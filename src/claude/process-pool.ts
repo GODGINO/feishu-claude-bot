@@ -1,0 +1,607 @@
+import { spawn, type ChildProcess } from 'node:child_process';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import * as readline from 'node:readline';
+import type { Logger } from '../utils/logger.js';
+import type { Config } from '../config.js';
+import { StreamParser, type ParseResult } from './stream-parser.js';
+import type { RunResult, ImageAttachment } from './runner.js';
+
+export interface SendOptions {
+  sessionKey: string;
+  sessionDir: string;
+  message: string;
+  images?: ImageAttachment[];
+  abortSignal?: AbortSignal;
+}
+
+interface PersistentProcess {
+  proc: ChildProcess;
+  sessionKey: string;
+  sessionDir: string;
+  sessionId?: string;
+  state: 'starting' | 'idle' | 'busy';
+  parser: StreamParser;
+  readyPromise: Promise<void>;
+  readyResolve?: () => void;
+  currentResolve?: (result: RunResult) => void;
+  currentReject?: (err: Error) => void;
+  mcpConfigMtime?: number; // mtime of mcp-servers.json when process was spawned
+  lastActivity: number; // timestamp of last stdout event
+}
+
+const KILL_GRACE_MS = 5000;
+const STATE_FILE = 'process-pool-state.json';
+
+export type UnsolicitedResultCallback = (sessionKey: string, result: RunResult) => void;
+export type ProgressCallback = (sessionKey: string, toolName: string, toolInput?: string) => void;
+
+export class ProcessPool {
+  private processes = new Map<string, PersistentProcess>();
+  private savedSessionIds = new Map<string, string>(); // sessionKey -> sessionId (for crash recovery)
+  private statePath: string;
+  private unsolicitedCallback?: UnsolicitedResultCallback;
+  private progressCallback?: ProgressCallback;
+
+  constructor(
+    private config: Config,
+    private sessionsDir: string,
+    private logger: Logger,
+  ) {
+    this.statePath = path.join(sessionsDir, STATE_FILE);
+    this.loadState();
+  }
+
+  /**
+   * Register callback for unsolicited results (e.g. background agent completion).
+   * Called when a result event arrives but no send() is pending.
+   */
+  onUnsolicitedResult(callback: UnsolicitedResultCallback): void {
+    this.unsolicitedCallback = callback;
+  }
+
+  /**
+   * Register callback for progress events (tool_use detected in stream).
+   */
+  onProgress(callback: ProgressCallback): void {
+    this.progressCallback = callback;
+  }
+
+  /**
+   * Get the timestamp of the last stdout activity for a session.
+   * Returns 0 if the session doesn't exist.
+   */
+  getLastActivity(sessionKey: string): number {
+    return this.processes.get(sessionKey)?.lastActivity ?? 0;
+  }
+
+  /**
+   * Translate tool name to Chinese description for progress messages.
+   */
+  static describeToolUse(name: string): string {
+    const map: Record<string, string> = {
+      WebSearch: '搜索网页',
+      WebFetch: '浏览网页',
+      Agent: '后台执行中',
+      Read: '读取文件',
+      Edit: '编辑文件',
+      Write: '编辑文件',
+      Bash: '执行命令',
+      Grep: '搜索代码',
+      Glob: '搜索代码',
+    };
+    return map[name] || name;
+  }
+
+  /**
+   * Send a message to the persistent process for a session.
+   * Spawns process on first message (no MCP = fast startup).
+   * Chrome MCP is lazy-loaded via start-chrome.sh when needed.
+   */
+  async send(opts: SendOptions): Promise<RunResult> {
+    let pp = this.processes.get(opts.sessionKey);
+
+    if (!pp) {
+      const resumeId = this.savedSessionIds.get(opts.sessionKey);
+      pp = this.spawn(opts.sessionKey, opts.sessionDir, resumeId);
+    }
+
+    // Check if MCP config changed (e.g. start-chrome.sh activated chrome-devtools MCP).
+    // If so, respawn with --resume to pick up the new MCP servers.
+    if (pp.state !== 'starting' && this.mcpConfigChanged(pp)) {
+      this.logger.info({ sessionKey: opts.sessionKey }, 'MCP config changed, respawning with --resume');
+      const resumeId = pp.sessionId || this.savedSessionIds.get(opts.sessionKey);
+      this.killProcessHard(pp.proc);
+      this.processes.delete(opts.sessionKey);
+      pp = this.spawn(opts.sessionKey, opts.sessionDir, resumeId);
+      // Clean up .mcp-changed signal file
+      try { fs.unlinkSync(path.join(opts.sessionDir, '.mcp-changed')); } catch { /* ignore */ }
+    }
+
+    // In stream-json + --resume mode, Claude waits for the first stdin message before
+    // emitting the system/init event. So we skip waiting and send immediately.
+    // The init event will arrive as part of the response stream and be handled by handleParseResult.
+    if (pp.state === 'starting') {
+      this.logger.info({ sessionKey: opts.sessionKey }, 'Process starting — sending message immediately (no wait)');
+      pp.state = 'busy';
+      pp.parser.reset();
+    } else if (pp.state === 'busy') {
+      // Should not happen if message-bridge has runningTasks lock, but guard anyway
+      throw new Error(`Process for ${opts.sessionKey} is busy`);
+    } else {
+      pp.state = 'busy';
+      pp.parser.reset();
+    }
+
+    // Build the stream-json message
+    const stdinMsg = this.buildStdinMessage(opts.message, opts.images);
+
+    // Set up abort handler
+    if (opts.abortSignal) {
+      const onAbort = () => {
+        this.logger.info({ sessionKey: opts.sessionKey }, 'Aborting persistent process');
+        this.killProcess(pp!);
+      };
+      opts.abortSignal.addEventListener('abort', onAbort, { once: true });
+    }
+
+    return new Promise<RunResult>((resolve, reject) => {
+      pp!.currentResolve = resolve;
+      pp!.currentReject = reject;
+
+      // Write message to stdin
+      const ok = pp!.proc.stdin?.write(stdinMsg + '\n');
+      if (ok === undefined) {
+        // stdin is null — should not happen with stdio: 'pipe'
+        pp!.state = 'idle';
+        reject(new Error('Claude process stdin is not available'));
+      }
+      // ok === false means backpressure — data IS queued and will be delivered.
+      // Do NOT reject here. If the process is dead, the 'close' or 'error'
+      // event handlers will reject the promise via currentReject.
+    });
+  }
+
+  /**
+   * Abort a specific session's process (/stop command).
+   * Saves sessionId for crash recovery, kills the process.
+   */
+  abort(sessionKey: string): void {
+    const pp = this.processes.get(sessionKey);
+    if (!pp) return;
+
+    this.killProcess(pp);
+  }
+
+  /**
+   * Reset a session (/new command).
+   * Kills the process and clears saved sessionId.
+   * Next message will spawn a fresh process WITHOUT --resume = clean context.
+   */
+  reset(sessionKey: string): void {
+    const pp = this.processes.get(sessionKey);
+    if (pp) {
+      this.killProcessHard(pp.proc);
+      if (pp.currentReject) {
+        pp.currentReject(new Error('Session reset'));
+        pp.currentResolve = undefined;
+        pp.currentReject = undefined;
+      }
+      this.processes.delete(sessionKey);
+    }
+    // Clear saved sessionId so next spawn does NOT use --resume
+    this.savedSessionIds.delete(sessionKey);
+    this.saveState();
+  }
+
+  /**
+   * Kill all processes (bot shutdown).
+   */
+  killAll(): void {
+    this.saveState();
+    for (const pp of this.processes.values()) {
+      this.killProcessHard(pp.proc);
+    }
+    this.processes.clear();
+  }
+
+  /**
+   * Number of currently busy processes.
+   */
+  get activeCount(): number {
+    let count = 0;
+    for (const pp of this.processes.values()) {
+      if (pp.state === 'busy') count++;
+    }
+    return count;
+  }
+
+  /**
+   * Spawn a new persistent Claude Code process for a session.
+   * Initial spawn has no MCP servers (fast ~5s startup).
+   * Chrome MCP is added later by start-chrome.sh, triggering respawn via mcpConfigChanged().
+   */
+  private spawn(sessionKey: string, sessionDir: string, resumeId?: string): PersistentProcess {
+    const args: string[] = [
+      '-p',
+      '--input-format', 'stream-json',
+      '--output-format', 'stream-json',
+      '--verbose',
+      '--model', this.config.claude.model,
+      '--dangerously-skip-permissions',
+    ];
+
+    // Load per-session MCP config. Use --strict-mcp-config to ignore global ~/.claude/settings.json
+    // MCP servers (which may include stale chrome-devtools pointing to a dead port).
+    const mcpConfigPath = path.join(sessionDir, 'mcp-servers.json');
+    if (fs.existsSync(mcpConfigPath)) {
+      args.push('--mcp-config', mcpConfigPath, '--strict-mcp-config');
+    }
+
+    // Append system prompt
+    const systemPrompt = this.config.claude.systemPrompt;
+    if (systemPrompt) {
+      args.push('--append-system-prompt', systemPrompt);
+    }
+
+    // Resume from saved session (crash recovery)
+    if (resumeId) {
+      args.push('--resume', resumeId);
+    }
+
+    this.logger.info(
+      { sessionKey, sessionDir, hasResume: !!resumeId },
+      'Spawning persistent Claude process',
+    );
+
+    // Build clean env: remove ALL Claude Code nesting detection variables
+    const cleanEnv = { ...process.env };
+    for (const key of Object.keys(cleanEnv)) {
+      if (key.startsWith('CLAUDE') || key === 'ANTHROPIC_INNER') {
+        delete cleanEnv[key];
+      }
+    }
+
+    const spawnEnv = {
+      ...cleanEnv,
+      ENABLE_TOOL_SEARCH: 'true',
+      MCP_TIMEOUT: '30000',
+      PATH: `${path.dirname(process.execPath)}:${process.env.HOME}/.local/bin:${process.env.HOME}/.bun/bin:${process.env.PATH}`,
+    };
+
+    // Debug: log claude-related vars and spawn args
+    const remainingClaudeVars = Object.keys(spawnEnv).filter(k => k.startsWith('CLAUDE') || k === 'ANTHROPIC_INNER');
+    this.logger.info({ sessionKey, remainingClaudeVars, claudePath: this.config.claude.path }, 'Spawn env debug');
+
+    // Dump spawn env and args to debug file
+    const debugInfo = { args, env: spawnEnv, claudePath: this.config.claude.path, cwd: sessionDir };
+    try { fs.writeFileSync(path.join(sessionDir, '.spawn-debug.json'), JSON.stringify(debugInfo, null, 2)); } catch {}
+
+    const proc = spawn(this.config.claude.path, args, {
+      cwd: sessionDir,
+      env: spawnEnv,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    // Catch EPIPE on stdin to prevent unhandled error crashing the entire bot process.
+    // EPIPE occurs when the child process dies and we try to write to its stdin.
+    proc.stdin?.on('error', (err) => {
+      this.logger.warn({ err, sessionKey }, 'stdin write error (child process likely dead)');
+    });
+
+    const parser = new StreamParser();
+    let readyResolve: (() => void) | undefined;
+    const readyPromise = new Promise<void>((resolve) => {
+      readyResolve = resolve;
+    });
+
+    // Record mcp-servers.json mtime for change detection
+    let mcpConfigMtime: number | undefined;
+    try {
+      const stat = fs.statSync(mcpConfigPath);
+      mcpConfigMtime = stat.mtimeMs;
+    } catch { /* no config file */ }
+
+    const pp: PersistentProcess = {
+      proc,
+      sessionKey,
+      sessionDir,
+      sessionId: resumeId,
+      state: 'starting',
+      parser,
+      readyPromise,
+      readyResolve,
+      mcpConfigMtime,
+      lastActivity: Date.now(),
+    };
+
+    this.processes.set(sessionKey, pp);
+
+    // Safety timeout: if no event with session_id arrives within 30s,
+    // mark as ready anyway as a fallback. (Reduced from 120s since chrome MCP is now lazy-loaded.)
+    const readyTimeout = setTimeout(() => {
+      if (pp.state === 'starting' && pp.readyResolve) {
+        this.logger.warn({ sessionKey }, 'Ready timeout — marking process as ready without system event');
+        pp.state = 'idle';
+        pp.readyResolve();
+        pp.readyResolve = undefined;
+      }
+    }, 30_000);
+    readyTimeout.unref();
+    // Clear timeout when ready resolves normally
+    readyPromise.then(() => clearTimeout(readyTimeout));
+
+    // Parse stdout continuously
+    const rl = readline.createInterface({ input: proc.stdout! });
+    let lineCount = 0;
+    rl.on('line', (line) => {
+      lineCount++;
+      pp.lastActivity = Date.now();
+      // Log first 10 lines to debug startup events
+      if (lineCount <= 10) {
+        try {
+          const parsed = JSON.parse(line);
+          this.logger.info(
+            { sessionKey, lineNum: lineCount, type: parsed.type, subtype: parsed.subtype, hasSessionId: !!parsed.session_id },
+            'Stdout line received',
+          );
+        } catch {
+          this.logger.info({ sessionKey, lineNum: lineCount, raw: line.slice(0, 100) }, 'Stdout non-JSON line');
+        }
+      }
+      const result = parser.parseLine(line);
+      if (result.toolUse) {
+        this.logger.info({ sessionKey, toolName: result.toolUse.name }, 'Tool use detected');
+      }
+      this.handleParseResult(pp, result);
+    });
+
+    // Capture stderr for logging
+    let stderr = '';
+    proc.stderr?.on('data', (chunk) => {
+      stderr += chunk.toString();
+      // Keep only last 2KB
+      if (stderr.length > 2048) {
+        stderr = stderr.slice(-2048);
+      }
+    });
+
+    // Handle process exit (crash or kill)
+    proc.on('close', (code) => {
+      this.logger.warn(
+        { sessionKey, code, stderr: stderr.slice(0, 500) },
+        'Persistent Claude process exited',
+      );
+
+      // Guard: only clean up if this process is still the active one for this session.
+      const current = this.processes.get(sessionKey);
+      if (current !== pp) {
+        this.logger.info({ sessionKey }, 'Ignoring close event from replaced process');
+        return;
+      }
+
+      // Only save sessionId for recovery if process exited cleanly (code 0).
+      // Crashed sessions (code !== 0 or null) may be corrupted — don't resume them.
+      if (pp.sessionId && code === 0) {
+        this.savedSessionIds.set(sessionKey, pp.sessionId);
+        this.saveState();
+      } else if (code !== 0) {
+        // Remove potentially corrupted sessionId
+        this.savedSessionIds.delete(sessionKey);
+        this.saveState();
+      }
+
+      // Reject any pending request
+      if (pp.currentReject) {
+        pp.currentReject(new Error(`Claude process exited with code ${code}`));
+        pp.currentResolve = undefined;
+        pp.currentReject = undefined;
+      }
+
+      // Also resolve ready promise if still starting
+      if (pp.state === 'starting' && pp.readyResolve) {
+        pp.readyResolve();
+      }
+
+      this.processes.delete(sessionKey);
+    });
+
+    proc.on('error', (err) => {
+      this.logger.error({ err, sessionKey }, 'Persistent Claude process error');
+      const current = this.processes.get(sessionKey);
+      if (current !== pp) return;
+      if (pp.currentReject) {
+        pp.currentReject(err);
+        pp.currentResolve = undefined;
+        pp.currentReject = undefined;
+      }
+      this.processes.delete(sessionKey);
+    });
+
+    return pp;
+  }
+
+  /**
+   * Handle a parsed stream-json event from stdout.
+   */
+  private handleParseResult(pp: PersistentProcess, result: ParseResult): void {
+    // system/init event → process is ready
+    if (result.sessionId) {
+      pp.sessionId = result.sessionId;
+      if (pp.state === 'starting' && pp.readyResolve) {
+        pp.state = 'idle';
+        pp.readyResolve();
+        pp.readyResolve = undefined;
+        this.logger.info(
+          { sessionKey: pp.sessionKey, sessionId: result.sessionId },
+          'Persistent Claude process ready',
+        );
+
+        // Save sessionId for crash recovery
+        this.savedSessionIds.set(pp.sessionKey, result.sessionId);
+        this.saveState();
+      }
+    }
+
+    // Progress callback: notify when Claude uses a tool
+    if (result.toolUse && this.progressCallback) {
+      this.progressCallback(pp.sessionKey, result.toolUse.name, result.toolUse.input);
+    }
+
+    // Detect unsolicited text (output arriving when no send() is pending).
+    // This happens when a background agent completes and Claude emits a follow-up.
+    // Reset parser to avoid mixing with previous turn's text.
+    if (result.text && pp.state === 'idle' && !pp.currentResolve) {
+      this.logger.info({ sessionKey: pp.sessionKey, textLen: result.text.length }, 'Unsolicited text detected, resetting parser');
+      pp.parser.reset();
+      pp.parser['_fullText'] = result.text;
+      pp.state = 'busy'; // Mark busy for the unsolicited turn
+    }
+
+    // result event → turn complete
+    if (result.done) {
+      const runResult: RunResult = {
+        fullText: pp.parser.fullText,
+        sessionId: pp.sessionId,
+        costUsd: result.costUsd,
+        durationMs: result.durationMs,
+        error: result.error,
+      };
+
+      // Update saved sessionId — but NOT if this turn had an error
+      // (error_during_execution with a corrupted --resume session must not be re-saved)
+      if (pp.sessionId && !result.error) {
+        this.savedSessionIds.set(pp.sessionKey, pp.sessionId);
+        this.saveState();
+      }
+
+      pp.state = 'idle';
+
+      if (pp.currentResolve) {
+        pp.currentResolve(runResult);
+        pp.currentResolve = undefined;
+        pp.currentReject = undefined;
+      } else if (runResult.fullText && this.unsolicitedCallback) {
+        // No pending send() — this is unsolicited output (e.g. background agent completion)
+        this.logger.info(
+          { sessionKey: pp.sessionKey, textLen: runResult.fullText.length },
+          'Unsolicited result received (background agent?)',
+        );
+        this.unsolicitedCallback(pp.sessionKey, runResult);
+      }
+    }
+  }
+
+  /**
+   * Build a stream-json stdin message.
+   */
+  private buildStdinMessage(message: string, images?: ImageAttachment[]): string {
+    let content: any;
+
+    if (images && images.length > 0) {
+      // Multimodal: array of content blocks
+      const blocks: any[] = [];
+      if (message) {
+        blocks.push({ type: 'text', text: message });
+      }
+      for (const img of images) {
+        blocks.push({
+          type: 'image',
+          source: {
+            type: 'base64',
+            media_type: img.mediaType,
+            data: img.base64,
+          },
+        });
+      }
+      content = blocks;
+    } else {
+      // Text only: simple string
+      content = message;
+    }
+
+    return JSON.stringify({
+      type: 'user',
+      message: {
+        role: 'user',
+        content,
+      },
+      parent_tool_use_id: null,
+    });
+  }
+
+  /**
+   * Kill a process gracefully (SIGTERM, then SIGKILL after grace period).
+   */
+  private killProcess(pp: PersistentProcess): void {
+    // Save sessionId before killing
+    if (pp.sessionId) {
+      this.savedSessionIds.set(pp.sessionKey, pp.sessionId);
+      this.saveState();
+    }
+
+    this.killProcessHard(pp.proc);
+  }
+
+  private killProcessHard(proc: ChildProcess): void {
+    if (proc.killed) return;
+    proc.kill('SIGTERM');
+    setTimeout(() => {
+      if (!proc.killed) {
+        proc.kill('SIGKILL');
+      }
+    }, KILL_GRACE_MS);
+  }
+
+  /**
+   * Check if the MCP config file has been modified since the process was spawned.
+   * This happens when start-chrome.sh activates chrome-devtools MCP.
+   */
+  private mcpConfigChanged(pp: PersistentProcess): boolean {
+    // Also check for explicit signal file from start-chrome.sh
+    const signalFile = path.join(pp.sessionDir, '.mcp-changed');
+    if (fs.existsSync(signalFile)) return true;
+
+    const mcpConfigPath = path.join(pp.sessionDir, 'mcp-servers.json');
+    try {
+      const stat = fs.statSync(mcpConfigPath);
+      if (pp.mcpConfigMtime === undefined) return true; // config was created after spawn
+      return stat.mtimeMs !== pp.mcpConfigMtime;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Persist sessionId mapping to disk for crash recovery.
+   */
+  private saveState(): void {
+    try {
+      const data: Record<string, string> = {};
+      for (const [key, id] of this.savedSessionIds) {
+        data[key] = id;
+      }
+      fs.writeFileSync(this.statePath, JSON.stringify(data, null, 2));
+    } catch (err) {
+      this.logger.warn({ err }, 'Failed to save process pool state');
+    }
+  }
+
+  /**
+   * Load sessionId mapping from disk (for bot restart recovery).
+   */
+  private loadState(): void {
+    try {
+      if (fs.existsSync(this.statePath)) {
+        const raw = fs.readFileSync(this.statePath, 'utf-8');
+        const data = JSON.parse(raw) as Record<string, string>;
+        for (const [key, id] of Object.entries(data)) {
+          this.savedSessionIds.set(key, id);
+        }
+        this.logger.info({ count: this.savedSessionIds.size }, 'Loaded process pool state');
+      }
+    } catch (err) {
+      this.logger.warn({ err }, 'Failed to load process pool state');
+    }
+  }
+}
