@@ -10,9 +10,16 @@ export class MessageSender {
   private nameCache = new Map<string, { name: string; expireAt: number }>();
 
   constructor(
-    private client: lark.Client,
+    private _client: lark.Client,
     private logger: Logger,
   ) {}
+
+  /**
+   * Get the underlying Lark client (for CardStreamer and other direct API access).
+   */
+  get larkClient(): lark.Client {
+    return this._client;
+  }
 
   /**
    * Resolve a user's open_id to their display name, with caching.
@@ -25,7 +32,7 @@ export class MessageSender {
     }
 
     try {
-      const resp = await this.client.contact.user.get({
+      const resp = await this._client.contact.user.get({
         path: { user_id: openId },
         params: { user_id_type: 'open_id' },
       });
@@ -47,7 +54,7 @@ export class MessageSender {
    */
   async fetchMessageText(messageId: string): Promise<string | null> {
     try {
-      const resp = await this.client.im.message.get({
+      const resp = await this._client.im.message.get({
         path: { message_id: messageId },
       });
       const msg = (resp as any).data?.items?.[0];
@@ -92,12 +99,79 @@ export class MessageSender {
   }
 
   /**
+   * Fetch child messages from a merge_forward (合并转发) message.
+   * Returns formatted text of all sub-messages.
+   */
+  async fetchMergeForwardContent(messageId: string): Promise<string | null> {
+    try {
+      const resp = await this._client.im.message.get({
+        path: { message_id: messageId },
+      });
+
+      const items = (resp as any)?.data?.items;
+      if (!Array.isArray(items) || items.length === 0) {
+        this.logger.warn({ messageId }, 'merge_forward: no child messages found');
+        return null;
+      }
+
+      const lines: string[] = ['[合并转发内容]'];
+      for (const item of items) {
+        // Skip the parent merge_forward message itself
+        if (item.msg_type === 'merge_forward') continue;
+
+        const senderName = item.sender?.sender_id?.name || '未知';
+        let content = '';
+
+        try {
+          if (item.msg_type === 'text') {
+            const parsed = JSON.parse(item.body?.content || '{}');
+            content = parsed.text || '';
+          } else if (item.msg_type === 'post') {
+            const parsed = JSON.parse(item.body?.content || '{}');
+            const body = parsed.zh_cn?.content || parsed.en_us?.content || parsed.content;
+            if (Array.isArray(body)) {
+              const texts: string[] = [];
+              for (const para of body) {
+                if (!Array.isArray(para)) continue;
+                for (const el of para) {
+                  if (el.tag === 'text') texts.push(el.text || '');
+                  else if (el.tag === 'a') texts.push(el.text || el.href || '');
+                }
+              }
+              content = texts.join('');
+            }
+          } else if (item.msg_type === 'image') {
+            content = '[图片]';
+          } else if (item.msg_type === 'file') {
+            const parsed = JSON.parse(item.body?.content || '{}');
+            content = `[文件: ${parsed.file_name || 'unknown'}]`;
+          } else {
+            content = `[${item.msg_type}]`;
+          }
+        } catch {
+          content = '[无法解析]';
+        }
+
+        if (content) {
+          lines.push(`${senderName}: ${content}`);
+        }
+      }
+
+      this.logger.info({ messageId, childCount: items.length }, 'Fetched merge_forward content');
+      return lines.join('\n');
+    } catch (err) {
+      this.logger.error({ err, messageId }, 'Failed to fetch merge_forward content');
+      return null;
+    }
+  }
+
+  /**
    * Download an image from a Feishu message as base64.
    * Uses the messageResource API which works for message attachments.
    */
   async downloadImage(messageId: string, imageKey: string): Promise<{ base64: string; mediaType: string } | null> {
     try {
-      const resp = await this.client.im.messageResource.get({
+      const resp = await this._client.im.messageResource.get({
         path: { message_id: messageId, file_key: imageKey },
         params: { type: 'image' },
       });
@@ -142,9 +216,58 @@ export class MessageSender {
   }
 
   /**
+   * Download a file attachment from a Feishu message, save to disk, return the path.
+   */
+  async downloadFile(messageId: string, fileKey: string, fileName: string, destDir: string): Promise<string | null> {
+    try {
+      const resp = await this._client.im.messageResource.get({
+        path: { message_id: messageId, file_key: fileKey },
+        params: { type: 'file' },
+      });
+
+      const data = (resp as any);
+      let buffer: Buffer;
+
+      if (Buffer.isBuffer(data)) {
+        buffer = data;
+      } else if (data instanceof ArrayBuffer) {
+        buffer = Buffer.from(data);
+      } else if (data?.data && Buffer.isBuffer(data.data)) {
+        buffer = data.data;
+      } else if (data?.data instanceof ArrayBuffer) {
+        buffer = Buffer.from(data.data);
+      } else if (typeof data?.getReadableStream === 'function') {
+        const stream = await data.getReadableStream();
+        const chunks: Buffer[] = [];
+        for await (const chunk of stream) {
+          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        }
+        buffer = Buffer.concat(chunks);
+      } else if (typeof data?.arrayBuffer === 'function') {
+        buffer = Buffer.from(await data.arrayBuffer());
+      } else {
+        this.logger.warn({ messageId, fileKey, type: typeof data }, 'Unknown file response format');
+        return null;
+      }
+
+      const fs = await import('node:fs');
+      const path = await import('node:path');
+      fs.mkdirSync(destDir, { recursive: true });
+      const filePath = path.join(destDir, fileName);
+      fs.writeFileSync(filePath, buffer);
+
+      this.logger.info({ messageId, fileKey, fileName, sizeKB: Math.round(buffer.length / 1024), filePath }, 'Downloaded file');
+      return filePath;
+    } catch (err) {
+      this.logger.error({ err, messageId, fileKey, fileName }, 'Failed to download file');
+      return null;
+    }
+  }
+
+  /**
    * Send a text reply to a message (using post format with markdown)
    */
-  async sendText(chatId: string, text: string, replyToMessageId?: string): Promise<string | null> {
+  async sendText(chatId: string, text: string, replyToMessageId?: string, rootId?: string): Promise<string | null> {
     try {
       const content = JSON.stringify({
         zh_cn: {
@@ -152,15 +275,29 @@ export class MessageSender {
         },
       });
 
+      // Thread reply: use im.message.create with root_id (creates message inside thread)
+      if (rootId) {
+        const resp = await this._client.im.message.create({
+          params: { receive_id_type: 'chat_id' },
+          data: {
+            receive_id: chatId,
+            content,
+            msg_type: 'post',
+            root_id: rootId,
+          } as any,
+        });
+        return (resp as any).data?.message_id || null;
+      }
+
       if (replyToMessageId) {
-        const resp = await this.client.im.message.reply({
+        const resp = await this._client.im.message.reply({
           path: { message_id: replyToMessageId },
           data: { content, msg_type: 'post' },
         });
         return (resp as any).data?.message_id || null;
       }
 
-      const resp = await this.client.im.message.create({
+      const resp = await this._client.im.message.create({
         params: { receive_id_type: 'chat_id' },
         data: {
           receive_id: chatId,
@@ -178,19 +315,33 @@ export class MessageSender {
   /**
    * Send an interactive card message
    */
-  async sendCard(chatId: string, cardJson: object, replyToMessageId?: string): Promise<string | null> {
+  async sendCard(chatId: string, cardJson: object, replyToMessageId?: string, rootId?: string): Promise<string | null> {
     try {
       const content = JSON.stringify(cardJson);
 
+      // Thread reply: use im.message.create with root_id
+      if (rootId) {
+        const resp = await this._client.im.message.create({
+          params: { receive_id_type: 'chat_id' },
+          data: {
+            receive_id: chatId,
+            content,
+            msg_type: 'interactive',
+            root_id: rootId,
+          } as any,
+        });
+        return (resp as any).data?.message_id || null;
+      }
+
       if (replyToMessageId) {
-        const resp = await this.client.im.message.reply({
+        const resp = await this._client.im.message.reply({
           path: { message_id: replyToMessageId },
           data: { content, msg_type: 'interactive' },
         });
         return (resp as any).data?.message_id || null;
       }
 
-      const resp = await this.client.im.message.create({
+      const resp = await this._client.im.message.create({
         params: { receive_id_type: 'chat_id' },
         data: {
           receive_id: chatId,
@@ -209,7 +360,7 @@ export class MessageSender {
    * Detect render mode and send reply accordingly.
    * If sessionDir is provided, @名字 mentions are resolved to Feishu <at> tags.
    */
-  async sendReply(chatId: string, text: string, replyToMessageId?: string, sessionDir?: string): Promise<string | null> {
+  async sendReply(chatId: string, text: string, replyToMessageId?: string, sessionDir?: string, rootId?: string): Promise<string | null> {
     // Resolve @mentions before sending
     if (sessionDir) {
       text = resolveAtMentions(text, sessionDir);
@@ -219,11 +370,11 @@ export class MessageSender {
     const cleanText = text.replace(/^<<TITLE:.+?>>\s*\n?/, '');
     const mode = detectRenderMode(text);
 
-    this.logger.info({ mode, textLength: text.length, hasTitle: /<<TITLE:/.test(text) }, 'sendReply render mode');
+    this.logger.info({ mode, textLength: text.length, hasTitle: /<<TITLE:/.test(text), rootId }, 'sendReply render mode');
 
     if (mode === 'card') {
       const card = buildMarkdownCard(text); // pass original text so title can be extracted
-      return this.sendCard(chatId, card, replyToMessageId);
+      return this.sendCard(chatId, card, replyToMessageId, rootId);
     }
 
     // For long text, split into chunks
@@ -235,20 +386,21 @@ export class MessageSender {
           chatId,
           chunks[i],
           i === 0 ? replyToMessageId : undefined,
+          rootId,
         );
         if (i === 0) firstMsgId = msgId;
       }
       return firstMsgId;
     }
 
-    return this.sendText(chatId, cleanText, replyToMessageId);
+    return this.sendText(chatId, cleanText, replyToMessageId, rootId);
   }
 
   /**
    * Upload a file to Feishu and send it as a file message.
    * @param filePath Absolute path to the file on disk
    */
-  async sendFile(chatId: string, filePath: string, replyToMessageId?: string): Promise<string | null> {
+  async sendFile(chatId: string, filePath: string, replyToMessageId?: string, rootId?: string): Promise<string | null> {
     try {
       if (!fs.existsSync(filePath)) {
         this.logger.warn({ filePath }, 'File not found for sending');
@@ -261,7 +413,7 @@ export class MessageSender {
 
       // Step 1: Upload file
       const fileStream = fs.createReadStream(filePath);
-      const uploadResp = await (this.client as any).im.file.create({
+      const uploadResp = await (this._client as any).im.file.create({
         data: {
           file_type: fileType,
           file_name: fileName,
@@ -280,15 +432,28 @@ export class MessageSender {
       // Step 2: Send file message
       const content = JSON.stringify({ file_key: fileKey });
 
+      if (rootId) {
+        const resp = await this._client.im.message.create({
+          params: { receive_id_type: 'chat_id' },
+          data: {
+            receive_id: chatId,
+            content,
+            msg_type: 'file',
+            root_id: rootId,
+          } as any,
+        });
+        return (resp as any).data?.message_id || null;
+      }
+
       if (replyToMessageId) {
-        const resp = await this.client.im.message.reply({
+        const resp = await this._client.im.message.reply({
           path: { message_id: replyToMessageId },
           data: { content, msg_type: 'file' },
         });
         return (resp as any).data?.message_id || null;
       }
 
-      const resp = await this.client.im.message.create({
+      const resp = await this._client.im.message.create({
         params: { receive_id_type: 'chat_id' },
         data: {
           receive_id: chatId,
@@ -306,7 +471,7 @@ export class MessageSender {
   /**
    * Upload an image file and send it as an image message.
    */
-  async sendImage(chatId: string, imagePath: string, replyToMessageId?: string): Promise<string | null> {
+  async sendImage(chatId: string, imagePath: string, replyToMessageId?: string, rootId?: string): Promise<string | null> {
     try {
       if (!fs.existsSync(imagePath)) {
         this.logger.warn({ imagePath }, 'Image not found for sending');
@@ -315,7 +480,7 @@ export class MessageSender {
 
       // Step 1: Upload image
       const imageStream = fs.createReadStream(imagePath);
-      const uploadResp = await (this.client as any).im.image.create({
+      const uploadResp = await (this._client as any).im.image.create({
         data: {
           image_type: 'message',
           image: imageStream,
@@ -333,15 +498,28 @@ export class MessageSender {
       // Step 2: Send image message
       const content = JSON.stringify({ image_key: imageKey });
 
+      if (rootId) {
+        const resp = await this._client.im.message.create({
+          params: { receive_id_type: 'chat_id' },
+          data: {
+            receive_id: chatId,
+            content,
+            msg_type: 'image',
+            root_id: rootId,
+          } as any,
+        });
+        return (resp as any).data?.message_id || null;
+      }
+
       if (replyToMessageId) {
-        const resp = await this.client.im.message.reply({
+        const resp = await this._client.im.message.reply({
           path: { message_id: replyToMessageId },
           data: { content, msg_type: 'image' },
         });
         return (resp as any).data?.message_id || null;
       }
 
-      const resp = await this.client.im.message.create({
+      const resp = await this._client.im.message.create({
         params: { receive_id_type: 'chat_id' },
         data: {
           receive_id: chatId,
@@ -386,6 +564,15 @@ function resolveAtMentions(text: string, sessionDir: string): string {
       const pattern = new RegExp(`@${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?!\\w)`, 'g');
       text = text.replace(pattern, `<at id=${openId}></at>`);
     }
+
+    // Fix invalid <at> tags Claude may have generated (e.g. <at id=0></at>)
+    // Keep only valid ones: ou_ prefixed IDs and "all"
+    text = text.replace(/<at id=([^>]+)><\/at>/g, (match, id) => {
+      if (id === 'all' || id.startsWith('ou_')) return match;
+      // Try to find author by name in the surrounding text — but can't reliably.
+      // Just strip the broken tag and leave a plain @ with whatever text follows.
+      return '';
+    });
   } catch { /* ignore parse errors */ }
 
   return text;

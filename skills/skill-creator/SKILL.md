@@ -57,7 +57,7 @@ Output: ...
 
 ### 3. 保存 Skill
 
-将 SKILL.md 写入当前 session 的 skills 目录：
+将 SKILL.md **直接写入**当前 session 的 skills 目录（使用 Write 工具创建文件）：
 
 ```
 .claude/skills/<skill-name>/SKILL.md
@@ -71,6 +71,8 @@ Output: ...
 └── scripts/
     └── helper.sh
 ```
+
+**重要：禁止使用 symlink！** 不要创建 `.agents/skills/` 或其他目录再 symlink 到 `.claude/skills/`。必须直接在 `.claude/skills/<skill-name>/` 下创建真实文件。系统会自动检测并修复 symlink。
 
 ### 4. 测试
 
@@ -94,10 +96,48 @@ ls -la .claude/skills/
 rm -rf .claude/skills/<skill-name>
 ```
 
+## 环境变量（重要）
+
+Skill 中涉及的 API Key、Secret、Token 等敏感信息**必须**使用环境变量，**禁止**硬编码在 SKILL.md 或脚本文件中，也**禁止**将 `.env` 文件放在 skill 文件夹内。
+
+### 存放位置
+
+环境变量统一存放在 session 根目录的 `session.env` 文件（**不是** skill 文件夹内）：
+
+```bash
+# session.env（位于 $SESSION_DIR/session.env）
+MY_API_KEY=sk-xxxxx
+PLUGIN_SECRET=yyyyy
+```
+
+用 Edit 或 Write 工具写入 `session.env`（注意追加而非覆盖已有变量）。
+
+### 在脚本中使用
+
+脚本直接用 `$VAR_NAME` 引用即可，Claude 进程启动时会自动加载 session.env 中的所有变量：
+
+```bash
+curl -H "Authorization: Bearer $MY_API_KEY" https://api.example.com
+```
+
+### 为什么不放在 skill 文件夹里
+
+- Skill 可能被迁移到其他 session，迁移时**不会**复制 `.env` 文件
+- 不同 session 可能需要不同的 key（不同用户、不同环境）
+- `session.env` 集中管理，可在 admin 后台查看和修改
+
+### 创建 skill 时的检查清单
+
+1. 脚本中是否有硬编码的 key/secret？→ 改为环境变量
+2. 环境变量是否写入了 `session.env`（而非 skill 目录）？
+3. SKILL.md 中是否说明了需要哪些环境变量？
+
 ## 注意事项
 
 - Skills 存在于当前 session 目录，不影响其他用户
 - 创建的 skill 在 `/new` 重置会话后仍然保留（因为 session 目录不变）
 - skill 内可以使用当前 session 的所有工具（Bash、Chrome、MCP 工具等）
-- 避免在 skill 中硬编码路径或密钥——用相对路径或环境变量
-- 如果 skill 需要调用外部 API，在 skill 中说明依赖，而不是假设已安装
+- 避免在 skill 中硬编码路径或密钥——用环境变量（见上方）
+- 如果 skill 需要调用外部 API，在 SKILL.md 中说明需要的环境变量
+- **禁止使用 symlink**：所有 skill 文件必须直接写在 `.claude/skills/<name>/` 下，不要创建中间目录（如 `.agents/`）再 symlink
+- **禁止写入 session 外部**：不要向 feishu-claude-bot 源码目录或其他 session 目录写入任何文件

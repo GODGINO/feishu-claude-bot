@@ -10,7 +10,8 @@ export interface ParseResult {
   costUsd?: number;
   durationMs?: number;
   error?: string;
-  toolUse?: { name: string; input?: string };
+  toolUse?: { name: string; input?: string; toolUseId?: string };
+  toolResult?: { toolUseId: string; isError?: boolean };
 }
 
 export class StreamParser {
@@ -46,8 +47,8 @@ export class StreamParser {
           this._sessionId = msg.session_id;
           result.sessionId = msg.session_id;
         }
-        // task_started/task_progress = subagent is running
-        if (msg.subtype === 'task_started' || msg.subtype === 'task_progress') {
+        // task_started = subagent launched (only add once, not on progress)
+        if (msg.subtype === 'task_started') {
           result.toolUse = { name: 'Agent' };
         }
         return result;
@@ -57,6 +58,7 @@ export class StreamParser {
       if (msg.type === 'assistant') {
         const text = this.extractText(msg.message?.content);
         const toolUse = this.extractToolUse(msg.message?.content);
+        const toolResult = this.extractToolResult(msg.message?.content);
         const result: ParseResult = {};
         if (text) {
           this._fullText += text;
@@ -65,7 +67,19 @@ export class StreamParser {
         if (toolUse) {
           result.toolUse = toolUse;
         }
+        if (toolResult) {
+          result.toolResult = toolResult;
+        }
         return result;
+      }
+
+      // User message: contains tool_result blocks (after tool execution completes)
+      if (msg.type === 'user') {
+        const toolResult = this.extractToolResult(msg.message?.content);
+        if (toolResult) {
+          return { toolResult };
+        }
+        return {};
       }
 
       // Result message: final output
@@ -77,7 +91,12 @@ export class StreamParser {
         }
         if (msg.result) {
           result.text = msg.result;
-          this._fullText = msg.result; // result contains the complete text
+          // Only use result text if nothing was accumulated during streaming.
+          // In multi-turn (agentic) responses, _fullText has the complete output
+          // while msg.result may only contain the last turn's summary.
+          if (!this._fullText) {
+            this._fullText = msg.result;
+          }
         }
         if (msg.total_cost_usd != null) result.costUsd = msg.total_cost_usd;
         if (msg.duration_ms != null) result.durationMs = msg.duration_ms;
@@ -92,11 +111,29 @@ export class StreamParser {
     }
   }
 
-  private extractToolUse(content: unknown): { name: string; input?: string } | undefined {
+  private extractToolUse(content: unknown): { name: string; input?: string; toolUseId?: string } | undefined {
     if (!Array.isArray(content)) return undefined;
     for (const block of content) {
       if (block.type === 'tool_use' && block.name) {
-        return { name: block.name, input: typeof block.input === 'string' ? block.input : undefined };
+        let input: string | undefined;
+        if (typeof block.input === 'string') {
+          input = block.input;
+        } else if (block.input && typeof block.input === 'object') {
+          // Stringify object inputs for display (e.g. { command: "git status" } → "git status")
+          const vals = Object.values(block.input as Record<string, unknown>);
+          input = vals.filter(v => typeof v === 'string').join(' ').slice(0, 200);
+        }
+        return { name: block.name, input, toolUseId: block.id };
+      }
+    }
+    return undefined;
+  }
+
+  private extractToolResult(content: unknown): { toolUseId: string; isError?: boolean } | undefined {
+    if (!Array.isArray(content)) return undefined;
+    for (const block of content) {
+      if (block.type === 'tool_result' && block.tool_use_id) {
+        return { toolUseId: block.tool_use_id, isError: block.is_error };
       }
     }
     return undefined;

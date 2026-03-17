@@ -18,6 +18,8 @@ export interface Config {
   maxQueuePerSession: number;
   processTimeout: number;
   logLevel: string;
+  adminPort: number;
+  adminPassword: string;
 }
 
 function required(key: string): string {
@@ -72,5 +74,7 @@ export function loadConfig(): Config {
     maxQueuePerSession: parseInt(optional('MAX_QUEUE_PER_SESSION', '5'), 10),
     processTimeout: parseInt(optional('PROCESS_TIMEOUT', '120000'), 10),
     logLevel: optional('LOG_LEVEL', 'info'),
+    adminPort: parseInt(optional('ADMIN_PORT', '3333'), 10),
+    adminPassword: optional('ADMIN_PASSWORD', ''),
   };
 }

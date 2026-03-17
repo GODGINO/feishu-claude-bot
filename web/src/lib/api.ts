@@ -1,0 +1,218 @@
+const BASE = '/api';
+
+async function fetchJson<T>(url: string): Promise<T> {
+  const res = await fetch(`${BASE}${url}`);
+  if (res.status === 401) {
+    window.location.reload();
+    throw new Error('Unauthorized');
+  }
+  if (!res.ok) throw new Error(`API error: ${res.status}`);
+  return res.json();
+}
+
+async function mutate<T = { ok: boolean }>(
+  method: 'POST' | 'PUT' | 'DELETE',
+  url: string,
+  body?: Record<string, unknown>,
+): Promise<T> {
+  const res = await fetch(`${BASE}${url}`, {
+    method,
+    headers: body ? { 'Content-Type': 'application/json' } : {},
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (res.status === 401) { window.location.reload(); throw new Error('Unauthorized'); }
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: 'Unknown error' }));
+    throw new Error(err.error || `API error: ${res.status}`);
+  }
+  return res.json();
+}
+
+export interface SessionSummary {
+  key: string;
+  name: string;
+  type: 'group' | 'dm' | 'other';
+  chatId: string | null;
+  autoReply: string | null;
+  memberCount: number;
+  cronJobCount: number;
+  messageCount: number;
+  hasEmail: boolean;
+  hasKnowledge: boolean;
+  skillCount: number;
+  skillNames: string[];
+  lastActiveAt: number | null;
+}
+
+export interface SessionDetail extends SessionSummary {
+  authors: Record<string, { name: string; feishuMcpUrl?: string }>;
+  sshPublicKey: string | null;
+}
+
+export interface CronJob {
+  id: string;
+  name: string;
+  schedule: string;
+  prompt: string;
+  enabled: boolean;
+  createdAt: string;
+  lastRunAt?: string;
+  lastResult?: string;
+}
+
+export interface ChatMessage {
+  timestamp: number;
+  senderName: string;
+  text: string;
+  botReply?: string;
+  senderOpenId?: string;
+}
+
+export interface ChatResponse {
+  messages: ChatMessage[];
+  total: number;
+  page: number;
+  limit: number;
+}
+
+export interface Stats {
+  totalSessions: number;
+  groupSessions: number;
+  dmSessions: number;
+  totalMessages: number;
+  todayMessages: number;
+  totalCronJobs: number;
+  totalEmailAccounts: number;
+  totalSkills: number;
+  totalObservations: number;
+}
+
+export interface EmailInfo {
+  configured: boolean;
+  pushTarget: any;
+  rules: string | null;
+}
+
+export interface Skill {
+  folder: string;
+  name: string;
+  description: string;
+  content: string;
+  disabled: boolean;
+  builtin: boolean;
+  envVars: string[];
+}
+
+export interface Observation {
+  id: number
+  type: string
+  title: string
+  narrative: string
+  facts: string
+  concepts: string
+  files_read: string
+  files_modified: string
+  created_at_epoch: number
+  project: string
+}
+
+export interface SessionSummaryMem {
+  id: number
+  request: string
+  investigated: string
+  learned: string
+  completed: string
+  next_steps: string
+  created_at_epoch: number
+}
+
+export interface MemoryResponse {
+  observations: Observation[]
+  total: number
+  page: number
+  limit: number
+}
+
+export interface SummariesResponse {
+  summaries: SessionSummaryMem[]
+  total: number
+}
+
+export interface EnvVariable {
+  key: string
+  value: string
+}
+
+export interface EnvResponse {
+  variables: EnvVariable[]
+  skillEnvMap: Record<string, string[]>
+}
+
+export const api = {
+  sessions: () => fetchJson<SessionSummary[]>('/sessions'),
+  session: (key: string) => fetchJson<SessionDetail>(`/sessions/${key}`),
+  knowledge: (key: string) => fetchJson<{ content: string }>(`/sessions/${key}/knowledge`),
+  cron: (key: string) => fetchJson<CronJob[]>(`/sessions/${key}/cron`),
+  chat: (key: string, page = 1, limit = 50) =>
+    fetchJson<ChatResponse>(`/sessions/${key}/chat?page=${page}&limit=${limit}`),
+  email: (key: string) => fetchJson<EmailInfo>(`/sessions/${key}/email`),
+  sessionEnv: (key: string) => fetchJson<EnvResponse>(`/sessions/${key}/env`),
+  updateSessionEnv: (key: string, variables: EnvVariable[]) =>
+    mutate('PUT', `/sessions/${key}/env`, { variables }),
+  skills: (key: string) => fetchJson<Skill[]>(`/sessions/${key}/skills`),
+  memory: (key: string, page = 1, limit = 20, search?: string, type?: string) => {
+    const params = new URLSearchParams({ page: String(page), limit: String(limit) })
+    if (search) params.set('search', search)
+    if (type) params.set('type', type)
+    return fetchJson<MemoryResponse>(`/sessions/${key}/memory?${params}`)
+  },
+  memorySummaries: (key: string, page = 1, limit = 10) =>
+    fetchJson<SummariesResponse>(`/sessions/${key}/memory/summaries?page=${page}&limit=${limit}`),
+  stats: () => fetchJson<Stats>('/stats'),
+  authCheck: async () => {
+    const res = await fetch(`${BASE}/auth/check`);
+    return res.ok;
+  },
+  login: async (password: string) => {
+    const res = await fetch(`${BASE}/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password }),
+    });
+    return res.ok;
+  },
+  logout: async () => {
+    await fetch(`${BASE}/auth/logout`, { method: 'POST' });
+  },
+
+  // Skill management
+  deleteSkill: (sessionKey: string, folder: string) =>
+    mutate('DELETE', `/sessions/${sessionKey}/skills/${folder}`),
+  toggleSkill: (sessionKey: string, folder: string, disabled: boolean) =>
+    mutate('PUT', `/sessions/${sessionKey}/skills/${folder}/toggle`, { disabled }),
+  transferSkill: (sessionKey: string, folder: string, targetSession: string, transferEnvVars = false) =>
+    mutate('POST', `/sessions/${sessionKey}/skills/${folder}/transfer`, { targetSession, transferEnvVars }),
+
+  // Cron management
+  deleteCronJob: (sessionKey: string, jobId: string) =>
+    mutate('DELETE', `/sessions/${sessionKey}/cron/${jobId}`),
+  toggleCronJob: (sessionKey: string, jobId: string, enabled: boolean) =>
+    mutate('PUT', `/sessions/${sessionKey}/cron/${jobId}/toggle`, { enabled }),
+
+  // Author management
+  deleteAuthor: (sessionKey: string, openId: string) =>
+    mutate('DELETE', `/sessions/${sessionKey}/authors/${openId}`),
+  updateAuthor: (sessionKey: string, openId: string, data: { name?: string; feishuMcpUrl?: string }) =>
+    mutate('PUT', `/sessions/${sessionKey}/authors/${openId}`, data),
+
+  // Refresh name caches (force re-fetch from Feishu API)
+  refreshNames: () => mutate('POST', '/refresh-names'),
+
+  // Session config (simple key-value files like streaming-reply, auto-reply)
+  getSessionConfig: async (sessionKey: string, configName: string): Promise<string> => {
+    const r = await fetchJson<{ value: string }>(`/sessions/${sessionKey}/config/${configName}`);
+    return r.value;
+  },
+  setSessionConfig: (sessionKey: string, configName: string, value: string) =>
+    mutate('PUT', `/sessions/${sessionKey}/config/${configName}`, { value }),
+};

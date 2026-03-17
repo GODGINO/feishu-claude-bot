@@ -47,11 +47,16 @@ GIT_SSH_COMMAND="ssh -i ssh_key/id_ed25519 -o StrictHostKeyChecking=no -o UserKn
 
 1. 从消息前缀 `[发送者: 名字 | id: ou_xxx]` 提取 openId 和名字
 2. 引导用户打开 https://open.feishu.cn/page/mcp 获取 MCP 链接
-3. 收到链接后更新 authors.json，并 `touch .mcp-changed` 触发重载
+3. 收到链接后（以 `https://mcp.feishu.cn` 开头的 URL）：
+   - 读取 `authors.json`
+   - 设置该用户的 `feishuMcpUrl` 字段
+   - 写入更新后的 `authors.json`
+   - 执行 `touch .mcp-changed` 触发 MCP 配置热重载
+4. 验证绑定：尝试调用一个简单的飞书 MCP 工具确认连通性
 
 ### 未注册用户
 
-如果发送者没有飞书 MCP，提示先绑定。
+如果发送者没有飞书 MCP，引导用户访问 https://open.feishu.cn/page/mcp 获取 MCP URL 并发送过来完成绑定。
 
 ## 管理命令
 

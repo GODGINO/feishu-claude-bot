@@ -2,18 +2,21 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { Logger } from '../utils/logger.js';
 
-const MAX_ENTRIES = 100;
+const MAX_ENTRIES = 1000;
 const CONTEXT_FILE = 'group-context.json';
 
 export interface ContextEntry {
   timestamp: number;
   senderName: string;
+  senderId?: string;
   text: string;
   botReply?: string;
 }
 
 export class GroupContextBuffer {
   private buffers = new Map<string, ContextEntry[]>();
+  /** Index of the last entry that was sent to the Claude subprocess. */
+  private sentIndex = new Map<string, number>();
 
   constructor(private logger: Logger) {}
 
@@ -28,40 +31,64 @@ export class GroupContextBuffer {
     }
     entries.push(entry);
     if (entries.length > MAX_ENTRIES) {
-      entries.splice(0, entries.length - MAX_ENTRIES);
+      const removed = entries.length - MAX_ENTRIES;
+      entries.splice(0, removed);
+      // Adjust sentIndex
+      const idx = this.sentIndex.get(chatId) ?? -1;
+      this.sentIndex.set(chatId, Math.max(-1, idx - removed));
     }
   }
 
   /**
-   * Format the buffer as a readable context string for prompt injection.
+   * Mark all current entries as "sent" to the subprocess.
+   * Called after a message (including context) is sent to Claude.
+   */
+  markSent(chatId: string): void {
+    const entries = this.buffers.get(chatId);
+    if (entries) {
+      this.sentIndex.set(chatId, entries.length - 1);
+    }
+  }
+
+  /**
+   * Format only the MISSED messages (entries added since last markSent).
+   * These are messages the subprocess never saw (e.g., non-@mention while auto-reply=off,
+   * or messages that arrived while bot was busy).
+   */
+  formatMissed(chatId: string): string {
+    const entries = this.buffers.get(chatId);
+    if (!entries || entries.length === 0) return '';
+
+    const lastSent = this.sentIndex.get(chatId) ?? -1;
+    // Missed = entries after lastSent, excluding the very last one (which is the current message)
+    const missed = entries.slice(lastSent + 1, -1);
+    if (missed.length === 0) return '';
+
+    const lines: string[] = [`[你不在时的 ${missed.length} 条群聊消息]`];
+    for (const e of missed) {
+      const d = new Date(e.timestamp);
+      const dt = d.toLocaleString('sv-SE', { timeZone: 'Asia/Shanghai' }).replace('T', ' ');
+      const senderTag = e.senderId ? `${e.senderName}(${e.senderId})` : e.senderName;
+      lines.push(`[${dt}] ${senderTag}: ${e.text}`);
+    }
+    return lines.join('\n');
+  }
+
+  /**
+   * Format ALL entries (for admin dashboard / legacy use).
    */
   format(chatId: string): string {
     const entries = this.buffers.get(chatId);
     if (!entries || entries.length === 0) return '';
 
     const lines: string[] = ['[最近群聊消息]'];
-    let lastDateStr = '';
     for (const e of entries) {
       const d = new Date(e.timestamp);
-      const dateStr = d.toLocaleDateString('zh-CN', {
-        month: '2-digit',
-        day: '2-digit',
-        weekday: 'short',
-        timeZone: 'Asia/Shanghai',
-      });
-      // Insert date header when day changes
-      if (dateStr !== lastDateStr) {
-        lines.push(`--- ${dateStr} ---`);
-        lastDateStr = dateStr;
-      }
-      const time = d.toLocaleTimeString('zh-CN', {
-        hour: '2-digit',
-        minute: '2-digit',
-        timeZone: 'Asia/Shanghai',
-      });
-      lines.push(`[${time}] ${e.senderName}: ${e.text}`);
+      const dt = d.toLocaleString('sv-SE', { timeZone: 'Asia/Shanghai' }).replace('T', ' ');
+      const senderTag = e.senderId ? `${e.senderName}(${e.senderId})` : e.senderName;
+      lines.push(`[${dt}] ${senderTag}: ${e.text}`);
       if (e.botReply) {
-        lines.push(`[${time}] Sigma: ${e.botReply}`);
+        lines.push(`[${dt}] Sigma: ${e.botReply}`);
       }
     }
     return lines.join('\n');
@@ -78,6 +105,8 @@ export class GroupContextBuffer {
       const entries = JSON.parse(raw) as ContextEntry[];
       if (Array.isArray(entries)) {
         this.buffers.set(chatId, entries.slice(-MAX_ENTRIES));
+        // Assume all loaded entries were already sent (from previous bot run)
+        this.sentIndex.set(chatId, entries.length - 1);
       }
     } catch (err) {
       this.logger.warn({ err, sessionDir }, 'Failed to load group context');

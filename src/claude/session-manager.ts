@@ -24,7 +24,7 @@ export class SessionManager {
     private sessionsDir: string,
     private logger: Logger,
   ) {
-    this.persistPath = path.join(sessionsDir, PERSIST_FILE);
+    this.persistPath = path.join(path.dirname(sessionsDir), PERSIST_FILE);
     fs.mkdirSync(sessionsDir, { recursive: true });
     this.mcpManager = new McpManager(sessionsDir, logger);
     this.loadFromDisk();
@@ -59,8 +59,15 @@ export class SessionManager {
       // Initialize CLAUDE.md with session settings template if it doesn't exist
       this.initClaudeMd(sessionDir);
 
+      // Create symlink to shared directory for cross-session knowledge transfer
+      this.ensureSharedLink(sessionDir);
+
       this.logger.info({ sessionKey }, 'Created new session');
     }
+
+    // Ensure shared link exists (also for existing sessions)
+    this.ensureSharedLink(session.sessionDir);
+
     session.lastUsed = Date.now();
 
     // Generate per-session MCP config (.claude/settings.json)
@@ -115,6 +122,28 @@ export class SessionManager {
       this.cleanupTimer = null;
     }
     this.saveToDisk();
+  }
+
+  /**
+   * Ensure a symlink ./shared → {projectRoot}/shared exists in the session directory.
+   * Allows cross-session knowledge transfer without escaping session boundaries.
+   */
+  private ensureSharedLink(sessionDir: string): void {
+    const linkPath = path.join(sessionDir, 'shared');
+    const target = path.join(path.dirname(this.sessionsDir), 'shared');
+    try {
+      const stat = fs.lstatSync(linkPath);
+      if (stat.isSymbolicLink()) return; // Already exists
+      // Not a symlink (maybe a regular dir) — skip to avoid data loss
+      return;
+    } catch {
+      // Does not exist — create it
+    }
+    try {
+      fs.symlinkSync(target, linkPath, 'dir');
+    } catch {
+      // Ignore — race condition or permission issue
+    }
   }
 
   /**

@@ -9,3 +9,12 @@ port-allocations.json
 process-pool-state.json
 .claude/settings.local.json
 .DS_Store
+.cf-tunnel.pid
+.cf-tunnel.url
+.cf-tunnel.log
+.chat-name-cache.json
+.name-cache.json
+sessions.json
+sigma-browser-extension.zip
+_email_processor/
+web/dist/

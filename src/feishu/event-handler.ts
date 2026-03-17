@@ -6,6 +6,11 @@ export interface ImageInfo {
   // Will be filled later with base64 data after download
 }
 
+export interface FileInfo {
+  fileKey: string;
+  fileName: string;
+}
+
 export interface IncomingMessage {
   messageId: string;
   chatId: string;
@@ -15,7 +20,9 @@ export interface IncomingMessage {
   text: string;
   messageType: string;
   parentId?: string;
+  rootId?: string;       // Thread root message ID (for thread/topic replies)
   images?: ImageInfo[];  // Images attached to the message
+  files?: FileInfo[];    // Files attached to the message
   isMentioned: boolean;  // Whether the bot was @mentioned
 }
 
@@ -66,10 +73,10 @@ export function createEventHandler(
         recentMessageIds.add(msgId);
         setTimeout(() => recentMessageIds.delete(msgId), DEDUP_TTL_MS);
 
-        // Handle text, post, and image messages
-        const supportedTypes = ['text', 'post', 'image'];
+        // Handle text, post, image, file, and merge_forward messages
+        const supportedTypes = ['text', 'post', 'image', 'file', 'merge_forward'];
         if (!supportedTypes.includes(message.message_type)) {
-          logger.debug({ messageType: message.message_type }, 'Ignoring unsupported message type');
+          logger.info({ messageType: message.message_type, content: message.content?.slice(0, 300) }, 'Ignoring unsupported message type');
           return;
         }
 
@@ -85,9 +92,10 @@ export function createEventHandler(
             : mentions.length > 0;
         }
 
-        // Parse message text and images
+        // Parse message text, images, and files
         let text = '';
         const images: ImageInfo[] = [];
+        const files: FileInfo[] = [];
 
         if (message.message_type === 'text') {
           const content = JSON.parse(message.content);
@@ -102,13 +110,21 @@ export function createEventHandler(
             images.push({ imageKey: content.image_key });
           }
           text = '[用户发送了一张图片]';
+        } else if (message.message_type === 'file') {
+          const content = JSON.parse(message.content);
+          if (content.file_key) {
+            files.push({ fileKey: content.file_key, fileName: content.file_name || 'unknown' });
+          }
+          text = `[文件] ${content.file_name || 'unknown'}`;
+        } else if (message.message_type === 'merge_forward') {
+          text = '[合并转发消息]';
         }
 
         // Strip @mention tags from text
         text = text.replace(/@_user_\w+/g, '').trim();
 
-        if (!text && images.length === 0) {
-          logger.debug('Empty message after stripping mentions, ignoring');
+        if (!text && images.length === 0 && files.length === 0) {
+          logger.info({ messageType: message.message_type, content: message.content?.slice(0, 300) }, 'Empty message after parsing, ignoring');
           return;
         }
 
@@ -124,7 +140,9 @@ export function createEventHandler(
           text: text || '[用户发送了图片]',
           messageType: message.message_type,
           parentId: message.parent_id || undefined,
+          rootId: message.root_id || undefined,
           images: images.length > 0 ? images : undefined,
+          files: files.length > 0 ? files : undefined,
           isMentioned,
         };
 
@@ -163,25 +181,42 @@ function parsePost(contentStr: string): { text: string; images: ImageInfo[] } {
     const textParts: string[] = [];
     const images: ImageInfo[] = [];
 
+    // Post title (if any)
+    const title = content.zh_cn?.title || content.en_us?.title || content.title;
+    if (title) textParts.push(title + '\n');
+
     const body = content.zh_cn?.content || content.en_us?.content || content.content;
-    if (!Array.isArray(body)) return { text: '', images: [] };
+    if (!Array.isArray(body)) return { text: textParts.join(''), images };
 
     for (const paragraph of body) {
-      if (!Array.isArray(paragraph)) continue;
+      // code_block is a single object, not an array of elements
+      if (!Array.isArray(paragraph)) {
+        if (paragraph?.tag === 'code_block') {
+          const lang = paragraph.language || '';
+          const code = paragraph.text || '';
+          textParts.push(`\n\`\`\`${lang}\n${code}\n\`\`\`\n`);
+        }
+        continue;
+      }
+      const lineParts: string[] = [];
       for (const element of paragraph) {
         if (element.tag === 'text') {
-          textParts.push(element.text || '');
+          lineParts.push(element.text || '');
         } else if (element.tag === 'a') {
-          textParts.push(element.text || element.href || '');
+          lineParts.push(element.text || element.href || '');
         } else if (element.tag === 'img' && element.image_key) {
           images.push({ imageKey: element.image_key });
+        } else if (element.tag === 'code') {
+          // Inline code
+          lineParts.push('`' + (element.text || '') + '`');
         } else if (element.tag === 'at') {
           // Skip @mentions
         }
       }
+      if (lineParts.length > 0) textParts.push(lineParts.join(''));
     }
 
-    return { text: textParts.join(''), images };
+    return { text: textParts.join('\n'), images };
   } catch {
     return { text: '', images: [] };
   }

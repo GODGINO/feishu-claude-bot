@@ -4,7 +4,16 @@
     "NODE_PATH": "__NODE_PATH__"
   },
 
-  "sharedMcp": {},
+  "sharedMcp": {
+    "feishu-im": {
+      "command": "node",
+      "args": ["{PROJECT_ROOT}/dist/feishu/im-mcp.js"],
+      "env": {
+        "FEISHU_APP_ID": "{FEISHU_APP_ID}",
+        "FEISHU_APP_SECRET": "{FEISHU_APP_SECRET}"
+      }
+    }
+  },
 
   "isolatedMcp": {
     "chrome-devtools": {

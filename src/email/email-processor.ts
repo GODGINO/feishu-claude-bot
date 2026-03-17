@@ -59,7 +59,7 @@ export class EmailProcessor {
     private sessionsDir: string,
     private logger: Logger,
   ) {
-    this.processorDir = path.join(sessionsDir, '_email_processor');
+    this.processorDir = path.join(path.dirname(sessionsDir), '_email_processor');
     fs.mkdirSync(this.processorDir, { recursive: true });
   }
 
@@ -99,7 +99,7 @@ ${bodySnippet}`;
     }).join('\n\n');
 
     const rulesSection = userRules
-      ? `\n## 用户自定义规则\n${userRules}\n\n请严格按照以上规则判断每封邮件是否应该推送（notify）。规则中标记为"过滤"的邮件设 notify: false，标记为"关注"的邮件设 notify: true。未匹配任何规则的邮件，根据内容自行判断是否值得推送。\n`
+      ? `\n## 用户自定义规则\n${userRules}\n\n请严格按照以上规则判断每封邮件是否应该推送（notify）。必须严格遵守用户规则，不得自行发挥。如果规则是白名单模式（只推送某些发件人），则不在白名单中的邮件一律设 notify: false。\n`
       : `\n默认规则：过滤纯广告/营销/垃圾邮件（notify: false），其他正常邮件都推送（notify: true）。\n`;
 
     const prompt = `你是邮件分析助手。分析以下 ${emails.length} 封邮件，对每封邮件：

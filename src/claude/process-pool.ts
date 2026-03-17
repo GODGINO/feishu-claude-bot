@@ -28,6 +28,7 @@ interface PersistentProcess {
   currentReject?: (err: Error) => void;
   mcpConfigMtime?: number; // mtime of mcp-servers.json when process was spawned
   lastActivity: number; // timestamp of last stdout event
+  intentionalAbort?: boolean; // true when killed via /stop (preserve sessionId for resume)
 }
 
 const KILL_GRACE_MS = 5000;
@@ -35,6 +36,14 @@ const STATE_FILE = 'process-pool-state.json';
 
 export type UnsolicitedResultCallback = (sessionKey: string, result: RunResult) => void;
 export type ProgressCallback = (sessionKey: string, toolName: string, toolInput?: string) => void;
+export type TextStreamCallback = (sessionKey: string, fullText: string) => void;
+export type ToolStreamCallback = (sessionKey: string, event: {
+  type: 'start' | 'end';
+  toolName: string;
+  toolInput?: string;
+  toolUseId?: string;
+  isError?: boolean;
+}) => void;
 
 export class ProcessPool {
   private processes = new Map<string, PersistentProcess>();
@@ -42,13 +51,15 @@ export class ProcessPool {
   private statePath: string;
   private unsolicitedCallback?: UnsolicitedResultCallback;
   private progressCallback?: ProgressCallback;
+  private textStreamCallbacks = new Map<string, TextStreamCallback>();
+  private toolStreamCallbacks = new Map<string, ToolStreamCallback>();
 
   constructor(
     private config: Config,
     private sessionsDir: string,
     private logger: Logger,
   ) {
-    this.statePath = path.join(sessionsDir, STATE_FILE);
+    this.statePath = path.join(path.dirname(sessionsDir), STATE_FILE);
     this.loadState();
   }
 
@@ -65,6 +76,30 @@ export class ProcessPool {
    */
   onProgress(callback: ProgressCallback): void {
     this.progressCallback = callback;
+  }
+
+  /**
+   * Register callback for text streaming (called with accumulated full text on each assistant event).
+   * Per-session: multiple sessions can have concurrent callbacks.
+   */
+  onTextStream(sessionKey: string, callback: TextStreamCallback | undefined): void {
+    if (callback) {
+      this.textStreamCallbacks.set(sessionKey, callback);
+    } else {
+      this.textStreamCallbacks.delete(sessionKey);
+    }
+  }
+
+  /**
+   * Register callback for tool call events (start/end).
+   * Per-session: multiple sessions can have concurrent callbacks.
+   */
+  onToolStream(sessionKey: string, callback: ToolStreamCallback | undefined): void {
+    if (callback) {
+      this.toolStreamCallbacks.set(sessionKey, callback);
+    } else {
+      this.toolStreamCallbacks.delete(sessionKey);
+    }
   }
 
   /**
@@ -136,11 +171,12 @@ export class ProcessPool {
     // Build the stream-json message
     const stdinMsg = this.buildStdinMessage(opts.message, opts.images);
 
-    // Set up abort handler
+    // Set up abort handler — send SIGINT to gracefully stop current turn, not kill the process.
+    // This preserves the process and sessionId so --resume works on next message.
     if (opts.abortSignal) {
       const onAbort = () => {
-        this.logger.info({ sessionKey: opts.sessionKey }, 'Aborting persistent process');
-        this.killProcess(pp!);
+        this.logger.info({ sessionKey: opts.sessionKey }, 'Abort signal received, sending SIGINT');
+        this.abort(opts.sessionKey);
       };
       opts.abortSignal.addEventListener('abort', onAbort, { once: true });
     }
@@ -170,7 +206,15 @@ export class ProcessPool {
     const pp = this.processes.get(sessionKey);
     if (!pp) return;
 
-    this.killProcess(pp);
+    // Mark as intentional so close handler preserves sessionId for --resume
+    pp.intentionalAbort = true;
+
+    // Send SIGINT (Ctrl+C equivalent) to stop the current task without killing the process.
+    // Claude Code CLI handles SIGINT by stopping the current turn and emitting a result event.
+    if (pp.proc.pid && !pp.proc.killed) {
+      this.logger.info({ sessionKey }, 'Sending SIGINT to stop current task');
+      pp.proc.kill('SIGINT');
+    }
   }
 
   /**
@@ -231,18 +275,24 @@ export class ProcessPool {
       '--dangerously-skip-permissions',
     ];
 
-    // Load per-session MCP config. Use --strict-mcp-config to ignore global ~/.claude/settings.json
-    // MCP servers (which may include stale chrome-devtools pointing to a dead port).
+    // Load per-session MCP config for stdio-only MCP servers.
+    // NOTE: --strict-mcp-config is NOT used because it blocks settings.json MCP servers,
+    // which is where Feishu Streamable HTTP MCP lives (url-type MCP is not supported in --mcp-config).
     const mcpConfigPath = path.join(sessionDir, 'mcp-servers.json');
     if (fs.existsSync(mcpConfigPath)) {
-      args.push('--mcp-config', mcpConfigPath, '--strict-mcp-config');
+      args.push('--mcp-config', mcpConfigPath);
     }
 
-    // Append system prompt
-    const systemPrompt = this.config.claude.systemPrompt;
-    if (systemPrompt) {
-      args.push('--append-system-prompt', systemPrompt);
-    }
+    // Append system prompt with session isolation rules
+    const isolationRule = `\n[安全隔离] 你的工作目录是 ${sessionDir}，这是你唯一允许操作的目录。
+- 严禁访问父目录（../）、其他 session 目录、~/、/tmp 等任何外部路径
+- 严禁在父目录或项目根目录执行 find、ls、cat、grep 等命令（会暴露其他用户的 session）
+- 安装 skill 时必须安装到当前目录的 .claude/skills/ 下，不要安装到全局
+- 执行 npx 命令时确保当前工作目录是 ${sessionDir}
+- SSH 密钥只使用当前目录下的 ssh_key/
+- ./shared/ 是跨 session 共享目录，可以在此读写文件用于跨会话知识传递（如保存报告、数据、配置等供其他 session 使用）`;
+    const systemPrompt = (this.config.claude.systemPrompt || '') + isolationRule;
+    args.push('--append-system-prompt', systemPrompt);
 
     // Resume from saved session (crash recovery)
     if (resumeId) {
@@ -262,11 +312,30 @@ export class ProcessPool {
       }
     }
 
+    // Load session environment variables from session.env
+    const sessionEnvVars: Record<string, string> = {};
+    try {
+      const envContent = fs.readFileSync(path.join(sessionDir, 'session.env'), 'utf-8');
+      for (const line of envContent.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('#')) continue;
+        const eqIdx = trimmed.indexOf('=');
+        if (eqIdx > 0) {
+          sessionEnvVars[trimmed.slice(0, eqIdx).trim()] = trimmed.slice(eqIdx + 1).trim();
+        }
+      }
+    } catch { /* no session.env */ }
+
     const spawnEnv = {
       ...cleanEnv,
+      ...sessionEnvVars,
       ENABLE_TOOL_SEARCH: 'true',
       MCP_TIMEOUT: '30000',
       PATH: `${path.dirname(process.execPath)}:${process.env.HOME}/.local/bin:${process.env.HOME}/.bun/bin:${process.env.PATH}`,
+      // Session isolation: prevent git from traversing above session dir
+      GIT_CEILING_DIRECTORIES: sessionDir,
+      // SESSION_DIR used by skill scripts (cron-cli.cjs, etc.)
+      SESSION_DIR: sessionDir,
     };
 
     // Debug: log claude-related vars and spawn args
@@ -380,14 +449,10 @@ export class ProcessPool {
         return;
       }
 
-      // Only save sessionId for recovery if process exited cleanly (code 0).
-      // Crashed sessions (code !== 0 or null) may be corrupted — don't resume them.
-      if (pp.sessionId && code === 0) {
+      // Always preserve sessionId if we have one — even on unexpected exits,
+      // --resume can recover the conversation. Only discard if we never got a sessionId.
+      if (pp.sessionId) {
         this.savedSessionIds.set(sessionKey, pp.sessionId);
-        this.saveState();
-      } else if (code !== 0) {
-        // Remove potentially corrupted sessionId
-        this.savedSessionIds.delete(sessionKey);
         this.saveState();
       }
 
@@ -446,6 +511,44 @@ export class ProcessPool {
     // Progress callback: notify when Claude uses a tool
     if (result.toolUse && this.progressCallback) {
       this.progressCallback(pp.sessionKey, result.toolUse.name, result.toolUse.input);
+    }
+
+    // Per-session stream callbacks
+    const textCb = this.textStreamCallbacks.get(pp.sessionKey);
+    const toolCb = this.toolStreamCallbacks.get(pp.sessionKey);
+
+    // Text stream callback: notify with accumulated text
+    if (result.text || result.toolUse || result.toolResult) {
+      this.logger.info({
+        sessionKey: pp.sessionKey,
+        hasResolve: !!pp.currentResolve,
+        hasTextCb: !!textCb,
+        hasToolCb: !!toolCb,
+        hasText: !!result.text,
+        hasToolUse: !!result.toolUse,
+        hasToolResult: !!result.toolResult,
+      }, 'Stream event check');
+    }
+    if (result.text && pp.currentResolve && textCb) {
+      textCb(pp.sessionKey, pp.parser.fullText);
+    }
+
+    // Tool stream callbacks: start and end events
+    if (result.toolUse && pp.currentResolve && toolCb) {
+      toolCb(pp.sessionKey, {
+        type: 'start',
+        toolName: result.toolUse.name,
+        toolInput: result.toolUse.input,
+        toolUseId: result.toolUse.toolUseId,
+      });
+    }
+    if (result.toolResult && pp.currentResolve && toolCb) {
+      toolCb(pp.sessionKey, {
+        type: 'end',
+        toolName: '',
+        toolUseId: result.toolResult.toolUseId,
+        isError: result.toolResult.isError,
+      });
     }
 
     // Detect unsolicited text (output arriving when no send() is pending).
@@ -565,7 +668,12 @@ export class ProcessPool {
     const mcpConfigPath = path.join(pp.sessionDir, 'mcp-servers.json');
     try {
       const stat = fs.statSync(mcpConfigPath);
-      if (pp.mcpConfigMtime === undefined) return true; // config was created after spawn
+      if (pp.mcpConfigMtime === undefined) {
+        // Config file was created after spawn — record mtime, don't trigger respawn.
+        // This happens on first message when mcp-servers.json is written after process start.
+        pp.mcpConfigMtime = stat.mtimeMs;
+        return false;
+      }
       return stat.mtimeMs !== pp.mcpConfigMtime;
     } catch {
       return false;

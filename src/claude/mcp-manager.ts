@@ -51,7 +51,7 @@ export class McpManager {
     private logger: Logger,
   ) {
     this.configPath = path.join(path.dirname(sessionsDir), 'mcp-config.json');
-    this.portAllocPath = path.join(sessionsDir, PORT_ALLOC_FILE);
+    this.portAllocPath = path.join(path.dirname(sessionsDir), PORT_ALLOC_FILE);
     this.config = this.loadConfig();
     this.loadPortAllocations();
   }
@@ -118,9 +118,11 @@ export class McpManager {
     if (settingsChanged) {
       fs.writeFileSync(settingsPath, settingsContent);
     }
-    if (mcpChanged) {
-      fs.writeFileSync(mcpConfigPath, mcpContent);
-      // Signal process pool to respawn with updated MCP config
+    if (mcpChanged || settingsChanged) {
+      if (mcpChanged) {
+        fs.writeFileSync(mcpConfigPath, mcpContent);
+      }
+      // Signal process pool to respawn with updated config (MCP or settings change)
       try { fs.writeFileSync(path.join(sessionDir, '.mcp-changed'), ''); } catch { /* ignore */ }
     }
 
@@ -273,10 +275,14 @@ exec node "${cliPath}" "$@"
   /**
    * Deploy all shared skills from skills/ directory to a session's .claude/skills/
    * Unlike email skill which is conditional, these are deployed to every session.
+   * Also fixes any symlinked skills (replaces with real copies).
    */
   private deploySharedSkills(sessionDir: string, vars?: Record<string, string>): void {
     const projectRoot = path.dirname(this.sessionsDir);
     const skillsRoot = path.join(projectRoot, 'skills');
+
+    // Fix any symlinked skills in the session (bot may have created them incorrectly)
+    this.fixSymlinkedSkills(sessionDir);
 
     let skillDirs: string[];
     try {
@@ -333,8 +339,59 @@ exec node "${cliPath}" "$@"
   }
 
   /**
+   * Fix any symlinked skills in the session's .claude/skills/ directory.
+   * The bot may create skills as symlinks (e.g., to .agents/skills/), which is
+   * non-standard. This replaces symlinks with real copies of the target content.
+   */
+  private fixSymlinkedSkills(sessionDir: string): void {
+    const skillsDir = path.join(sessionDir, '.claude', 'skills');
+    try {
+      if (!fs.existsSync(skillsDir)) return;
+      for (const entry of fs.readdirSync(skillsDir)) {
+        const entryPath = path.join(skillsDir, entry);
+        try {
+          const stat = fs.lstatSync(entryPath);
+          if (!stat.isSymbolicLink()) continue;
+
+          // Resolve the symlink target
+          const target = fs.realpathSync(entryPath);
+          if (!fs.existsSync(target)) {
+            // Broken symlink — remove it
+            fs.unlinkSync(entryPath);
+            this.logger.info({ skill: entry, sessionDir }, 'Removed broken skill symlink');
+            continue;
+          }
+
+          // Replace symlink with a real copy
+          fs.unlinkSync(entryPath);
+          this.copyDirRecursive(target, entryPath);
+          this.logger.info({ skill: entry, target, sessionDir }, 'Fixed symlinked skill → copied to session');
+        } catch { /* ignore individual entry errors */ }
+      }
+    } catch { /* ignore */ }
+  }
+
+  /**
+   * Recursively copy a directory.
+   */
+  private copyDirRecursive(src: string, dest: string): void {
+    fs.mkdirSync(dest, { recursive: true });
+    for (const entry of fs.readdirSync(src)) {
+      const srcPath = path.join(src, entry);
+      const destPath = path.join(dest, entry);
+      const stat = fs.statSync(srcPath);
+      if (stat.isDirectory()) {
+        this.copyDirRecursive(srcPath, destPath);
+      } else {
+        fs.copyFileSync(srcPath, destPath);
+      }
+    }
+  }
+
+  /**
    * Build the initial MCP servers config (shared + session only, NO isolated like chrome-devtools).
    * This ensures fast Claude process startup. Chrome MCP is added later by start-chrome.sh.
+   * Always includes remote-browser MCP (for user's local browser when explicitly requested).
    */
   private buildInitialMcpServers(sessionKey: string, sessionDir: string, vars: Record<string, string>): Record<string, any> {
     const mcpServers: Record<string, any> = {};
@@ -354,9 +411,39 @@ exec node "${cliPath}" "$@"
       }
     }
 
-    // NOTE: Feishu MCP servers are NOT added here (mcp-servers.json).
-    // Streamable HTTP MCP in --mcp-config causes Claude to exit if connection fails.
-    // They are added to .claude/settings.json instead (non-fatal on failure).
+    // Always include remote-browser MCP (used when user explicitly requests their local browser).
+    // Sigma browser (server Chrome) is the default, lazy-loaded via start-chrome.sh.
+    // The browser skill prompt tells Sigma which to use based on user's request.
+    const projectRoot = path.dirname(this.sessionsDir);
+    mcpServers['remote-browser'] = {
+      command: 'node',
+      args: [
+        path.join(projectRoot, 'dist', 'relay', 'remote-browser-mcp.js'),
+        sessionKey,
+      ],
+    };
+
+    // Cron MCP — exposes list/create/delete/toggle cron jobs as MCP tools.
+    // SESSION_DIR env var is set by process-pool.ts at spawn time.
+    mcpServers['cron'] = {
+      command: 'node',
+      args: [path.join(projectRoot, 'dist', 'cron', 'cron-mcp.js')],
+    };
+
+    // Feishu Tools MCP — task, calendar, bitable via OAuth Device Flow + User Access Token.
+    mcpServers['feishu-tools'] = {
+      command: 'node',
+      args: [path.join(projectRoot, 'dist', 'feishu', 'feishu-tools-mcp.js')],
+      env: {
+        SESSION_DIR: sessionDir,
+        FEISHU_APP_ID: vars.FEISHU_APP_ID || '',
+        FEISHU_APP_SECRET: vars.FEISHU_APP_SECRET || '',
+      },
+    };
+
+    // NOTE: Feishu MCP servers (url-type / Streamable HTTP) are NOT added here.
+    // --mcp-config only supports stdio MCP (command+args). Feishu MCP uses Streamable HTTP
+    // (url field) which is only supported in settings.json. See buildSettings().
 
     // NOTE: isolatedMcp (chrome-devtools) is deliberately excluded here.
     // It's added by start-chrome.sh when the user actually needs Chrome.
@@ -396,7 +483,7 @@ exec node "${cliPath}" "$@"
     const singleUrlFile = path.join(sessionDir, 'feishu-mcp-url');
     try {
       if (fs.existsSync(singleUrlFile)) {
-        const url = fs.readFileSync(singleUrlFile, 'utf-8').trim();
+        const url = fs.readFileSync(singleUrlFile, 'utf-8').split('\n')[0].trim();
         if (url) {
           mcpServers['feishu'] = { url };
         }
@@ -450,10 +537,9 @@ exec node "${cliPath}" "$@"
     // NOTE: Isolated MCP (chrome-devtools) is NOT added here.
     // It is lazy-loaded via start-chrome.sh → mcp-servers.json → --mcp-config.
 
-    // Add feishu MCP servers (from feishu-mcp-url file and authors.json).
-    // These go in settings.json (not mcp-servers.json) because streamable HTTP MCP
-    // in --mcp-config causes Claude to exit with code 0 if connection fails during init.
-    // In settings.json, MCP connection failures are non-fatal.
+    // Add Feishu MCP servers (url-type / Streamable HTTP).
+    // These MUST be in settings.json because --mcp-config only supports stdio MCP (command+args).
+    // settings.json MCP failures are non-fatal, so if the URL is unreachable Claude still starts.
     this.addFeishuMcpServers(sessionDir, mcpServers);
 
     // Only include mcpServers if there are any
@@ -485,6 +571,10 @@ exec node "${cliPath}" "$@"
       HOME: process.env.HOME || '',
       PROJECT_ROOT: path.dirname(this.sessionsDir),
     };
+
+    // Add Feishu app credentials from process env (for feishu-im shared MCP)
+    if (process.env.FEISHU_APP_ID) vars.FEISHU_APP_ID = process.env.FEISHU_APP_ID;
+    if (process.env.FEISHU_APP_SECRET) vars.FEISHU_APP_SECRET = process.env.FEISHU_APP_SECRET;
 
     // Load per-session MCP URLs from config files in session directory
     const feishuMcpUrlFile = path.join(sessionDir, 'feishu-mcp-url');

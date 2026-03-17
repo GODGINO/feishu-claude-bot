@@ -13,6 +13,7 @@ import { MessageQueue } from './message-queue.js';
 import { GroupContextBuffer } from './group-context.js';
 import { EmailSetup } from './email-setup.js';
 import type { IdleMonitor } from '../email/idle-monitor.js';
+import { CardStreamer } from '../feishu/card-streamer.js';
 
 const TITLE_INSTRUCTION = '\n\n[当你的回复包含 markdown 格式（表格、列表、代码块、加粗、链接、分隔线等）时，必须在第一行写 <<TITLE:简短标题>>，然后空一行写正文。标题10字以内，概括主题。纯文字短回复（打招呼、一两句话确认）不要写标题。]';
 
@@ -27,10 +28,15 @@ function getFeishuMcpHint(sessionDir: string, userId: string): string {
     const data = JSON.parse(fs.readFileSync(authorsFile, 'utf-8'));
     const author = data.authors?.[userId];
     if (author?.feishuMcpUrl) {
-      return `[飞书文档工具限制: 此消息发送者的飞书MCP为 feishu_${userId}，操作飞书文档时仅限调用 mcp__feishu_${userId}__* 系列工具，严禁使用其他用户的飞书MCP工具]`;
+      return `[身份绑定: 当前操作者是「${author.name}」(${userId})。所有操作（编写文档、日报、创建内容等）必须以此人身份执行。飞书MCP仅限调用 mcp__feishu_${userId}__* 系列工具，严禁使用其他用户的飞书MCP工具。文档署名、作者信息必须是「${author.name}」，不得使用群内其他人的姓名。使用 feishu-tools MCP 的任务/日历/多维表格工具时，user_id 参数传 ${userId}。如果工具返回未授权错误，先调用 feishu_auth_start 引导用户完成飞书 OAuth 授权。]`;
+    }
+    // User exists but no MCP URL — provide binding guidance
+    if (author) {
+      return `[身份: 当前操作者是「${author.name}」(${userId})，但尚未绑定飞书 MCP。如果用户需要使用飞书文档/表格/日历/任务等功能，引导用户访问 https://open.feishu.cn/page/mcp 获取 MCP URL 并发送给我完成绑定。使用 feishu-tools MCP 的任务/日历/多维表格工具时，user_id 参数传 ${userId}。]`;
     }
   } catch { /* ignore */ }
-  return '';
+  // DM sessions (no authors.json): still provide feishu-tools hint
+  return `[使用 feishu-tools MCP 的任务/日历/多维表格工具时，user_id 参数传 ${userId}。如果工具返回未授权错误，先调用 feishu_auth_start 引导用户完成飞书 OAuth 授权。]`;
 }
 
 export class MessageBridge {
@@ -161,7 +167,7 @@ export class MessageBridge {
             const elapsed = Math.round((Date.now() - bg.startedAt) / 1000);
             const progressMsg = this.formatProgress(bg.recentTools, elapsed);
             this.logger.info({ sessionKey, elapsed, toolCount: bg.recentTools.length }, 'Sending progress reply');
-            await this.sender.sendText(msg.chatId, progressMsg);
+            await this.sender.sendText(msg.chatId, progressMsg, bg.messageId);
           }
         }
       } else {
@@ -174,6 +180,7 @@ export class MessageBridge {
           this.groupContext.add(msg.chatId, {
             timestamp: Date.now(),
             senderName: msg.senderName || '未知用户',
+            senderId: msg.userId,
             text: msg.text,
           });
           this.groupContext.save(session.sessionDir, msg.chatId);
@@ -191,11 +198,27 @@ export class MessageBridge {
       return;
     }
 
-    // Load group context buffer if needed (group chats only)
-    if (msg.chatType === 'group') {
+    // Load context buffer if needed (group and DM chats)
+    {
       const session = this.sessionMgr.getOrCreate(sessionKey);
       if (!this.groupContext['buffers'].has(msg.chatId)) {
         this.groupContext.load(session.sessionDir, msg.chatId);
+      }
+    }
+
+    // Auto-reply check: if off, buffer non-@mention messages without sending to Claude
+    if (msg.chatType === 'group' && !msg.isMentioned) {
+      let autoReply = 'on';
+      try { autoReply = fs.readFileSync(path.join(session.sessionDir, 'auto-reply'), 'utf-8').trim(); } catch {}
+      if (autoReply === 'off') {
+        this.groupContext.add(msg.chatId, {
+          timestamp: Date.now(),
+          senderName: msg.senderName || '未知用户',
+          senderId: msg.userId,
+          text: msg.text,
+        });
+        this.groupContext.save(session.sessionDir, msg.chatId);
+        return;
       }
     }
 
@@ -210,7 +233,17 @@ export class MessageBridge {
     const abortController = new AbortController();
     this.abortControllers.set(sessionKey, abortController);
 
-    const isNonMentionGroup = !msg.isMentioned && msg.chatType === 'group';
+    // Check auto-reply mode: 'always' treats all group messages as @mentioned
+    let autoReplyMode = 'on';
+    if (msg.chatType === 'group') {
+      try { autoReplyMode = fs.readFileSync(path.join(session.sessionDir, 'auto-reply'), 'utf-8').trim(); } catch {}
+    }
+    const isNonMentionGroup = msg.chatType === 'group' && !msg.isMentioned && autoReplyMode !== 'always';
+
+    // Thread reply: only use existing thread root if message is already in a thread.
+    // Sigma can request new thread via <<THREAD>> tag in response.
+    const existingRootId = msg.rootId;
+    let threadRootId: string | undefined = existingRootId;
 
     // Start typing indicator (THINKING emoji for non-@mention, normal for @mention)
     const reactionId = await this.typing.start(msg.messageId, isNonMentionGroup ? 'THINKING' : undefined);
@@ -229,24 +262,37 @@ export class MessageBridge {
         prompt = `[发送者: ${userName} | id: ${msg.userId}]${mcpHint ? ' ' + mcpHint : ''} ${prompt}`;
       }
 
-      // For group messages, inject rolling context and appropriate tag
+      // Group messages: the Claude subprocess is persistent and manages its own context.
+      // We only inject missed messages (buffered while auto-reply=off or bot was busy).
+      // @mention vs non-@mention: same flow, different hint.
       if (msg.chatType === 'group') {
-        const contextStr = this.groupContext.format(msg.chatId);
-        if (isNonMentionGroup) {
-          const tag = '[群聊消息，未@你]';
-          const noReplyHint = '\n[如果这条消息不需要你回复（闲聊、表情、"好的/收到"等），请仅回复 NO_REPLY 两个词，不加任何其他内容。如果有人提问、讨论你擅长的话题、或提到你的名字(Sigma)，则正常回复。]';
-          prompt = contextStr
-            ? `${contextStr}\n\n${tag}\n${prompt}${noReplyHint}`
-            : `${tag}\n${prompt}${noReplyHint}`;
-        } else {
-          const tag = '[你被@提及，必须回复]';
-          prompt = contextStr ? `${contextStr}\n\n${tag}\n${prompt}` : `${tag}\n${prompt}`;
+        // Inject missed messages (only non-empty when auto-reply=off had buffered messages)
+        const missedStr = this.groupContext.formatMissed(msg.chatId);
+        if (missedStr) {
+          prompt = `${missedStr}\n\n${prompt}`;
         }
 
-        // Write user message to group context buffer
+        // Add behavior hint
+        if (isNonMentionGroup) {
+          prompt = `[群聊消息，未@你]\n${prompt}\n[如果这条消息不需要你回复（闲聊、表情、"好的/收到"等），请仅回复 NO_REPLY 两个词，不加任何其他内容。如果有人提问、讨论你擅长的话题、或提到你的名字(Sigma)，则正常回复。]`;
+        } else {
+          prompt = `[你被@提及，必须回复]\n${prompt}`;
+        }
+
+        // Record + mark sent (for admin dashboard + missed message tracking)
         this.groupContext.add(msg.chatId, {
           timestamp: Date.now(),
           senderName: userName || msg.senderName || '未知用户',
+          senderId: msg.userId,
+          text: msg.text,
+        });
+        this.groupContext.markSent(msg.chatId);
+      } else if (msg.chatType === 'p2p') {
+        // Record DM message (for admin dashboard only)
+        this.groupContext.add(msg.chatId, {
+          timestamp: Date.now(),
+          senderName: userName || msg.senderName || '未知用户',
+          senderId: msg.userId,
           text: msg.text,
         });
       }
@@ -259,17 +305,135 @@ export class MessageBridge {
         }
       }
 
+      // Fetch merge_forward child messages if present
+      if (msg.messageType === 'merge_forward') {
+        const mergeContent = await this.sender.fetchMergeForwardContent(msg.messageId);
+        if (mergeContent) {
+          prompt = prompt.replace('[合并转发消息]', mergeContent);
+        }
+      }
+
       // Download images if present
       let images: ImageAttachment[] | undefined;
       if (msg.images && msg.images.length > 0) {
         images = [];
+        const savedPaths: string[] = [];
         for (const imgInfo of msg.images) {
           const downloaded = await this.sender.downloadImage(msg.messageId, imgInfo.imageKey);
           if (downloaded) {
             images.push({ base64: downloaded.base64, mediaType: downloaded.mediaType });
+            // Save image to session directory so tools (e.g. image-gen-api) can access it
+            try {
+              const ext = downloaded.mediaType.split('/')[1]?.replace('jpeg', 'jpg') || 'png';
+              const imgPath = path.join(session.sessionDir, `upload-${Date.now()}-${savedPaths.length}.${ext}`);
+              fs.writeFileSync(imgPath, Buffer.from(downloaded.base64, 'base64'));
+              savedPaths.push(imgPath);
+              this.logger.info({ imageKey: imgInfo.imageKey, imgPath }, 'Saved image to session dir');
+            } catch (e) {
+              this.logger.warn({ error: e }, 'Failed to save image file');
+            }
           }
         }
         if (images.length === 0) images = undefined;
+        if (savedPaths.length > 0) {
+          prompt += `\n[用户发送的图片已保存: ${savedPaths.join(', ')}]`;
+        }
+      }
+
+      // Download files if present
+      if (msg.files && msg.files.length > 0) {
+        const filePaths: string[] = [];
+        for (const fileInfo of msg.files) {
+          const filePath = await this.sender.downloadFile(msg.messageId, fileInfo.fileKey, fileInfo.fileName, session.sessionDir);
+          if (filePath) {
+            filePaths.push(filePath);
+          }
+        }
+        if (filePaths.length > 0) {
+          prompt += `\n[用户发送的文件已保存: ${filePaths.join(', ')}]`;
+        }
+      }
+
+      // Check streaming mode
+      let streamingReply = 'on';
+      try { streamingReply = fs.readFileSync(path.join(session.sessionDir, 'streaming-reply'), 'utf-8').trim(); } catch {}
+
+      this.logger.info({ sessionKey, streamingReply, isNonMentionGroup }, 'Streaming check');
+
+      // Streaming card path: create card and stream updates in real-time
+      if (streamingReply === 'on' && !isNonMentionGroup) {
+        this.logger.info({ sessionKey }, 'Entering streaming card path');
+        const streamer = new CardStreamer(this.sender.larkClient, this.logger);
+        await streamer.start(msg.chatId, msg.messageId, existingRootId, msg.messageId);
+
+        if (!streamer.isFallback) {
+          // Register stream callbacks scoped to this session
+          const onText = (key: string, text: string) => {
+            if (key === sessionKey) {
+              this.logger.info({ sessionKey, textLen: text.length }, 'Stream text callback fired');
+              streamer.updateText(text);
+            }
+          };
+          const onTool = (key: string, event: { type: 'start' | 'end'; toolName: string; toolInput?: string; toolUseId?: string; isError?: boolean }) => {
+            if (key !== sessionKey) return;
+            if (event.type === 'start') {
+              streamer.addToolCall(event.toolName, event.toolInput, event.toolUseId);
+            } else if (event.type === 'end' && event.toolUseId) {
+              streamer.updateToolCall(event.toolUseId, event.isError ? 'failed' : 'complete');
+            }
+          };
+          this.runner.onTextStream(sessionKey, onText);
+          this.runner.onToolStream(sessionKey, onTool);
+
+          try {
+            const result = await this.runner.run({
+              sessionKey,
+              message: prompt + TITLE_INSTRUCTION,
+              sessionDir: session.sessionDir,
+              abortSignal: abortController.signal,
+              images,
+            });
+
+            const rawText = result.fullText || '';
+            const replyText = rawText.trim();
+            // Detect <<THREAD>> for sendMentionedFiles rootId
+            const streamWantsThread = rawText.startsWith('<<THREAD>>');
+            const streamRootId = existingRootId || (streamWantsThread ? msg.messageId : undefined);
+            if (isNonMentionGroup && replyText === 'NO_REPLY') {
+              await streamer.abort('(无需回复)');
+            } else {
+              await streamer.complete(rawText || '(空回复)');
+              const cleanText = rawText.replace(/^<<THREAD>>\s*/, '');
+              await this.sendMentionedFiles(msg.chatId, cleanText, session.sessionDir, undefined, streamRootId);
+            }
+
+            // Write bot reply to context buffer
+            const cleanReply = replyText.replace(/^<<THREAD>>\s*/, '');
+            if ((msg.chatType === 'group' || msg.chatType === 'p2p') && cleanReply && cleanReply !== 'NO_REPLY') {
+              const entries = this.groupContext['buffers'].get(msg.chatId);
+              if (entries && entries.length > 0) {
+                entries[entries.length - 1].botReply = cleanReply.length > 500
+                  ? cleanReply.slice(0, 500) + '...' : cleanReply;
+              }
+              this.groupContext.save(session.sessionDir, msg.chatId);
+            }
+          } catch (err) {
+            if (abortController.signal.aborted) {
+              // /stop was used — complete with whatever content we have, not an error
+              this.logger.info({ sessionKey }, 'Streaming task stopped by user');
+              await streamer.complete(streamer.getCurrentText() || '⏹ 任务已中止');
+            } else {
+              this.logger.error({ err, sessionKey }, 'Streaming task failed');
+              await streamer.abort(`❌ 出错了: ${err instanceof Error ? err.message : String(err)}`);
+            }
+          } finally {
+            this.runner.onTextStream(sessionKey, undefined);
+            this.runner.onToolStream(sessionKey, undefined);
+          }
+          // Skip the normal reply flow below — streaming handled everything
+          return;
+        }
+        // If fallback, continue with normal flow below
       }
 
       // Start Claude processing (non-blocking race with timeout)
@@ -297,14 +461,21 @@ export class MessageBridge {
         // Claude responded quickly — check for NO_REPLY before sending
         const result = quickResult.result;
         const replyText = result.fullText?.trim() || '';
+        // Detect <<THREAD>> tag for thread reply
+        const wantsThread = result.fullText?.startsWith('<<THREAD>>') || false;
+        const effectiveRootId = existingRootId || (wantsThread ? msg.messageId : undefined);
+        // Strip <<THREAD>> from result before sending
+        if (wantsThread && result.fullText) {
+          result.fullText = result.fullText.replace(/^<<THREAD>>\s*/, '');
+        }
         this.logger.info(
-          { sessionKey, hasError: !!result.error, textLength: replyText.length, mode: 'quick', isNoReply: replyText === 'NO_REPLY' },
+          { sessionKey, hasError: !!result.error, textLength: replyText.length, mode: 'quick', isNoReply: replyText === 'NO_REPLY', wantsThread },
           'Claude subprocess finished (quick)',
         );
-        if (replyText === 'NO_REPLY' || (isNonMentionGroup && replyText === '')) {
-          // Silent skip — no reply needed
+        if (isNonMentionGroup && (replyText === 'NO_REPLY' || replyText === '')) {
+          // Silent skip — no reply needed (only for non-@mention group messages)
         } else {
-          await this.sendResult(msg, sessionKey, session, result, reactionId ?? undefined);
+          await this.sendResult(msg, sessionKey, session, result, reactionId ?? undefined, effectiveRootId);
         }
       } else {
         // Claude is still processing — keep typing indicator and lock
@@ -339,20 +510,26 @@ export class MessageBridge {
           .then(async (result) => {
             clearInterval(activityCheck);
             const replyText = result.fullText?.trim() || '';
+            // Detect <<THREAD>> for background results
+            const bgWantsThread = result.fullText?.startsWith('<<THREAD>>') || false;
+            const bgRootId = existingRootId || (bgWantsThread ? msg.messageId : undefined);
+            if (bgWantsThread && result.fullText) {
+              result.fullText = result.fullText.replace(/^<<THREAD>>\s*/, '');
+            }
             this.logger.info(
-              { sessionKey, hasError: !!result.error, textLength: replyText.length, mode: 'background', isNoReply: replyText === 'NO_REPLY' },
+              { sessionKey, hasError: !!result.error, textLength: replyText.length, mode: 'background', isNoReply: replyText === 'NO_REPLY', bgWantsThread },
               'Claude subprocess finished (background)',
             );
-            if (replyText === 'NO_REPLY' || (isNonMentionGroup && replyText === '')) {
-              // Silent skip
+            if (isNonMentionGroup && (replyText === 'NO_REPLY' || replyText === '')) {
+              // Silent skip (only for non-@mention group messages)
             } else if (result.error && !result.fullText) {
-              await this.sender.sendReply(msg.chatId, `❌ 出错了: ${result.error}`, msg.messageId);
+              await this.sender.sendReply(msg.chatId, `❌ 出错了: ${result.error}`, undefined, undefined, bgRootId);
             } else {
               const finalText = result.fullText || '(空回复)';
-              await this.sender.sendReply(msg.chatId, finalText, msg.messageId, session.sessionDir);
-              await this.sendMentionedFiles(msg.chatId, finalText, session.sessionDir, msg.messageId);
-              // Write to group context
-              if (msg.chatType === 'group') {
+              await this.sender.sendReply(msg.chatId, finalText, undefined, session.sessionDir, bgRootId);
+              await this.sendMentionedFiles(msg.chatId, finalText, session.sessionDir, undefined, bgRootId);
+              // Write to context buffer
+              if (msg.chatType === 'group' || msg.chatType === 'p2p') {
                 const entries = this.groupContext['buffers'].get(msg.chatId);
                 if (entries && entries.length > 0) {
                   entries[entries.length - 1].botReply = finalText.length > 500
@@ -366,7 +543,7 @@ export class MessageBridge {
             clearInterval(activityCheck);
             this.logger.error({ err, sessionKey }, 'Background task failed');
             if (!isNonMentionGroup) {
-              this.sender.sendReply(msg.chatId, '❌ 后台任务失败，请重试', msg.messageId).catch(() => {});
+              this.sender.sendReply(msg.chatId, '❌ 后台任务失败，请重试', undefined, undefined, existingRootId).catch(() => {});
             }
           })
           .finally(() => {
@@ -383,7 +560,7 @@ export class MessageBridge {
 
     } catch (err) {
       this.logger.error({ err, sessionKey }, 'Failed to process message');
-      await this.sender.sendReply(msg.chatId, '❌ 处理消息时出错，请重试', msg.messageId);
+      await this.sender.sendReply(msg.chatId, '❌ 处理消息时出错，请重试', undefined, undefined, existingRootId);
     } finally {
       if (!backgroundMode) {
         // Stop typing indicator and release lock
@@ -407,17 +584,18 @@ export class MessageBridge {
     session: { sessionDir: string },
     result: { fullText: string; error?: string; sessionId?: string },
     reactionId: string | undefined,
+    threadRootId?: string,
   ): Promise<void> {
     const replyText = result.fullText || '(空回复)';
     if (result.error && !result.fullText) {
-      await this.sender.sendReply(msg.chatId, `❌ 出错了: ${result.error}`, msg.messageId);
+      await this.sender.sendReply(msg.chatId, `❌ 出错了: ${result.error}`, undefined, undefined, threadRootId);
     } else {
-      await this.sender.sendReply(msg.chatId, replyText, msg.messageId, session.sessionDir);
-      await this.sendMentionedFiles(msg.chatId, replyText, session.sessionDir, msg.messageId);
+      await this.sender.sendReply(msg.chatId, replyText, undefined, session.sessionDir, threadRootId);
+      await this.sendMentionedFiles(msg.chatId, replyText, session.sessionDir, undefined, threadRootId);
     }
 
-    // Write bot reply to group context buffer
-    if (msg.chatType === 'group') {
+    // Write bot reply to context buffer
+    if (msg.chatType === 'group' || msg.chatType === 'p2p') {
       const entries = this.groupContext['buffers'].get(msg.chatId);
       if (entries && entries.length > 0) {
         entries[entries.length - 1].botReply = replyText.length > 500
@@ -428,22 +606,33 @@ export class MessageBridge {
   }
 
   /**
-   * Scan Claude's reply for file paths in the session directory and send them via Feishu.
+   * Scan Claude's reply for file paths and send them via Feishu.
+   * Matches paths in session directory and /tmp/.
    */
   private async sendMentionedFiles(
     chatId: string,
     replyText: string,
     sessionDir: string,
     replyToMessageId?: string,
+    rootId?: string,
   ): Promise<void> {
     try {
       // Match absolute paths that look like files (with extensions)
-      const pathPattern = new RegExp(
-        sessionDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '/[\\w./-]+\\.\\w+',
-        'g',
-      );
-      const matches = replyText.match(pathPattern);
-      if (!matches) return;
+      const escapedDir = sessionDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const projectRoot = path.resolve(sessionDir, '..', '..');
+      const escapedRoot = projectRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const patterns = [
+        new RegExp(escapedDir + '/[\\w./-]+\\.\\w+', 'g'),
+        new RegExp(escapedRoot + '/[\\w./-]+\\.\\w+', 'g'),
+        /\/tmp\/[\w./-]+\.\w+/g,
+      ];
+      const allMatches: string[] = [];
+      for (const p of patterns) {
+        const m = replyText.match(p);
+        if (m) allMatches.push(...m);
+      }
+      if (allMatches.length === 0) return;
+      const matches = allMatches;
 
       // Deduplicate
       const uniquePaths = [...new Set(matches)];
@@ -461,9 +650,9 @@ export class MessageBridge {
 
         const ext = path.extname(filePath).toLowerCase();
         if (imageExts.has(ext)) {
-          await this.sender.sendImage(chatId, filePath);
+          await this.sender.sendImage(chatId, filePath, undefined, rootId);
         } else {
-          await this.sender.sendFile(chatId, filePath);
+          await this.sender.sendFile(chatId, filePath, undefined, rootId);
         }
 
         this.logger.info({ filePath }, 'Sent file to Feishu');

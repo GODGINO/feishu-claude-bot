@@ -1,3 +1,4 @@
+import * as fs from 'node:fs';
 import type { MessageSender } from '../feishu/message-sender.js';
 import type { SessionManager } from '../claude/session-manager.js';
 import type { ClaudeRunner } from '../claude/runner.js';
@@ -61,6 +62,12 @@ export class CommandHandler {
     if (cmd === '/register') {
       return this.handleRegister(ctx);
     }
+    if (cmd === '/auto' || cmd.startsWith('/auto ')) {
+      return this.handleAuto(text.trim(), ctx);
+    }
+    if (cmd === '/stream' || cmd.startsWith('/stream ')) {
+      return this.handleStream(text.trim(), ctx);
+    }
 
     return false;
   }
@@ -80,9 +87,10 @@ export class CommandHandler {
   private async handleStop(ctx: CommandContext): Promise<boolean> {
     const controller = this.abortControllers.get(ctx.sessionKey);
     if (controller) {
-      controller.abort();
-      // Also abort the persistent process (it will auto-resume on next message)
+      // Send SIGINT first — Claude Code will stop current turn and emit a result.
+      // The abortController then cancels the message-bridge wait loop.
       this.runner.abort(ctx.sessionKey);
+      controller.abort();
       await this.sender.sendText(ctx.chatId, '⏹ 已中止当前任务', ctx.messageId);
       this.logger.info({ sessionKey: ctx.sessionKey }, '/stop: task aborted');
     } else {
@@ -264,6 +272,72 @@ export class CommandHandler {
     return true;
   }
 
+  private async handleAuto(text: string, ctx: CommandContext): Promise<boolean> {
+    const session = this.sessionMgr.get(ctx.sessionKey) || this.sessionMgr.getOrCreate(ctx.sessionKey);
+    const autoReplyFile = `${session.sessionDir}/auto-reply`;
+    const parts = text.split(/\s+/);
+    const sub = parts[1]?.toLowerCase();
+
+    if (sub === 'on' || sub === 'off' || sub === 'always') {
+      fs.writeFileSync(autoReplyFile, sub);
+      const descMap: Record<string, string> = {
+        on: '已开启：未@消息也会由 AI 判断是否回复',
+        off: '已关闭：仅回复 @消息（未@消息记录为上下文）',
+        always: '已开启 Always 模式：所有消息都视为@提及，必定回复',
+      };
+      await this.sender.sendText(ctx.chatId, `✅ 自动回复${descMap[sub]}`, ctx.messageId);
+      this.logger.info({ sessionKey: ctx.sessionKey, autoReply: sub }, '/auto: updated');
+    } else {
+      let current = 'on';
+      try { current = fs.readFileSync(autoReplyFile, 'utf-8').trim(); } catch {}
+      const descMap: Record<string, string> = {
+        on: '当前：未@消息也会由 AI 判断是否回复',
+        off: '当前：仅回复 @消息（未@消息记录为上下文）',
+        always: '当前：Always 模式，所有消息都视为@提及，必定回复',
+      };
+      await this.sender.sendReply(ctx.chatId, [
+        `**自动回复状态: ${current}**`,
+        '',
+        descMap[current] || descMap['on'],
+        '',
+        '`/auto on` — 开启（AI 判断是否回复未@消息）',
+        '`/auto off` — 关闭（仅回复@消息）',
+        '`/auto always` — 全部回复（所有消息都当作@处理）',
+      ].join('\n'), ctx.messageId);
+    }
+    return true;
+  }
+
+  private async handleStream(text: string, ctx: CommandContext): Promise<boolean> {
+    const session = this.sessionMgr.get(ctx.sessionKey) || this.sessionMgr.getOrCreate(ctx.sessionKey);
+    const streamFile = `${session.sessionDir}/streaming-reply`;
+    const parts = text.split(/\s+/);
+    const sub = parts[1]?.toLowerCase();
+
+    if (sub === 'on' || sub === 'off') {
+      fs.writeFileSync(streamFile, sub);
+      const desc = sub === 'on'
+        ? '已开启：回复将以流式卡片实时显示'
+        : '已关闭：回复将在完成后一次性发送';
+      await this.sender.sendText(ctx.chatId, `✅ 流式回复${desc}`, ctx.messageId);
+      this.logger.info({ sessionKey: ctx.sessionKey, streaming: sub }, '/stream: updated');
+    } else {
+      let current = 'off';
+      try { current = fs.readFileSync(streamFile, 'utf-8').trim(); } catch {}
+      await this.sender.sendReply(ctx.chatId, [
+        `**流式回复状态: ${current}**`,
+        '',
+        current === 'on'
+          ? '当前：回复以流式卡片实时显示'
+          : '当前：回复在完成后一次性发送',
+        '',
+        '`/stream on` — 开启流式卡片回复',
+        '`/stream off` — 关闭流式卡片回复',
+      ].join('\n'), ctx.messageId);
+    }
+    return true;
+  }
+
   private async handleHelp(ctx: CommandContext): Promise<boolean> {
     const helpText = [
       '**可用命令**',
@@ -273,6 +347,8 @@ export class CommandHandler {
       '`/status` — 查看当前会话状态',
       '`/email` — 邮箱管理（添加、查看、测试）',
       '`/register` — 注册开发者身份（Git + 飞书 MCP）',
+      '`/auto [on|off|always]` — 群聊自动回复（on=AI判断, off=仅@回复, always=全部回复）',
+      '`/stream [on|off]` — 流式卡片回复开关（实时显示生成过程）',
       '`/help` — 显示此帮助信息',
       '',
       '直接发送消息即可与 Claude 对话。Claude 可以读写文件、执行命令等。',

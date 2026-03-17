@@ -15,6 +15,7 @@ import * as path from 'node:path';
 import { execSync } from 'node:child_process';
 import { IdleMonitor } from './email/idle-monitor.js';
 import { EmailProcessor, formatPushNotification } from './email/email-processor.js';
+import { startAdminServer } from './admin/server.js';
 
 /**
  * Ensure only one bot instance runs at a time.
@@ -61,7 +62,7 @@ async function main() {
   const config = loadConfig();
   const logger = createLogger(config.logLevel);
 
-  const PID_FILE = path.join(config.sessionsDir, '.bot.pid');
+  const PID_FILE = path.join(path.dirname(config.sessionsDir), '.bot.pid');
   ensureSingleInstance(PID_FILE, logger);
 
   // Watchdog: periodically check for rogue duplicate processes (every 60s)
@@ -151,6 +152,9 @@ async function main() {
   );
   chromeChecker.start();
 
+  // Start admin dashboard + relay server
+  const { relayServer } = startAdminServer(config.sessionsDir, config.adminPort, logger, client, config.adminPassword);
+
   // Start WebSocket connection
   await wsClient.start({ eventDispatcher: dispatcher });
   logger.info('Feishu WebSocket connected. Bot is ready!');
@@ -158,6 +162,7 @@ async function main() {
   // Graceful shutdown
   const shutdown = () => {
     logger.info('Shutting down...');
+    relayServer.destroy();
     idleMonitor.stopAll();
     chromeChecker.stop();
     scheduler.stop();
