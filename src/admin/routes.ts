@@ -268,7 +268,6 @@ export function createRoutes(sessionsDir: string, feishuClient?: lark.Client): R
     const isDm = key.startsWith('dm_');
     const chatId = readText(path.join(dir, 'chat-id')) || (isGroup ? key.replace('group_', '') : null);
     const autoReply = readText(path.join(dir, 'auto-reply'));
-    const streamingReply = readText(path.join(dir, 'streaming-reply'));
     const authors = readJson(path.join(dir, 'authors.json'));
     const cronJobs = readJson(path.join(dir, 'cron-jobs.json'));
     const context = readJson(path.join(dir, 'group-context.json'));
@@ -340,7 +339,6 @@ export function createRoutes(sessionsDir: string, feishuClient?: lark.Client): R
       type: isGroup ? 'group' : isDm ? 'dm' : 'other',
       chatId,
       autoReply,
-      streamingReply,
       memberCount: memberNames.size || (authors?.authors ? Object.keys(authors.authors).length : 0),
       cronJobCount: Array.isArray(cronJobs) ? cronJobs.length : 0,
       messageCount: Array.isArray(context) ? context.length : 0,

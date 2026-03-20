@@ -65,9 +65,6 @@ export class CommandHandler {
     if (cmd === '/auto' || cmd.startsWith('/auto ')) {
       return this.handleAuto(text.trim(), ctx);
     }
-    if (cmd === '/stream' || cmd.startsWith('/stream ')) {
-      return this.handleStream(text.trim(), ctx);
-    }
 
     return false;
   }
@@ -308,35 +305,6 @@ export class CommandHandler {
     return true;
   }
 
-  private async handleStream(text: string, ctx: CommandContext): Promise<boolean> {
-    const session = this.sessionMgr.get(ctx.sessionKey) || this.sessionMgr.getOrCreate(ctx.sessionKey);
-    const streamFile = `${session.sessionDir}/streaming-reply`;
-    const parts = text.split(/\s+/);
-    const sub = parts[1]?.toLowerCase();
-
-    if (sub === 'on' || sub === 'off') {
-      fs.writeFileSync(streamFile, sub);
-      const desc = sub === 'on'
-        ? '已开启：回复将以流式卡片实时显示'
-        : '已关闭：回复将在完成后一次性发送';
-      await this.sender.sendText(ctx.chatId, `✅ 流式回复${desc}`, ctx.messageId);
-      this.logger.info({ sessionKey: ctx.sessionKey, streaming: sub }, '/stream: updated');
-    } else {
-      let current = 'off';
-      try { current = fs.readFileSync(streamFile, 'utf-8').trim(); } catch {}
-      await this.sender.sendReply(ctx.chatId, [
-        `**流式回复状态: ${current}**`,
-        '',
-        current === 'on'
-          ? '当前：回复以流式卡片实时显示'
-          : '当前：回复在完成后一次性发送',
-        '',
-        '`/stream on` — 开启流式卡片回复',
-        '`/stream off` — 关闭流式卡片回复',
-      ].join('\n'), ctx.messageId);
-    }
-    return true;
-  }
 
   private async handleHelp(ctx: CommandContext): Promise<boolean> {
     const helpText = [
@@ -348,7 +316,6 @@ export class CommandHandler {
       '`/email` — 邮箱管理（添加、查看、测试）',
       '`/register` — 注册开发者身份（Git + 飞书 MCP）',
       '`/auto [on|off|always]` — 群聊自动回复（on=AI判断, off=仅@回复, always=全部回复）',
-      '`/stream [on|off]` — 流式卡片回复开关（实时显示生成过程）',
       '`/help` — 显示此帮助信息',
       '',
       '直接发送消息即可与 Claude 对话。Claude 可以读写文件、执行命令等。',

@@ -265,7 +265,6 @@ export class MessageBridge {
 
     // Start typing indicator (THINKING emoji for non-@mention, normal for @mention)
     const reactionId = await this.typing.start(msg.messageId, isNonMentionGroup ? 'THINKING' : undefined);
-    let backgroundMode = false; // true = cleanup handled by .finally() on the promise, skip try/finally
 
     try {
       // Resolve user name: try API first, fall back to event sender name
@@ -372,54 +371,46 @@ export class MessageBridge {
         }
       }
 
-      // Check streaming mode
-      let streamingReply = 'on';
-      try { streamingReply = fs.readFileSync(path.join(session.sessionDir, 'streaming-reply'), 'utf-8').trim(); } catch {}
-
-      this.logger.info({ sessionKey, streamingReply, isNonMentionGroup }, 'Streaming check');
-
-      // Streaming card path: create card and stream updates in real-time
-      // All messages use lazy mode: card is created only when Claude starts outputting real content.
-      // This prevents empty cards for NO_REPLY / REACT-only responses.
-      if (streamingReply === 'on') {
-        this.logger.info({ sessionKey }, 'Entering streaming card path (lazy)');
+      // Streaming card path: card created on-demand (when tools are used).
+      // Simple text replies are sent as plain text messages.
+      {
+        this.logger.info({ sessionKey, isNonMentionGroup }, 'Entering streaming path');
         const streamer = new CardStreamer(this.sender.larkClient, this.logger);
 
-        if (!streamer.isFallback) {
+        {
           // Register stream callbacks scoped to this session
-          let lazyStarted = false; // card not created yet — will create on first real content
-          let lazyStarting = false; // true while start() is in progress
-          let lazyLatestText = ''; // buffer latest text while start() is in progress
+          let cardCreated = false;
+          let cardCreating = false;
+
+          // Create streaming card (called on first tool use, or at result for long text)
+          let bufferedText = ''; // Buffer text until card is created or result arrives
+          const ensureCard = () => {
+            if (cardCreated || cardCreating) return;
+            cardCreating = true;
+            this.logger.info({ sessionKey }, 'Creating streaming card');
+            const p = streamer.start(msg.chatId, msg.messageId, existingRootId, msg.messageId).then(() => {
+              cardCreating = false;
+              cardCreated = true;
+              // Flush buffered text
+              if (bufferedText) streamer.updateText(bufferedText);
+            });
+            streamer.startPromise = p;
+          };
+
           const onText = (key: string, text: string) => {
             if (key !== sessionKey) return;
-            // Lazy mode: first real text triggers card creation
-            if (!lazyStarted) {
-              const trimmed = text.trim();
-              if (!trimmed) return;
-              if (trimmed === 'NO_REPLY') return;
-              // REACT-only response — don't create card
-              if (/^(<<REACT:\w+>>\s*)+$/.test(trimmed)) return;
-              // Real content — create card now
-              lazyStarted = true;
-              lazyStarting = true;
-              lazyLatestText = text;
-              this.logger.info({ sessionKey }, 'Lazy card: real content detected, creating card');
-              const p = streamer.start(msg.chatId, msg.messageId, existingRootId, msg.messageId).then(() => {
-                lazyStarting = false;
-                streamer.updateText(lazyLatestText);
-              });
-              streamer.startPromise = p;
-              return;
+            bufferedText = text; // Always buffer latest accumulated text
+            if (cardCreated && !cardCreating) {
+              streamer.updateText(text);
             }
-            // Buffer text while start() is still in progress
-            if (lazyStarting) {
-              lazyLatestText = text;
-              return;
-            }
-            streamer.updateText(text);
+            // If card not created yet: text stays buffered until tool call or result
           };
           const onTool = (key: string, event: { type: 'start' | 'end'; toolName: string; toolInput?: string; toolUseId?: string; isError?: boolean }) => {
             if (key !== sessionKey) return;
+            // First tool call triggers card creation
+            if (event.type === 'start' && !cardCreated && !cardCreating) {
+              ensureCard();
+            }
             if (event.type === 'start') {
               streamer.addToolCall(event.toolName, event.toolInput, event.toolUseId);
             } else if (event.type === 'end' && event.toolUseId) {
@@ -478,15 +469,16 @@ export class MessageBridge {
             const streamWantsThread = rawText.includes('<<THREAD>>');
             const streamRootId = existingRootId || (streamWantsThread ? msg.messageId : undefined);
             const isReactOnly = !rawText && !!result.fullText;
+            const cleanText = rawText.replace(/<<THREAD>>\s*/g, '').replace(/<<REACT:\w+>>\s*/g, '').trim();
             if (replyText === 'NO_REPLY' || (isNonMentionGroup && replyText === '') || isReactOnly) {
-              // NO_REPLY, empty non-mention, or REACT-only — card was never created (lazy mode)
+              // NO_REPLY, empty non-mention, or REACT-only — no reply needed
             } else if (runningAgents.size > 0) {
-              // Agents still running — keep card alive, show text but don't finalize
-              this.logger.info({ sessionKey, runningAgents: runningAgents.size }, 'Turn done but agents still running, keeping card alive');
+              // Agents still running — need card for progress display
+              if (!cardCreated) ensureCard();
+              if (streamer.startPromise) await streamer.startPromise;
               streamer.completeTextOnly(rawText || '(空回复)');
-              const cleanText = rawText.replace(/<<THREAD>>\s*/g, '');
               await this.sendMentionedFiles(msg.chatId, cleanText, session.sessionDir, undefined, streamRootId);
-              // Timeout fallback: finalize card if agents don't complete within 10 minutes
+              this.logger.info({ sessionKey, runningAgents: runningAgents.size }, 'Turn done but agents still running, keeping card alive');
               setTimeout(() => {
                 if (streamer.isWaitingForAgents()) {
                   this.logger.warn({ sessionKey, remaining: runningAgents.size }, 'Agent timeout — finalizing card');
@@ -494,11 +486,16 @@ export class MessageBridge {
                   this.runner.onSubagentStream(sessionKey, undefined);
                 }
               }, 10 * 60 * 1000);
-            } else {
-              await streamer.complete(rawText || '(空回复)');
-              const cleanText = rawText.replace(/<<THREAD>>\s*/g, '');
+            } else if (!cardCreated) {
+              // No card was created (no tool calls) — send as plain text
+              this.logger.info({ sessionKey, textLen: cleanText.length }, 'No tools used, sending plain text reply');
+              await this.sender.sendReply(msg.chatId, cleanText || '(空回复)', undefined, session.sessionDir, streamRootId);
               await this.sendMentionedFiles(msg.chatId, cleanText, session.sessionDir, undefined, streamRootId);
-              // No agents running, clean up subagent listener
+              this.runner.onSubagentStream(sessionKey, undefined);
+            } else {
+              // Card exists (tools were used) — complete normally
+              await streamer.complete(rawText || '(空回复)');
+              await this.sendMentionedFiles(msg.chatId, cleanText, session.sessionDir, undefined, streamRootId);
               this.runner.onSubagentStream(sessionKey, undefined);
             }
 
@@ -528,153 +525,20 @@ export class MessageBridge {
           // Skip the normal reply flow below — streaming handled everything
           return;
         }
-        // If fallback, continue with normal flow below
       }
 
-      // Start Claude processing (non-blocking race with timeout)
-      const resultPromise = this.runner.run({
-        sessionKey,
-        message: prompt + TITLE_INSTRUCTION,
-        sessionDir: session.sessionDir,
-        abortSignal: abortController.signal,
-        images,
-      });
-
-      // Race: wait up to 15 seconds for a quick response.
-      // If Claude responds in time → send reply normally.
-      // If not → release the lock so new messages can be processed,
-      //          and handle the result in the background when it arrives.
-      const QUICK_TIMEOUT_MS = 15_000;
-      const quickResult = await Promise.race([
-        resultPromise.then(r => ({ type: 'result' as const, result: r })),
-        new Promise<{ type: 'timeout' }>(resolve =>
-          setTimeout(() => resolve({ type: 'timeout' }), QUICK_TIMEOUT_MS),
-        ),
-      ]);
-
-      if (quickResult.type === 'result') {
-        // Claude responded quickly — check for NO_REPLY before sending
-        const result = quickResult.result;
-        // Process <<REACT:emoji>> tags
-        if (result.fullText) {
-          result.fullText = await this.processReactions(result.fullText, msg.messageId);
-        }
-        const replyText = result.fullText?.trim() || '';
-        // Detect <<THREAD>> tag for thread reply
-        const wantsThread = result.fullText?.includes('<<THREAD>>') || false;
-        const effectiveRootId = existingRootId || (wantsThread ? msg.messageId : undefined);
-        // Strip <<THREAD>> from result before sending
-        if (wantsThread && result.fullText) {
-          result.fullText = result.fullText.replace(/<<THREAD>>\s*/g, '');
-        }
-        this.logger.info(
-          { sessionKey, hasError: !!result.error, textLength: replyText.length, mode: 'quick', isNoReply: replyText === 'NO_REPLY', wantsThread },
-          'Claude subprocess finished (quick)',
-        );
-        if (replyText === 'NO_REPLY' || (isNonMentionGroup && replyText === '') || (!result.fullText && replyText === '')) {
-          // Silent skip — NO_REPLY, empty non-mention, or REACT-only
-        } else {
-          await this.sendResult(msg, sessionKey, session, result, reactionId ?? undefined, effectiveRootId);
-        }
-      } else {
-        // Claude is still processing — keep typing indicator and lock
-        this.logger.info({ sessionKey }, 'Quick timeout — continuing in background, keeping lock');
-        backgroundMode = true;
-
-        // Track for progress reporting
-        this.backgroundSessions.set(sessionKey, {
-          chatId: msg.chatId,
-          messageId: msg.messageId,
-          startedAt: Date.now(),
-          recentTools: [],
-        });
-
-        // Activity-based timeout: check every 60s, abort if no activity for 5min (@mention) or 3min (non-@mention)
-        const IDLE_LIMIT_MS = isNonMentionGroup ? 180_000 : 300_000;
-        const bgStartTime = Date.now();
-        const activityCheck = setInterval(() => {
-          const lastActivity = this.runner.getLastActivity(sessionKey);
-          // Use bgStartTime as fallback if process has no activity yet
-          const reference = lastActivity > 0 ? lastActivity : bgStartTime;
-          const idleMs = Date.now() - reference;
-          if (idleMs > IDLE_LIMIT_MS) {
-            this.logger.warn({ sessionKey, idleMs, idleLimitMs: IDLE_LIMIT_MS }, 'Activity timeout — aborting');
-            abortController.abort();
-            clearInterval(activityCheck);
-          }
-        }, 60_000);
-
-        // Handle result when it eventually arrives
-        resultPromise
-          .then(async (result) => {
-            clearInterval(activityCheck);
-            // Process <<REACT:emoji>> tags
-            if (result.fullText) {
-              result.fullText = await this.processReactions(result.fullText, msg.messageId);
-            }
-            const replyText = result.fullText?.trim() || '';
-            // Detect <<THREAD>> for background results
-            const bgWantsThread = result.fullText?.includes('<<THREAD>>') || false;
-            const bgRootId = existingRootId || (bgWantsThread ? msg.messageId : undefined);
-            if (bgWantsThread && result.fullText) {
-              result.fullText = result.fullText.replace(/<<THREAD>>\s*/g, '');
-            }
-            this.logger.info(
-              { sessionKey, hasError: !!result.error, textLength: replyText.length, mode: 'background', isNoReply: replyText === 'NO_REPLY', bgWantsThread },
-              'Claude subprocess finished (background)',
-            );
-            if (replyText === 'NO_REPLY' || (isNonMentionGroup && replyText === '') || (!result.fullText && replyText === '')) {
-              // Silent skip — NO_REPLY, empty non-mention, or REACT-only
-            } else if (result.error && !result.fullText) {
-              await this.sender.sendReply(msg.chatId, `❌ 出错了: ${result.error}`, undefined, undefined, bgRootId);
-            } else {
-              const finalText = result.fullText || '(空回复)';
-              await this.sender.sendReply(msg.chatId, finalText, undefined, session.sessionDir, bgRootId);
-              await this.sendMentionedFiles(msg.chatId, finalText, session.sessionDir, undefined, bgRootId);
-              // Write to context buffer
-              if (msg.chatType === 'group' || msg.chatType === 'p2p') {
-                const entries = this.groupContext['buffers'].get(msg.chatId);
-                if (entries && entries.length > 0) {
-                  entries[entries.length - 1].botReply = finalText.length > 500
-                    ? finalText.slice(0, 500) + '...' : finalText;
-                }
-                this.groupContext.save(session.sessionDir, msg.chatId);
-              }
-            }
-          })
-          .catch((err) => {
-            clearInterval(activityCheck);
-            this.logger.error({ err, sessionKey }, 'Background task failed');
-            if (!isNonMentionGroup) {
-              this.sender.sendReply(msg.chatId, '❌ 后台任务失败，请重试', undefined, undefined, existingRootId).catch(() => {});
-            }
-          })
-          .finally(() => {
-            // Clean up background session tracking, release lock, stop typing
-            this.backgroundSessions.delete(sessionKey);
-            this.typing.stop(msg.messageId, reactionId).catch(() => {});
-            this.runningTasks.delete(sessionKey);
-            this.abortControllers.delete(sessionKey);
-            this.processQueue(sessionKey);
-          });
-
-        return; // Don't run finally cleanup — backgroundMode flag prevents it
-      }
 
     } catch (err) {
       this.logger.error({ err, sessionKey }, 'Failed to process message');
       await this.sender.sendReply(msg.chatId, '❌ 处理消息时出错，请重试', undefined, undefined, existingRootId);
     } finally {
-      if (!backgroundMode) {
-        // Stop typing indicator and release lock
-        await this.typing.stop(msg.messageId, reactionId);
-        this.runningTasks.delete(sessionKey);
-        this.abortControllers.delete(sessionKey);
+      // Stop typing indicator and release lock
+      await this.typing.stop(msg.messageId, reactionId);
+      this.runningTasks.delete(sessionKey);
+      this.abortControllers.delete(sessionKey);
 
-        // Process next queued message
-        await this.processQueue(sessionKey);
-      }
-      // backgroundMode: cleanup is handled by the promise .finally() above
+      // Process next queued message
+      await this.processQueue(sessionKey);
     }
   }
 
