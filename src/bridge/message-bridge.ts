@@ -115,6 +115,19 @@ export class MessageBridge {
   }
 
   /**
+   * Check if text is a REACT-only response. If so, send reaction and return empty string.
+   * REACT is mutually exclusive with text — like NO_REPLY.
+   */
+  private async processReactions(text: string, messageId: string): Promise<string> {
+    const match = text.trim().match(/^<<REACT:(\w+)>>$/);
+    if (!match) return text; // Not a REACT-only response, return unchanged
+    const emojiType = match[1];
+    this.typing.start(messageId, emojiType).catch(() => {});
+    this.logger.info({ messageId, emojiType }, 'Sending reaction');
+    return '';
+  }
+
+  /**
    * Main entry point for incoming messages.
    */
   async handleMessage(msg: IncomingMessage): Promise<void> {
@@ -206,11 +219,16 @@ export class MessageBridge {
       }
     }
 
-    // Auto-reply check: if off, buffer non-@mention messages without sending to Claude
+    // Auto-reply check: buffer non-@mention messages when appropriate
     if (msg.chatType === 'group' && !msg.isMentioned) {
       let autoReply = 'on';
       try { autoReply = fs.readFileSync(path.join(session.sessionDir, 'auto-reply'), 'utf-8').trim(); } catch {}
-      if (autoReply === 'off') {
+
+      // Skip without sending to Claude:
+      // 1. auto=off: all non-@bot messages are buffered
+      // 2. auto=on but message @mentions others (not bot): clearly not for Sigma
+      const shouldBuffer = autoReply === 'off' || (autoReply === 'on' && msg.hasMentions);
+      if (shouldBuffer) {
         this.groupContext.add(msg.chatId, {
           timestamp: Date.now(),
           senderName: msg.senderName || '未知用户',
@@ -274,7 +292,7 @@ export class MessageBridge {
 
         // Add behavior hint
         if (isNonMentionGroup) {
-          prompt = `[群聊消息，未@你]\n${prompt}\n[如果这条消息不需要你回复（闲聊、表情、"好的/收到"等），请仅回复 NO_REPLY 两个词，不加任何其他内容。如果有人提问、讨论你擅长的话题、或提到你的名字(Sigma)，则正常回复。]`;
+          prompt = `[群聊消息，未@你。不需要回复（闲聊、表情、"好的/收到"等）就只输出 NO_REPLY，不要输出任何其他内容。有人提问、讨论你擅长的话题、或提到你的名字(Sigma)则正常回复。]\n${prompt}`;
         } else {
           prompt = `[你被@提及，必须回复]\n${prompt}`;
         }
@@ -361,18 +379,44 @@ export class MessageBridge {
       this.logger.info({ sessionKey, streamingReply, isNonMentionGroup }, 'Streaming check');
 
       // Streaming card path: create card and stream updates in real-time
-      if (streamingReply === 'on' && !isNonMentionGroup) {
-        this.logger.info({ sessionKey }, 'Entering streaming card path');
+      // All messages use lazy mode: card is created only when Claude starts outputting real content.
+      // This prevents empty cards for NO_REPLY / REACT-only responses.
+      if (streamingReply === 'on') {
+        this.logger.info({ sessionKey }, 'Entering streaming card path (lazy)');
         const streamer = new CardStreamer(this.sender.larkClient, this.logger);
-        await streamer.start(msg.chatId, msg.messageId, existingRootId, msg.messageId);
 
         if (!streamer.isFallback) {
           // Register stream callbacks scoped to this session
+          let lazyStarted = false; // card not created yet — will create on first real content
+          let lazyStarting = false; // true while start() is in progress
+          let lazyLatestText = ''; // buffer latest text while start() is in progress
           const onText = (key: string, text: string) => {
-            if (key === sessionKey) {
-              this.logger.info({ sessionKey, textLen: text.length }, 'Stream text callback fired');
-              streamer.updateText(text);
+            if (key !== sessionKey) return;
+            // Lazy mode: first real text triggers card creation
+            if (!lazyStarted) {
+              const trimmed = text.trim();
+              if (!trimmed) return;
+              if (trimmed === 'NO_REPLY') return;
+              // REACT-only response — don't create card
+              if (/^(<<REACT:\w+>>\s*)+$/.test(trimmed)) return;
+              // Real content — create card now
+              lazyStarted = true;
+              lazyStarting = true;
+              lazyLatestText = text;
+              this.logger.info({ sessionKey }, 'Lazy card: real content detected, creating card');
+              const p = streamer.start(msg.chatId, msg.messageId, existingRootId, msg.messageId).then(() => {
+                lazyStarting = false;
+                streamer.updateText(lazyLatestText);
+              });
+              streamer.startPromise = p;
+              return;
             }
+            // Buffer text while start() is still in progress
+            if (lazyStarting) {
+              lazyLatestText = text;
+              return;
+            }
+            streamer.updateText(text);
           };
           const onTool = (key: string, event: { type: 'start' | 'end'; toolName: string; toolInput?: string; toolUseId?: string; isError?: boolean }) => {
             if (key !== sessionKey) return;
@@ -385,6 +429,38 @@ export class MessageBridge {
           this.runner.onTextStream(sessionKey, onText);
           this.runner.onToolStream(sessionKey, onTool);
 
+          // Track running subagents for this card
+          const runningAgents = new Map<string, { toolUseId?: string; description?: string }>();
+
+          // Register persistent subagent listener (survives after result)
+          this.runner.onSubagentStream(sessionKey, (_key, event) => {
+            if (event.type === 'started') {
+              runningAgents.set(event.taskId, { toolUseId: event.toolUseId, description: event.description });
+              if (event.toolUseId) streamer.registerSubagent(event.taskId, event.toolUseId);
+            } else if (event.type === 'progress') {
+              // Subagent tool call step — add as child of the Agent tool
+              if (event.toolName) {
+                streamer.addSubagentStep(event.taskId, event.toolName, event.description);
+              }
+            } else {
+              // completed or stopped
+              const agent = runningAgents.get(event.taskId);
+              runningAgents.delete(event.taskId);
+              // Mark last running child as complete
+              streamer.completeSubagentSteps(event.taskId);
+              // Update card tool status
+              if (agent?.toolUseId) {
+                streamer.updateToolCall(agent.toolUseId, event.type === 'completed' ? 'complete' : 'failed');
+              }
+              // All agents done → finalize card
+              if (runningAgents.size === 0 && streamer.isWaitingForAgents()) {
+                this.logger.info({ sessionKey }, 'All subagents completed, finalizing card');
+                streamer.finalizeAfterAgents();
+                this.runner.onSubagentStream(sessionKey, undefined);
+              }
+            }
+          });
+
           try {
             const result = await this.runner.run({
               sessionKey,
@@ -394,21 +470,40 @@ export class MessageBridge {
               images,
             });
 
-            const rawText = result.fullText || '';
+            let rawText = result.fullText || '';
+            // Process <<REACT:emoji>> — send reaction, clear text if REACT-only
+            rawText = await this.processReactions(rawText, msg.messageId);
             const replyText = rawText.trim();
             // Detect <<THREAD>> for sendMentionedFiles rootId
-            const streamWantsThread = rawText.startsWith('<<THREAD>>');
+            const streamWantsThread = rawText.includes('<<THREAD>>');
             const streamRootId = existingRootId || (streamWantsThread ? msg.messageId : undefined);
-            if (isNonMentionGroup && replyText === 'NO_REPLY') {
-              await streamer.abort('(无需回复)');
+            const isReactOnly = !rawText && !!result.fullText;
+            if (replyText === 'NO_REPLY' || (isNonMentionGroup && replyText === '') || isReactOnly) {
+              // NO_REPLY, empty non-mention, or REACT-only — card was never created (lazy mode)
+            } else if (runningAgents.size > 0) {
+              // Agents still running — keep card alive, show text but don't finalize
+              this.logger.info({ sessionKey, runningAgents: runningAgents.size }, 'Turn done but agents still running, keeping card alive');
+              streamer.completeTextOnly(rawText || '(空回复)');
+              const cleanText = rawText.replace(/<<THREAD>>\s*/g, '');
+              await this.sendMentionedFiles(msg.chatId, cleanText, session.sessionDir, undefined, streamRootId);
+              // Timeout fallback: finalize card if agents don't complete within 10 minutes
+              setTimeout(() => {
+                if (streamer.isWaitingForAgents()) {
+                  this.logger.warn({ sessionKey, remaining: runningAgents.size }, 'Agent timeout — finalizing card');
+                  streamer.finalizeAfterAgents();
+                  this.runner.onSubagentStream(sessionKey, undefined);
+                }
+              }, 10 * 60 * 1000);
             } else {
               await streamer.complete(rawText || '(空回复)');
-              const cleanText = rawText.replace(/^<<THREAD>>\s*/, '');
+              const cleanText = rawText.replace(/<<THREAD>>\s*/g, '');
               await this.sendMentionedFiles(msg.chatId, cleanText, session.sessionDir, undefined, streamRootId);
+              // No agents running, clean up subagent listener
+              this.runner.onSubagentStream(sessionKey, undefined);
             }
 
             // Write bot reply to context buffer
-            const cleanReply = replyText.replace(/^<<THREAD>>\s*/, '');
+            const cleanReply = replyText.replace(/<<THREAD>>\s*/g, '');
             if ((msg.chatType === 'group' || msg.chatType === 'p2p') && cleanReply && cleanReply !== 'NO_REPLY') {
               const entries = this.groupContext['buffers'].get(msg.chatId);
               if (entries && entries.length > 0) {
@@ -419,13 +514,13 @@ export class MessageBridge {
             }
           } catch (err) {
             if (abortController.signal.aborted) {
-              // /stop was used — complete with whatever content we have, not an error
               this.logger.info({ sessionKey }, 'Streaming task stopped by user');
               await streamer.complete(streamer.getCurrentText() || '⏹ 任务已中止');
             } else {
               this.logger.error({ err, sessionKey }, 'Streaming task failed');
               await streamer.abort(`❌ 出错了: ${err instanceof Error ? err.message : String(err)}`);
             }
+            this.runner.onSubagentStream(sessionKey, undefined);
           } finally {
             this.runner.onTextStream(sessionKey, undefined);
             this.runner.onToolStream(sessionKey, undefined);
@@ -460,20 +555,24 @@ export class MessageBridge {
       if (quickResult.type === 'result') {
         // Claude responded quickly — check for NO_REPLY before sending
         const result = quickResult.result;
+        // Process <<REACT:emoji>> tags
+        if (result.fullText) {
+          result.fullText = await this.processReactions(result.fullText, msg.messageId);
+        }
         const replyText = result.fullText?.trim() || '';
         // Detect <<THREAD>> tag for thread reply
-        const wantsThread = result.fullText?.startsWith('<<THREAD>>') || false;
+        const wantsThread = result.fullText?.includes('<<THREAD>>') || false;
         const effectiveRootId = existingRootId || (wantsThread ? msg.messageId : undefined);
         // Strip <<THREAD>> from result before sending
         if (wantsThread && result.fullText) {
-          result.fullText = result.fullText.replace(/^<<THREAD>>\s*/, '');
+          result.fullText = result.fullText.replace(/<<THREAD>>\s*/g, '');
         }
         this.logger.info(
           { sessionKey, hasError: !!result.error, textLength: replyText.length, mode: 'quick', isNoReply: replyText === 'NO_REPLY', wantsThread },
           'Claude subprocess finished (quick)',
         );
-        if (isNonMentionGroup && (replyText === 'NO_REPLY' || replyText === '')) {
-          // Silent skip — no reply needed (only for non-@mention group messages)
+        if (replyText === 'NO_REPLY' || (isNonMentionGroup && replyText === '') || (!result.fullText && replyText === '')) {
+          // Silent skip — NO_REPLY, empty non-mention, or REACT-only
         } else {
           await this.sendResult(msg, sessionKey, session, result, reactionId ?? undefined, effectiveRootId);
         }
@@ -509,19 +608,23 @@ export class MessageBridge {
         resultPromise
           .then(async (result) => {
             clearInterval(activityCheck);
+            // Process <<REACT:emoji>> tags
+            if (result.fullText) {
+              result.fullText = await this.processReactions(result.fullText, msg.messageId);
+            }
             const replyText = result.fullText?.trim() || '';
             // Detect <<THREAD>> for background results
-            const bgWantsThread = result.fullText?.startsWith('<<THREAD>>') || false;
+            const bgWantsThread = result.fullText?.includes('<<THREAD>>') || false;
             const bgRootId = existingRootId || (bgWantsThread ? msg.messageId : undefined);
             if (bgWantsThread && result.fullText) {
-              result.fullText = result.fullText.replace(/^<<THREAD>>\s*/, '');
+              result.fullText = result.fullText.replace(/<<THREAD>>\s*/g, '');
             }
             this.logger.info(
               { sessionKey, hasError: !!result.error, textLength: replyText.length, mode: 'background', isNoReply: replyText === 'NO_REPLY', bgWantsThread },
               'Claude subprocess finished (background)',
             );
-            if (isNonMentionGroup && (replyText === 'NO_REPLY' || replyText === '')) {
-              // Silent skip (only for non-@mention group messages)
+            if (replyText === 'NO_REPLY' || (isNonMentionGroup && replyText === '') || (!result.fullText && replyText === '')) {
+              // Silent skip — NO_REPLY, empty non-mention, or REACT-only
             } else if (result.error && !result.fullText) {
               await this.sender.sendReply(msg.chatId, `❌ 出错了: ${result.error}`, undefined, undefined, bgRootId);
             } else {

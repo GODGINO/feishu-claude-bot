@@ -21,6 +21,7 @@
     "better-sqlite3": "^12.6.2",
     "dotenv": "^16.4.0",
     "express": "^5.2.1",
+    "framer-api": "^0.1.2",
     "imapflow": "^1.2.10",
     "mailparser": "^3.9.3",
     "nodemailer": "^8.0.1",

@@ -4,12 +4,59 @@
  * Connects to the relay server with multiple session keys,
  * receives commands, dispatches them to content scripts or
  * chrome.* APIs, and sends responses back.
+ *
+ * Uses chrome.alarms + chrome.storage to survive MV3 service worker termination.
  */
 
 const connections = new Map(); // sessionKey -> WebSocket
 let state = { connected: false, connecting: false, sessionKeys: [], relayUrl: '' };
 let activeTabId = null; // Currently selected tab for operations
 let manualDisconnect = false;
+
+// ── Keepalive: prevent Chrome from killing the service worker while connected ──
+
+const KEEPALIVE_ALARM = 'sigma-keepalive';
+const KEEPALIVE_INTERVAL = 0.4; // minutes (~24s, under Chrome's 30s idle limit)
+
+function startKeepalive() {
+  chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: KEEPALIVE_INTERVAL });
+}
+
+function stopKeepalive() {
+  chrome.alarms.clear(KEEPALIVE_ALARM);
+}
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === KEEPALIVE_ALARM) {
+    // This callback alone keeps the service worker alive.
+    // Also check if connections are still open; if not, reconnect.
+    if (connections.size === 0 && !manualDisconnect && state.relayUrl && state.sessionKeys.length > 0) {
+      console.log('[Sigma] Keepalive: connections lost, reconnecting...');
+      connect(state.relayUrl, state.sessionKeys);
+    }
+  }
+});
+
+// ── Persist connection config so we can reconnect after SW restart ──
+
+async function saveConfig() {
+  await chrome.storage.local.set({
+    sigmaConfig: {
+      relayUrl: state.relayUrl,
+      sessionKeys: state.sessionKeys,
+      manualDisconnect,
+    }
+  });
+}
+
+async function loadAndReconnect() {
+  const data = await chrome.storage.local.get('sigmaConfig');
+  const config = data.sigmaConfig;
+  if (config && !config.manualDisconnect && config.relayUrl && config.sessionKeys?.length > 0) {
+    console.log('[Sigma] SW restarted, auto-reconnecting...');
+    connect(config.relayUrl, config.sessionKeys);
+  }
+}
 
 // ── State management ──
 
@@ -22,12 +69,14 @@ function setState(updates) {
 // ── WebSocket connection ──
 
 function connect(relayUrl, sessionKeys) {
-  disconnect();
+  disconnect(true); // silent disconnect (don't mark as manual)
   manualDisconnect = false;
 
   if (!sessionKeys || sessionKeys.length === 0) return;
 
   setState({ connecting: true, sessionKeys, relayUrl });
+  saveConfig();
+  startKeepalive();
 
   const wsBase = relayUrl.replace(/^https:/, 'wss:').replace(/^http:/, 'ws:').replace(/\/$/, '');
   let connectedCount = 0;
@@ -91,8 +140,12 @@ function connect(relayUrl, sessionKeys) {
   }
 }
 
-function disconnect() {
-  manualDisconnect = true;
+function disconnect(silent = false) {
+  if (!silent) {
+    manualDisconnect = true;
+    stopKeepalive();
+    saveConfig();
+  }
   for (const [key, socket] of connections) {
     socket.close(4000, 'User disconnect');
   }
@@ -315,3 +368,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return false;
   }
 });
+
+// ── Auto-reconnect on SW restart ──
+
+loadAndReconnect();

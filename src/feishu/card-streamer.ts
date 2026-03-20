@@ -24,8 +24,10 @@ export class CardStreamer {
   private lastUpdateTime = 0;
   private pendingText = '';
   private toolCalls: ToolCallInfo[] = [];
+  private taskIdToToolUseId = new Map<string, string>(); // taskId → toolUseId (for subagent step routing)
   private updateTimer: ReturnType<typeof setTimeout> | null = null;
   private fallback = false;
+  startPromise: Promise<void> | null = null; // Track pending start() for lazy mode
   private startTime = 0;
   // Deferred IM message send (to detect <<THREAD>> in first text)
   private messageSent = false;
@@ -114,7 +116,7 @@ export class CardStreamer {
     if (this.messageSent || !this.cardId) return;
     this.messageSent = true;
 
-    const wantsThread = text?.startsWith('<<THREAD>>') || false;
+    const wantsThread = text?.includes('<<THREAD>>') || false;
     const rootId = this.deferredExistingRootId || (wantsThread ? this.deferredUserMessageId : undefined);
 
     this.logger.info({
@@ -198,17 +200,25 @@ export class CardStreamer {
   }
 
   addToolCall(name: string, input?: string, toolUseId?: string): void {
-    // When a new non-Agent tool starts, mark any running Agent calls as complete
-    if (name !== 'Agent') {
-      for (const tc of this.toolCalls) {
-        if (tc.name === 'Agent' && tc.status === 'running') {
-          tc.status = 'complete';
-          tc.endTime = Date.now();
+    let displayName = name;
+    if (name === 'Agent') {
+      const agentCount = this.toolCalls.filter(t => t.name.startsWith('Agent')).length + 1;
+      if (agentCount > 1 || this.toolCalls.some(t => t.name.startsWith('Agent'))) {
+        // Relabel all existing Agent entries with #N if not already labeled
+        let idx = 1;
+        for (const tc of this.toolCalls) {
+          if (tc.name === 'Agent') {
+            tc.name = `Agent #${idx}`;
+            idx++;
+          } else if (tc.name.startsWith('Agent #')) {
+            idx++;
+          }
         }
+        displayName = `Agent #${idx}`;
       }
     }
     this.toolCalls.push({
-      name,
+      name: displayName,
       input: input ? (input.length > 200 ? input.slice(0, 200) + '...' : input) : undefined,
       status: 'running',
       startTime: Date.now(),
@@ -235,10 +245,16 @@ export class CardStreamer {
     this.updateText(this.pendingText);
   }
 
+
   /**
    * Finalize the card with complete content.
    */
   async complete(fullText: string): Promise<void> {
+    // Wait for lazy start() to finish before completing
+    if (this.startPromise) {
+      await this.startPromise;
+      this.startPromise = null;
+    }
     if (this.fallback || !this.cardId) return;
 
     this.completed = true;
@@ -246,8 +262,8 @@ export class CardStreamer {
     // Ensure IM message is sent before completing
     await this.ensureMessageSent(fullText);
 
-    // Strip <<THREAD>> tag from display text
-    fullText = fullText.replace(/^<<THREAD>>\s*/, '');
+    // Strip <<THREAD>> and <<REACT:...>> tags from display text
+    fullText = fullText.replace(/<<THREAD>>\s*/g, '').replace(/<<REACT:\w+>>\s*/g, '');
 
     if (this.updateTimer) {
       clearTimeout(this.updateTimer);
@@ -310,6 +326,91 @@ export class CardStreamer {
     }
   }
 
+  /** Map taskId to the Agent's toolUseId for subagent step routing. */
+  registerSubagent(taskId: string, toolUseId: string): void {
+    this.taskIdToToolUseId.set(taskId, toolUseId);
+    this.logger.info({ taskId, toolUseId, mapSize: this.taskIdToToolUseId.size }, 'Registered subagent mapping');
+  }
+
+  /**
+   * Add a subagent step as a child of the corresponding Agent tool call.
+   * Previous running child is auto-completed.
+   */
+  addSubagentStep(taskId: string, toolName: string, description?: string): void {
+    const agentToolUseId = this.taskIdToToolUseId.get(taskId);
+    const agent = agentToolUseId
+      ? this.toolCalls.find(t => t.toolUseId === agentToolUseId)
+      : [...this.toolCalls].reverse().find(t => t.name === 'Agent' && t.status === 'running');
+    if (!agent) {
+      this.logger.warn({ taskId, agentToolUseId, toolCallCount: this.toolCalls.length }, 'addSubagentStep: no matching Agent found');
+      return;
+    }
+
+    if (!agent.children) agent.children = [];
+
+    // Mark previous running children as complete
+    for (const child of agent.children) {
+      if (child.status === 'running') {
+        child.status = 'complete';
+        child.endTime = Date.now();
+      }
+    }
+
+    agent.children.push({
+      name: toolName,
+      input: description ? (description.length > 200 ? description.slice(0, 200) + '...' : description) : undefined,
+      status: 'running',
+      startTime: Date.now(),
+    });
+
+    this.updateText(this.pendingText);
+  }
+
+  /** Mark all running children of a subagent as complete. */
+  completeSubagentSteps(taskId: string): void {
+    const agentToolUseId = this.taskIdToToolUseId.get(taskId);
+    const agent = agentToolUseId
+      ? this.toolCalls.find(t => t.toolUseId === agentToolUseId)
+      : undefined;
+    if (!agent?.children) return;
+
+    for (const child of agent.children) {
+      if (child.status === 'running') {
+        child.status = 'complete';
+        child.endTime = Date.now();
+      }
+    }
+    this.taskIdToToolUseId.delete(taskId);
+    this.updateText(this.pendingText);
+  }
+
+  private waitingForAgents = false;
+
+  /**
+   * Mark text as final but keep card in streaming mode for agent updates.
+   * Call this when the main turn is done but subagents are still running.
+   */
+  completeTextOnly(fullText: string): void {
+    fullText = fullText.replace(/<<THREAD>>\s*/g, '');
+    this.pendingText = fullText;
+    this.waitingForAgents = true;
+    // Ensure IM message is sent
+    this.ensureMessageSent(fullText).catch(() => {});
+    // Flush current state to card
+    this.updateText(fullText);
+  }
+
+  /** Whether the card is waiting for subagents to complete. */
+  isWaitingForAgents(): boolean {
+    return this.waitingForAgents;
+  }
+
+  /** Finalize the card after all subagents have completed. */
+  async finalizeAfterAgents(): Promise<void> {
+    this.waitingForAgents = false;
+    await this.complete(this.pendingText || '');
+  }
+
   async abort(error?: string): Promise<void> {
     if (this.fallback || !this.cardId) return;
 
@@ -363,6 +464,30 @@ export class CardStreamer {
   }
 
   /**
+   * Silently delete the card message (for REACT-only / NO_REPLY responses).
+   */
+  async deleteCard(): Promise<void> {
+    this.completed = true;
+    if (this.updateTimer) {
+      clearTimeout(this.updateTimer);
+      this.updateTimer = null;
+    }
+    if (this.inflightFlush) {
+      await this.inflightFlush.catch(() => {});
+      this.inflightFlush = null;
+    }
+    // Delete the IM message if it was sent
+    if (this.messageId) {
+      try {
+        await this.client.im.message.delete({ path: { message_id: this.messageId } });
+        this.logger.info({ messageId: this.messageId }, 'Deleted card message (REACT/NO_REPLY)');
+      } catch (err) {
+        this.logger.debug({ err, messageId: this.messageId }, 'Failed to delete card message');
+      }
+    }
+  }
+
+  /**
    * Flush pending text/tool updates to the card.
    */
   private async flushUpdate(): Promise<void> {
@@ -374,9 +499,10 @@ export class CardStreamer {
     this.lastUpdateTime = Date.now();
     this.sequence++;
 
-    // Strip <<THREAD>> and <<TITLE:...>> tags from display text (flexible syntax)
+    // Strip <<THREAD>>, <<REACT:...>> and <<TITLE:...>> tags from display text
     const displayText = this.pendingText
-      .replace(/^<<THREAD>>\s*/, '')
+      .replace(/<<THREAD>>\s*/g, '')
+      .replace(/<<REACT:\w+>>\s*/g, '')
       .replace(/<?<<TITLE:.+?>>>?\s*\n?/g, '')
       .replace(/<TITLE:.+?>\s*\n?/g, '');
 

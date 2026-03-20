@@ -81,20 +81,26 @@ async function main() {
 
   // Get bot's own open_id for @mention detection in groups
   let botOpenId = '';
-  try {
-    const resp = await client.request({
-      method: 'GET',
-      url: '/open-apis/bot/v3/info',
-    });
-    const respData = resp as any;
-    botOpenId = respData?.data?.bot?.open_id || respData?.bot?.open_id || '';
-    if (botOpenId) {
-      logger.info({ botOpenId }, 'Bot info retrieved');
-    } else {
-      logger.warn('Bot info response missing open_id, will auto-detect from mentions');
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const resp = await client.request({
+        method: 'GET',
+        url: '/open-apis/bot/v3/info',
+      });
+      const respData = resp as any;
+      botOpenId = respData?.data?.bot?.open_id || respData?.bot?.open_id || '';
+      if (botOpenId) {
+        logger.info({ botOpenId }, 'Bot info retrieved');
+        break;
+      }
+      logger.warn({ attempt }, 'Bot info response missing open_id, retrying...');
+    } catch (err) {
+      logger.warn({ err, attempt }, 'Failed to get bot info, retrying...');
     }
-  } catch (err) {
-    logger.warn({ err }, 'Failed to get bot info, will auto-detect from mentions');
+    if (attempt < 3) await new Promise(r => setTimeout(r, 2000));
+  }
+  if (!botOpenId) {
+    logger.error('Could not get botOpenId after 3 attempts — @mention detection will be disabled in groups');
   }
 
   // Create core components (botStartTime filters out stale events from before startup)

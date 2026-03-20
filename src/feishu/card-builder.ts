@@ -13,6 +13,27 @@ export interface ToolCallInfo {
   startTime: number;
   endTime?: number;
   toolUseId?: string;
+  children?: ToolCallInfo[];
+}
+
+/**
+ * Get tool-specific emoji based on tool name.
+ */
+function toolEmoji(name: string): string {
+  if (name === 'Agent' || name.startsWith('Agent #')) return '🤖';
+  if (name === 'Bash') return '💻';
+  if (name === 'Read') return '📖';
+  if (name === 'Edit') return '✏️';
+  if (name === 'Write') return '📝';
+  if (name === 'Grep') return '🔍';
+  if (name === 'Glob') return '📁';
+  if (name === 'WebSearch' || name === 'WebFetch') return '🌐';
+  if (name === 'Skill') return '🧠';
+  if (name === 'ToolSearch') return '🔧';
+  if (name.startsWith('mcp__chrome-devtools__') || name.startsWith('mcp__remote-browser__')) return '🖥️';
+  if (name.startsWith('mcp__feishu')) return '💬';
+  if (name.startsWith('mcp__cron')) return '⏰';
+  return '🔧';
 }
 
 /**
@@ -193,8 +214,18 @@ function formatDuration(ms: number): string {
  */
 function formatToolCalls(toolCalls: ToolCallInfo[]): string {
   const MAX_VISIBLE = 5;
-  const hidden = toolCalls.length - MAX_VISIBLE;
-  const visible = hidden > 0 ? toolCalls.slice(-MAX_VISIBLE) : toolCalls;
+
+  // Prioritize running items — never fold them
+  let visible: ToolCallInfo[];
+  if (toolCalls.length <= MAX_VISIBLE) {
+    visible = toolCalls;
+  } else {
+    const running = toolCalls.filter(t => t.status === 'running');
+    const done = toolCalls.filter(t => t.status !== 'running');
+    const doneSlots = Math.max(0, MAX_VISIBLE - running.length);
+    visible = [...done.slice(-doneSlots), ...running];
+  }
+  const hidden = toolCalls.length - visible.length;
 
   const lines: string[] = [];
   if (hidden > 0) {
@@ -204,35 +235,82 @@ function formatToolCalls(toolCalls: ToolCallInfo[]): string {
     lines.push(`... ${hidden} 条已折叠，总用时 ${timeStr}`);
   }
   for (const tc of visible) {
-    const icon = tc.status === 'running' ? '🔄' : tc.status === 'complete' ? '✅' : '❌';
-    const duration = tc.endTime ? `${((tc.endTime - tc.startTime) / 1000).toFixed(1)}s` : '';
-    const statusText = tc.status === 'running' ? '执行中...' : duration;
-
-    let inputSummary = '';
-    if (tc.input) {
-      const truncated = tc.input.length > 80 ? tc.input.slice(0, 80) + '...' : tc.input;
-      inputSummary = `\n   ${truncated}`;
+    lines.push(`- ${formatSingleTool(tc)}`);
+    // Render subagent children tree with markdown nested list
+    if (tc.children && tc.children.length > 0) {
+      const completed = tc.children.filter(c => c.status !== 'running');
+      const running = tc.children.filter(c => c.status === 'running');
+      // 1. Collapsed completed count
+      if (completed.length > 1) {
+        const elapsed = Date.now() - completed[0].startTime;
+        const totalSecs = Math.round(elapsed / 1000);
+        const timeStr = totalSecs < 60 ? `${totalSecs}s` : `${Math.floor(totalSecs / 60)}:${(totalSecs % 60).toString().padStart(2, '0')}`;
+        lines.push(`   - ... ${completed.length - 1} 条已折叠 · 总用时 ${timeStr}`);
+      }
+      // 2. Last completed step
+      if (completed.length > 0) {
+        lines.push(`   - ${formatSingleTool(completed[completed.length - 1])}`);
+      }
+      // 3. Currently running step
+      if (running.length > 0) {
+        lines.push(`   - ${formatSingleTool(running[running.length - 1])}`);
+      }
     }
-
-    lines.push(`${icon} **${tc.name}** ${statusText ? `(${statusText})` : ''}${inputSummary}`);
   }
   return lines.join('\n');
+}
+
+function formatSingleTool(tc: ToolCallInfo): string {
+  const statusIcon = tc.status === 'running' ? '🔄' : tc.status === 'complete' ? '✅' : '❌';
+  const emoji = toolEmoji(tc.name);
+
+  // For Agent with children: compute duration from children's time span
+  let durationSecs: number | undefined;
+  if (tc.endTime) {
+    if ((tc.name === 'Agent' || tc.name.startsWith('Agent #')) && tc.children && tc.children.length > 0) {
+      const firstStart = tc.children[0].startTime;
+      const lastEnd = tc.children[tc.children.length - 1].endTime || Date.now();
+      durationSecs = (lastEnd - firstStart) / 1000;
+    } else {
+      durationSecs = (tc.endTime - tc.startTime) / 1000;
+    }
+  } else if (tc.status === 'running' && (tc.name === 'Agent' || tc.name.startsWith('Agent #')) && tc.children && tc.children.length > 0) {
+    // Running Agent: show elapsed since first child started
+    durationSecs = (Date.now() - tc.children[0].startTime) / 1000;
+  }
+
+  let timeStr = '';
+  if (durationSecs != null) {
+    timeStr = durationSecs < 60 ? `${durationSecs.toFixed(1)}s` : `${Math.floor(durationSecs / 60)}:${Math.round(durationSecs % 60).toString().padStart(2, '0')}`;
+  }
+  const statusText = tc.status === 'running' ? '执行中...' : timeStr;
+
+  let inputSummary = '';
+  if (tc.input) {
+    const truncated = tc.input.length > 80 ? tc.input.slice(0, 80) + '...' : tc.input;
+    inputSummary = ` ${truncated}`;
+  }
+
+  return `${statusIcon} ${emoji} **${tc.name}** ${statusText ? `(${statusText})` : ''}${inputSummary}`;
 }
 
 /**
  * Format tool calls summary for the completed card's collapsed panel.
  */
 function formatToolCallsSummary(toolCalls: ToolCallInfo[]): string {
-  return toolCalls.map(tc => {
-    const icon = tc.status === 'complete' ? '✅' : '❌';
-    const duration = tc.endTime ? `${((tc.endTime - tc.startTime) / 1000).toFixed(1)}s` : '?';
-
-    let inputSummary = '';
-    if (tc.input) {
-      const truncated = tc.input.length > 100 ? tc.input.slice(0, 100) + '...' : tc.input;
-      inputSummary = `\n   ${truncated}`;
+  const lines: string[] = [];
+  for (const tc of toolCalls) {
+    lines.push(`- ${formatSingleTool(tc)}`);
+    if (tc.children && tc.children.length > 0) {
+      if (tc.children.length > 1) {
+        const elapsed = (tc.children[tc.children.length - 1].endTime || Date.now()) - tc.children[0].startTime;
+        const totalSecs = Math.round(elapsed / 1000);
+        const timeStr = totalSecs < 60 ? `${totalSecs}s` : `${Math.floor(totalSecs / 60)}:${(totalSecs % 60).toString().padStart(2, '0')}`;
+        lines.push(`   - ... ${tc.children.length - 1} 条已折叠 · 总用时 ${timeStr}`);
+      }
+      const last = tc.children[tc.children.length - 1];
+      lines.push(`   - ${formatSingleTool(last)}`);
     }
-
-    return `${icon} **${tc.name}** (${duration})${inputSummary}`;
-  }).join('\n');
+  }
+  return lines.join('\n');
 }

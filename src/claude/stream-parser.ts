@@ -12,6 +12,9 @@ export interface ParseResult {
   error?: string;
   toolUse?: { name: string; input?: string; toolUseId?: string };
   toolResult?: { toolUseId: string; isError?: boolean };
+  subagentStart?: { taskId: string; description: string; toolUseId?: string };
+  subagentProgress?: { taskId: string; toolName: string; description: string; toolUseId?: string };
+  subagentEnd?: { taskId: string; status: 'completed' | 'stopped'; summary?: string; toolUseId?: string };
 }
 
 export class StreamParser {
@@ -47,9 +50,32 @@ export class StreamParser {
           this._sessionId = msg.session_id;
           result.sessionId = msg.session_id;
         }
-        // task_started = subagent launched (only add once, not on progress)
+        // task_started = subagent launched
         if (msg.subtype === 'task_started') {
-          result.toolUse = { name: 'Agent' };
+          result.toolUse = { name: 'Agent', input: msg.description, toolUseId: msg.tool_use_id };
+          result.subagentStart = {
+            taskId: msg.task_id,
+            description: msg.description || '',
+            toolUseId: msg.tool_use_id,
+          };
+        }
+        // task_progress = subagent tool call step
+        if (msg.subtype === 'task_progress' && msg.last_tool_name) {
+          result.subagentProgress = {
+            taskId: msg.task_id,
+            toolName: msg.last_tool_name,
+            description: msg.description || '',
+            toolUseId: msg.tool_use_id,
+          };
+        }
+        // task_notification = subagent completed/stopped
+        if (msg.subtype === 'task_notification' && msg.status) {
+          result.subagentEnd = {
+            taskId: msg.task_id,
+            status: msg.status,
+            summary: msg.summary,
+            toolUseId: msg.tool_use_id,
+          };
         }
         return result;
       }

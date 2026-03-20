@@ -45,6 +45,16 @@ export type ToolStreamCallback = (sessionKey: string, event: {
   isError?: boolean;
 }) => void;
 
+/** Persistent callback for subagent lifecycle events — survives across turns. */
+export type SubagentStreamCallback = (sessionKey: string, event: {
+  type: 'started' | 'progress' | 'completed' | 'stopped';
+  taskId: string;
+  toolUseId?: string;
+  description?: string;
+  summary?: string;
+  toolName?: string; // For progress events: the tool being used
+}) => void;
+
 export class ProcessPool {
   private processes = new Map<string, PersistentProcess>();
   private savedSessionIds = new Map<string, string>(); // sessionKey -> sessionId (for crash recovery)
@@ -53,6 +63,7 @@ export class ProcessPool {
   private progressCallback?: ProgressCallback;
   private textStreamCallbacks = new Map<string, TextStreamCallback>();
   private toolStreamCallbacks = new Map<string, ToolStreamCallback>();
+  private subagentStreamCallbacks = new Map<string, SubagentStreamCallback>();
 
   constructor(
     private config: Config,
@@ -99,6 +110,18 @@ export class ProcessPool {
       this.toolStreamCallbacks.set(sessionKey, callback);
     } else {
       this.toolStreamCallbacks.delete(sessionKey);
+    }
+  }
+
+  /**
+   * Register persistent callback for subagent lifecycle events.
+   * Unlike toolStream, this survives across turns — fires even after result.
+   */
+  onSubagentStream(sessionKey: string, callback: SubagentStreamCallback | undefined): void {
+    if (callback) {
+      this.subagentStreamCallbacks.set(sessionKey, callback);
+    } else {
+      this.subagentStreamCallbacks.delete(sessionKey);
     }
   }
 
@@ -418,6 +441,13 @@ export class ProcessPool {
           this.logger.info({ sessionKey, lineNum: lineCount, raw: line.slice(0, 100) }, 'Stdout non-JSON line');
         }
       }
+      // Log task_progress events to understand subagent protocol
+      try {
+        const raw = JSON.parse(line);
+        if (raw.type === 'system' && (raw.subtype === 'task_progress' || raw.subtype === 'task_started' || raw.subtype === 'task_notification')) {
+          this.logger.info({ sessionKey, subtype: raw.subtype, payload: JSON.stringify(raw).slice(0, 500) }, 'Subagent event');
+        }
+      } catch {}
       const result = parser.parseLine(line);
       if (result.toolUse) {
         this.logger.info({ sessionKey, toolName: result.toolUse.name }, 'Tool use detected');
@@ -549,6 +579,46 @@ export class ProcessPool {
         toolUseId: result.toolResult.toolUseId,
         isError: result.toolResult.isError,
       });
+    }
+
+    // Subagent end: mark Agent tool as complete (during active turn)
+    if (result.subagentEnd && pp.currentResolve && toolCb) {
+      toolCb(pp.sessionKey, {
+        type: 'end',
+        toolName: 'Agent',
+        toolUseId: result.subagentEnd.toolUseId,
+        isError: result.subagentEnd.status === 'stopped',
+      });
+    }
+
+    // Persistent subagent callbacks — fire regardless of currentResolve
+    const subagentCb = this.subagentStreamCallbacks.get(pp.sessionKey);
+    if (subagentCb) {
+      if (result.subagentStart) {
+        subagentCb(pp.sessionKey, {
+          type: 'started',
+          taskId: result.subagentStart.taskId,
+          toolUseId: result.subagentStart.toolUseId,
+          description: result.subagentStart.description,
+        });
+      }
+      if (result.subagentProgress) {
+        subagentCb(pp.sessionKey, {
+          type: 'progress',
+          taskId: result.subagentProgress.taskId,
+          toolUseId: result.subagentProgress.toolUseId,
+          toolName: result.subagentProgress.toolName,
+          description: result.subagentProgress.description,
+        });
+      }
+      if (result.subagentEnd) {
+        subagentCb(pp.sessionKey, {
+          type: result.subagentEnd.status === 'completed' ? 'completed' : 'stopped',
+          taskId: result.subagentEnd.taskId,
+          toolUseId: result.subagentEnd.toolUseId,
+          summary: result.subagentEnd.summary,
+        });
+      }
     }
 
     // Detect unsolicited text (output arriving when no send() is pending).

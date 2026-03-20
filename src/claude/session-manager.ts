@@ -173,6 +173,25 @@ export class SessionManager {
 ## 经验与方法论
 
 （踩过的坑、有效的工作流程、需要避免的错误、提炼出的最佳实践）
+
+## Git Commit 规范
+
+提交代码时必须使用以下格式：
+
+\`\`\`
+<type>(<需求名称>): <简短描述>
+
+<详细描述>
+
+feishuId:<飞书id>
+\`\`\`
+
+**type 字段**：feat(新功能) | fix(修bug) | docs(文档) | style(格式) | refactor(重构) | test(测试)
+
+- **需求名称**：飞书中的需求或 bug 标题
+- **简短描述**：不超过 50 字符
+- **详细描述**：若有则添加，无则删除，单行不超过 50 字符
+- **feishuId**：对应飞书需求 ID
 `;
     try {
       fs.writeFileSync(claudeMdPath, template);

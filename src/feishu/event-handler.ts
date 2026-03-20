@@ -24,6 +24,7 @@ export interface IncomingMessage {
   images?: ImageInfo[];  // Images attached to the message
   files?: FileInfo[];    // Files attached to the message
   isMentioned: boolean;  // Whether the bot was @mentioned
+  hasMentions: boolean;  // Whether the message contains any @mentions (including non-bot users)
 }
 
 export type MessageHandler = (msg: IncomingMessage) => void | Promise<void>;
@@ -87,9 +88,13 @@ export function createEventHandler(
         let isMentioned = chatType === 'p2p'; // DMs are always "mentioned"
         if (chatType === 'group') {
           const mentions = message.mentions || [];
-          isMentioned = botOpenId
-            ? mentions.some((m: any) => m.id?.open_id === botOpenId)
-            : mentions.length > 0;
+          if (botOpenId) {
+            isMentioned = mentions.some((m: any) => m.id?.open_id === botOpenId);
+          } else {
+            // botOpenId unknown — default to false (safe: won't reply to non-@bot messages)
+            // Only DMs are auto-replied to when botOpenId is missing
+            isMentioned = false;
+          }
         }
 
         // Parse message text, images, and files
@@ -144,6 +149,7 @@ export function createEventHandler(
           images: images.length > 0 ? images : undefined,
           files: files.length > 0 ? files : undefined,
           isMentioned,
+          hasMentions: (message.mentions || []).length > 0,
         };
 
         logger.info(

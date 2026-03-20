@@ -2,7 +2,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { Logger } from '../utils/logger.js';
 import type { Config } from '../config.js';
-import { ProcessPool, type SendOptions, type UnsolicitedResultCallback, type ProgressCallback, type TextStreamCallback, type ToolStreamCallback } from './process-pool.js';
+import { ProcessPool, type SendOptions, type UnsolicitedResultCallback, type ProgressCallback, type TextStreamCallback, type ToolStreamCallback, type SubagentStreamCallback } from './process-pool.js';
 
 export interface ImageAttachment {
   base64: string;
@@ -209,6 +209,13 @@ export class ClaudeRunner {
    */
   onToolStream(sessionKey: string, callback: ToolStreamCallback | undefined): void {
     this.pool.onToolStream(sessionKey, callback);
+  }
+
+  /**
+   * Register/unregister persistent callback for subagent lifecycle events.
+   */
+  onSubagentStream(sessionKey: string, callback: SubagentStreamCallback | undefined): void {
+    this.pool.onSubagentStream(sessionKey, callback);
   }
 
   /**

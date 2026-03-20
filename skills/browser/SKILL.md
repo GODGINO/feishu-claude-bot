@@ -36,22 +36,14 @@ bash {SESSION_DIR}/start-chrome.sh
 
 扩展 zip 已预先打包好，直接发送：`{PROJECT_ROOT}/sigma-browser-extension.zip`
 
-**第二步：发送连接信息**
-
-读取 CF 隧道 URL 和会话 Key，发消息告诉用户：
-```
-中继 URL：<CF 隧道 URL，从 {PROJECT_ROOT}/.cf-tunnel.url 读取>
-会话 Key：<当前会话的 session key>
-```
-
-**第三步：发送安装指南**
+**第二步：发送安装指南**
 
 > **安装 Sigma 浏览器扩展：**
 > 1. 解压收到的 zip 文件（会得到一个文件夹，里面有 manifest.json 等文件）
 > 2. 打开 Chrome → 地址栏输入 `chrome://extensions`
 > 3. 右上角打开「开发者模式」
 > 4. 点击「加载已解压的扩展程序」→ 选择解压后的文件夹（包含 manifest.json 的那个）
-> 5. 点击扩展图标（蓝色 S），填入上面的中继 URL 和会话 Key
+> 5. 点击扩展图标（蓝色 S），在输入框填入会话 Key：`<当前会话的 session key>`，点 Add
 > 6. 点击 Connect
 > 7. 看到绿色圆点「Connected」即连接成功
 >
