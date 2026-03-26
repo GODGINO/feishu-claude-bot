@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Krispy Krunchy Chicken - 4x6 Postcard</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Montserrat:wght@400;600;700;800;900&display=swap');
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    width: 1800px;
+    height: 1200px;
+    overflow: hidden;
+    font-family: 'Montserrat', sans-serif;
+    background: #001333;
+  }
+
+  .card {
+    width: 1800px;
+    height: 1200px;
+    position: relative;
+    overflow: hidden;
+    background: linear-gradient(135deg, #001333 0%, #112C3F 40%, #001333 100%);
+  }
+
+  /* Red diagonal accent */
+  .red-accent {
+    position: absolute;
+    top: 0;
+    right: -100px;
+    width: 900px;
+    height: 1200px;
+    background: #DD282C;
+    transform: skewX(-12deg);
+    z-index: 1;
+  }
+
+  .red-accent-overlay {
+    position: absolute;
+    top: 0;
+    right: -100px;
+    width: 900px;
+    height: 1200px;
+    background: linear-gradient(180deg, rgba(221,40,44,0.9) 0%, #DD282C 50%, rgba(180,20,20,1) 100%);
+    transform: skewX(-12deg);
+    z-index: 1;
+  }
+
+  /* Food images area - left side */
+  .food-collage {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 55%;
+    height: 100%;
+    z-index: 2;
+  }
+
+  .food-img-1 {
+    position: absolute;
+    top: 30px;
+    left: 30px;
+    width: 460px;
+    height: 340px;
+    border-radius: 16px;
+    object-fit: cover;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+    border: 3px solid rgba(255,255,255,0.15);
+  }
+
+  .food-img-2 {
+    position: absolute;
+    top: 50px;
+    left: 440px;
+    width: 380px;
+    height: 280px;
+    border-radius: 16px;
+    object-fit: cover;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+    border: 3px solid rgba(255,255,255,0.15);
+  }
+
+  .food-img-3 {
+    position: absolute;
+    bottom: 160px;
+    left: 60px;
+    width: 400px;
+    height: 300px;
+    border-radius: 16px;
+    object-fit: cover;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+    border: 3px solid rgba(255,255,255,0.15);
+  }
+
+  /* Logo */
+  .logo {
+    position: absolute;
+    top: 40px;
+    right: 60px;
+    width: 320px;
+    z-index: 10;
+    filter: drop-shadow(0 4px 12px rgba(0,0,0,0.3));
+  }
+
+  /* Promotion text */
+  .promo-area {
+    position: absolute;
+    right: 40px;
+    top: 320px;
+    width: 520px;
+    z-index: 10;
+    text-align: center;
+  }
+
+  .promo-label {
+    font-size: 32px;
+    font-weight: 700;
+    color: #FFD400;
+    text-transform: uppercase;
+    letter-spacing: 4px;
+    margin-bottom: 10px;
+  }
+
+  .promo-discount {
+    font-size: 120px;
+    font-weight: 900;
+    color: #FFFFFF;
+    line-height: 1;
+    text-shadow: 0 4px 20px rgba(0,0,0,0.3);
+  }
+
+  .promo-discount span {
+    font-size: 72px;
+  }
+
+  .promo-off {
+    font-size: 60px;
+    font-weight: 800;
+    color: #FFD400;
+    margin-top: -10px;
+  }
+
+  /* Peblla branding + order info */
+  .order-section {
+    position: absolute;
+    bottom: 30px;
+    left: 30px;
+    right: 30px;
+    height: 140px;
+    background: rgba(255,255,255,0.08);
+    backdrop-filter: blur(10px);
+    border-radius: 16px;
+    border: 1px solid rgba(255,255,255,0.1);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 40px;
+    z-index: 10;
+  }
+
+  .qr-section {
+    display: flex;
+    align-items: center;
+    gap: 24px;
+  }
+
+  .qr-code {
+    width: 100px;
+    height: 100px;
+    border-radius: 8px;
+    background: white;
+    padding: 4px;
+  }
+
+  .qr-code img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+  }
+
+  .scan-text {
+    color: rgba(255,255,255,0.7);
+    font-size: 18px;
+    font-weight: 600;
+  }
+
+  .scan-text strong {
+    color: #FFD400;
+    display: block;
+    font-size: 22px;
+  }
+
+  .info-section {
+    text-align: right;
+    color: rgba(255,255,255,0.8);
+    font-size: 16px;
+    line-height: 1.6;
+  }
+
+  .info-section .address {
+    font-weight: 600;
+    color: #FFFFFF;
+    font-size: 18px;
+  }
+
+  /* Peblla badge */
+  .peblla-badge {
+    position: absolute;
+    bottom: 180px;
+    right: 50px;
+    z-index: 10;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: rgba(255,255,255,0.1);
+    padding: 8px 16px;
+    border-radius: 20px;
+  }
+
+  .peblla-badge img {
+    height: 20px;
+  }
+
+  .peblla-badge span {
+    color: rgba(255,255,255,0.6);
+    font-size: 13px;
+    font-weight: 500;
+  }
+
+  /* Decorative elements */
+  .sunburst {
+    position: absolute;
+    top: -200px;
+    right: 200px;
+    width: 600px;
+    height: 600px;
+    background: radial-gradient(circle, rgba(255,212,0,0.15) 0%, transparent 70%);
+    z-index: 0;
+  }
+
+  .dots-pattern {
+    position: absolute;
+    bottom: 200px;
+    left: 500px;
+    width: 200px;
+    height: 200px;
+    background-image: radial-gradient(circle, rgba(255,255,255,0.1) 1px, transparent 1px);
+    background-size: 20px 20px;
+    z-index: 1;
+  }
+</style>
+</head>
+<body>
+<div class="card">
+  <!-- Background elements -->
+  <div class="sunburst"></div>
+  <div class="red-accent-overlay"></div>
+  <div class="dots-pattern"></div>
+
+  <!-- Food images -->
+  <div class="food-collage">
+    <img class="food-img-1" src="menu-hand-breaded-chicken.jpg" alt="Fried Chicken">
+    <img class="food-img-2" src="menu-chicken-sandwich.jpg" alt="Chicken Sandwich">
+    <img class="food-img-3" src="menu-chicken-tenders-hero.jpg" alt="Chicken Tenders">
+  </div>
+
+  <!-- Logo -->
+  <img class="logo" src="logo-footer.png" alt="Krispy Krunchy Chicken">
+
+  <!-- Promotion -->
+  <div class="promo-area">
+    <div class="promo-label">First Order</div>
+    <div class="promo-discount">10<span>%</span></div>
+    <div class="promo-off">OFF</div>
+  </div>
+
+  <!-- Peblla badge -->
+  <div class="peblla-badge">
+    <span>Powered by peblla</span>
+  </div>
+
+  <!-- Bottom bar with QR + info -->
+  <div class="order-section">
+    <div class="qr-section">
+      <div class="qr-code">
+        <img src="../../../../../../upload-1774535703302-0.jpg" alt="QR Code">
+      </div>
+      <div class="scan-text">
+        <strong>Scan to Order</strong>
+        Order online now!
+      </div>
+    </div>
+    <div class="info-section">
+      <div class="address">Krispy Krunchy Chicken</div>
+      400 S Broadway, Baltimore, MD 21231
+    </div>
+  </div>
+</div>
+</body>
+</html>
