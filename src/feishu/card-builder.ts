@@ -109,7 +109,25 @@ export function buildStreamingCard(text: string, toolCalls?: ToolCallInfo[]): ob
  * Build a complete card — final state with full text and optional reasoning panel.
  * @param title - Custom card header title. If not provided, uses "✅ Sigma".
  */
-export function buildCompleteCard(text: string, toolCalls?: ToolCallInfo[], elapsed?: number, title?: string): object {
+export interface ButtonInfo {
+  label: string;
+  actionId: string;
+  type?: string; // default, primary, danger
+}
+
+/**
+ * Extract <<BUTTON:label|actionId|type?>> tags from text.
+ */
+export function extractButtons(text: string): { cleanText: string; buttons: ButtonInfo[] } {
+  const buttons: ButtonInfo[] = [];
+  const cleanText = text.replace(/<<BUTTON:([^|>]+)\|([^|>]+)(?:\|([^>]+))?>>[\s]*/g, (_, label, actionId, type) => {
+    buttons.push({ label: label.trim(), actionId: actionId.trim(), type: type?.trim() });
+    return '';
+  }).trim();
+  return { cleanText, buttons };
+}
+
+export function buildCompleteCard(text: string, toolCalls?: ToolCallInfo[], elapsed?: number, title?: string, buttons?: ButtonInfo[], sessionKey?: string, chatId?: string): object {
   // Extract <<TITLE:...>> from text if present and no explicit title
   let displayText = text || '(空回复)';
   let headerTitle = title || '';
@@ -144,6 +162,28 @@ export function buildCompleteCard(text: string, toolCalls?: ToolCallInfo[], elap
   }
   if (toolCalls && toolCalls.length > 0) {
     footerParts.push(`${toolCalls.length} 次工具调用`);
+  }
+
+  // Buttons (if any)
+  if (buttons && buttons.length > 0) {
+    elements.push({ tag: 'hr' });
+    elements.push({
+      tag: 'action',
+      actions: buttons.map(btn => ({
+        tag: 'button',
+        type: btn.type || 'default',
+        text: { tag: 'plain_text', content: btn.label },
+        behaviors: [{
+          type: 'callback',
+          value: {
+            action: btn.actionId,
+            label: btn.label,
+            sessionKey: sessionKey || '',
+            chatId: chatId || '',
+          },
+        }],
+      })),
+    });
   }
 
   elements.push({ tag: 'hr' });

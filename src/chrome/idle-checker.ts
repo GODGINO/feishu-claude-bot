@@ -1,4 +1,6 @@
 import { execSync } from 'node:child_process';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import type { SessionManager } from '../claude/session-manager.js';
 import type { Logger } from '../utils/logger.js';
 
@@ -45,6 +47,10 @@ export class ChromeIdleChecker {
           'Killing idle Chrome instance',
         );
         this.killChromeOnPort(port);
+
+        // Remove chrome-devtools from mcp-servers.json immediately
+        // so setup() won't detect a config change and kill the Claude process
+        this.removeChromeFromMcpConfig(session.sessionDir);
       } catch (err) {
         this.logger.debug({ err, sessionKey, port }, 'Error checking Chrome idle status');
       }
@@ -60,6 +66,18 @@ export class ChromeIdleChecker {
     } catch {
       return false;
     }
+  }
+
+  private removeChromeFromMcpConfig(sessionDir: string): void {
+    const mcpPath = path.join(sessionDir, 'mcp-servers.json');
+    try {
+      const config = JSON.parse(fs.readFileSync(mcpPath, 'utf-8'));
+      if (config.mcpServers?.['chrome-devtools']) {
+        delete config.mcpServers['chrome-devtools'];
+        fs.writeFileSync(mcpPath, JSON.stringify(config, null, 2));
+        this.logger.info({ sessionDir }, 'Removed chrome-devtools from mcp-servers.json');
+      }
+    } catch { /* ignore */ }
   }
 
   private killChromeOnPort(port: number): void {

@@ -4,6 +4,7 @@ import type { Logger } from '../utils/logger.js';
 import type { ClaudeRunner } from '../claude/runner.js';
 import type { SessionManager } from '../claude/session-manager.js';
 import type { MessageSender } from '../feishu/message-sender.js';
+import type { MessageBridge } from '../bridge/message-bridge.js';
 import type { ResolvedSkill } from '../claude/mcp-manager.js';
 
 interface ScheduledJob {
@@ -45,12 +46,19 @@ export class CronRunner {
   private userJobs = new Map<string, UserJobEntry>();   // User cron jobs (jobId → entry)
   private watchTimer: NodeJS.Timeout | null = null;
 
+  private messageBridge?: MessageBridge;
+
   constructor(
     private runner: ClaudeRunner,
     private sessionMgr: SessionManager,
     private sender: MessageSender,
     private logger: Logger,
   ) {}
+
+  /** Set MessageBridge reference for reply pipeline (called after bridge is created). */
+  setMessageBridge(bridge: MessageBridge): void {
+    this.messageBridge = bridge;
+  }
 
   /**
    * Start scheduling all skills and user cron jobs
@@ -126,41 +134,23 @@ export class CronRunner {
   }
 
   private async executeSkill(skill: ResolvedSkill): Promise<void> {
-    let sessionKey: string;
-    if (skill.sessionKey) {
-      sessionKey = skill.sessionKey;
-    } else {
-      sessionKey = '_shared_scheduler';
+    const sessionKey = skill.sessionKey || '_shared_scheduler';
+    const chatId = skill.targetChatId || (skill.sessionKey ? sessionKeyToChatId(skill.sessionKey) : null);
+
+    if (!chatId) {
+      this.logger.warn({ skill: skill.name }, 'No chatId for scheduled skill, skipping');
+      return;
     }
 
-    const session = this.sessionMgr.getOrCreate(sessionKey);
+    this.logger.info({ skill: skill.name, sessionKey, chatId }, 'Executing scheduled skill');
 
-    this.logger.info(
-      { skill: skill.name, sessionKey, shared: skill.shared },
-      'Executing scheduled skill',
-    );
-
-    try {
-      const result = await this.runner.run({
-        sessionKey,
-        message: skill.prompt,
-        sessionDir: session.sessionDir,
-      });
-
-      const replyText = result.fullText || '(空结果)';
-
-      if (skill.targetChatId) {
-        await this.sender.sendReply(skill.targetChatId, replyText);
-      } else if (skill.sessionKey) {
-        const chatId = sessionKeyToChatId(skill.sessionKey);
-        if (chatId) {
-          await this.sender.sendReply(chatId, `📋 **${skill.name}**\n\n${replyText}`);
-        }
-      }
-
-      this.logger.info({ skill: skill.name, textLength: replyText.length }, 'Scheduled skill completed');
-    } catch (err) {
-      this.logger.error({ err, skill: skill.name }, 'Failed to execute scheduled skill');
+    if (this.messageBridge) {
+      await this.messageBridge.executeCronJob(sessionKey, chatId, skill.prompt, skill.name);
+    } else {
+      // Fallback if bridge not set yet (shouldn't happen)
+      const session = this.sessionMgr.getOrCreate(sessionKey);
+      const result = await this.runner.run({ sessionKey, message: skill.prompt, sessionDir: session.sessionDir });
+      await this.sender.sendReply(chatId, `📋 **${skill.name}**\n\n${result.fullText || '(空结果)'}`);
     }
   }
 
@@ -303,34 +293,26 @@ export class CronRunner {
     );
 
     try {
-      // 2. Run Claude subprocess with the job's prompt
-      const result = await this.runner.run({
-        sessionKey,
-        message: job.prompt,
-        sessionDir: session.sessionDir,
-      });
+      if (this.messageBridge) {
+        await this.messageBridge.executeCronJob(sessionKey, chatId, job.prompt, job.name);
+      } else {
+        // Fallback
+        const result = await this.runner.run({ sessionKey, message: job.prompt, sessionDir: session.sessionDir });
+        await this.sender.sendReply(chatId, `⏰ **${job.name}**\n\n${result.fullText || '(空结果)'}`);
+      }
 
-      // 3. Send result to the chat
-      const replyText = result.fullText || '(任务执行完成，无输出)';
-      await this.sender.sendReply(chatId, `⏰ **${job.name}**\n\n${replyText}`);
-
-      // 5. Update job status in cron-jobs.json
+      // Update job status
       this.updateJobStatus(session.sessionDir, job.id, {
         lastRunAt: new Date().toISOString(),
-        lastResult: replyText.slice(0, 200),
+        lastResult: 'completed',
       });
 
-      this.logger.info(
-        { jobId: job.id, name: job.name, textLength: replyText.length },
-        'User cron job completed',
-      );
+      this.logger.info({ jobId: job.id, name: job.name }, 'User cron job completed');
     } catch (err) {
       this.logger.error({ err, jobId: job.id, name: job.name }, 'Failed to execute user cron job');
-
-      // Try to notify user about the failure
       try {
         await this.sender.sendReply(chatId, `⚠️ 定时任务 **${job.name}** 执行失败: ${(err as Error).message}`);
-      } catch { /* ignore notification failure */ }
+      } catch { /* ignore */ }
     }
   }
 

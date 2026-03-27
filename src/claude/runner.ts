@@ -67,7 +67,7 @@ export class ClaudeRunner {
           const continueResult = await this.pool.send({
             sessionKey: opts.sessionKey,
             sessionDir: opts.sessionDir,
-            message: '工具已加载，请继续执行之前的操作。',
+            message: 'Continue',
             abortSignal: opts.abortSignal,
           });
           // Merge: use the continuation's text as the final response
@@ -78,8 +78,8 @@ export class ClaudeRunner {
         }
       }
 
-      // "Prompt is too long" — context window full. Compact context and retry.
-      if (result.error && /prompt is too long/i.test(result.error)) {
+      // "Could not process image" or "Prompt is too long" — compact context and retry.
+      if (result.error && (/prompt is too long/i.test(result.error) || /could not process image/i.test(result.error))) {
         this.logger.warn({ sessionKey: opts.sessionKey }, 'Prompt too long, compacting context and retrying');
         try {
           // Send /compact to trigger Claude Code's built-in context compression.

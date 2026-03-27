@@ -94,8 +94,12 @@ export class McpManager {
           execSync(`curl -s --max-time 1 http://127.0.0.1:${port}/json/version > /dev/null 2>&1`);
           initialMcpServers['chrome-devtools'] = chromeEntry;
         } catch {
-          // Chrome not running — drop the entry
+          // Chrome not running — drop the entry and silently update the file.
+          // This is NOT a config change that requires process restart.
           this.logger.info({ sessionKey }, 'Chrome not running, removing chrome-devtools from MCP config');
+          const cleanedContent = JSON.stringify({ mcpServers: initialMcpServers }, null, 2);
+          fs.writeFileSync(mcpConfigPath, cleanedContent);
+          // Don't set mcpChanged — removing a dead Chrome entry doesn't need a respawn
         }
       }
       const newMcpContent = JSON.stringify({ mcpServers: initialMcpServers }, null, 2);
@@ -543,9 +547,37 @@ exec node "${cliPath}" "$@"
     this.addFeishuMcpServers(sessionDir, mcpServers);
 
     // Only include mcpServers if there are any
+    const projectRoot = path.dirname(this.sessionsDir);
     const settings: any = {
       permissions: {
-        allow: ['Bash(*)', 'Read(*)', 'Write(*)', 'Edit(*)', 'Glob(*)', 'Grep(*)'],
+        allow: [
+          'Bash(*)', 'Glob(*)', 'Grep(*)',
+          // Read: only current session (including .claude/), shared, tmp
+          `Read(${sessionDir}/**)`,
+          `Read(${sessionDir}/.claude/**)`,
+          `Read(${projectRoot}/shared/**)`,
+          'Read(/tmp/**)', 'Read(/private/tmp/**)',
+          // Write/Edit: only current session (including .claude/), shared, tmp
+          `Write(${sessionDir}/**)`,
+          `Write(${sessionDir}/.claude/**)`,
+          `Write(${projectRoot}/shared/**)`,
+          'Write(/tmp/**)', 'Write(/private/tmp/**)',
+          `Edit(${sessionDir}/**)`,
+          `Edit(${sessionDir}/.claude/**)`,
+          `Edit(${projectRoot}/shared/**)`,
+          'Edit(/tmp/**)', 'Edit(/private/tmp/**)',
+        ],
+        deny: [
+          // Global Claude config/memory
+          'Write(~/.claude/**)', 'Edit(~/.claude/**)',
+          // Sensitive files
+          `Read(${projectRoot}/.env)`,
+          // Browser isolation
+          'Bash(open *)',
+          'Bash(*google-chrome*)',
+          'Bash(*Google Chrome*)',
+          'Bash(*remote-debugging-port*)',
+        ],
       },
     };
 

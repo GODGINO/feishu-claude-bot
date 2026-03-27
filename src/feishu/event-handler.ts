@@ -33,12 +33,15 @@ export type MessageHandler = (msg: IncomingMessage) => void | Promise<void>;
 const recentMessageIds = new Set<string>();
 const DEDUP_TTL_MS = 600_000; // 10 minutes
 
+export type CardActionHandler = (action: { sessionKey: string; chatId: string; actionId: string; label: string; operatorId: string }) => void | Promise<void>;
+
 export function createEventHandler(
   botOpenId: string,
   logger: Logger,
   botStartTime: number = Date.now(),
-): { dispatcher: lark.EventDispatcher; onMessage: (handler: MessageHandler) => void } {
+): { dispatcher: lark.EventDispatcher; onMessage: (handler: MessageHandler) => void; onCardAction: (handler: CardActionHandler) => void } {
   let messageHandler: MessageHandler | null = null;
+  let cardActionHandler: CardActionHandler | null = null;
 
   const dispatcher = new lark.EventDispatcher({}).register({
     'im.message.receive_v1': async (data: any) => {
@@ -129,8 +132,13 @@ export function createEventHandler(
         text = text.replace(/@_user_\w+/g, '').trim();
 
         if (!text && images.length === 0 && files.length === 0) {
-          logger.info({ messageType: message.message_type, content: message.content?.slice(0, 300) }, 'Empty message after parsing, ignoring');
-          return;
+          if (isMentioned) {
+            // Pure @mention with no text — user wants attention, inject placeholder
+            text = '[用户@了你，请查看上下文并回复]';
+          } else {
+            logger.info({ messageType: message.message_type, content: message.content?.slice(0, 300) }, 'Empty message after parsing, ignoring');
+            return;
+          }
         }
 
         // Extract sender name from event (no extra API call needed)
@@ -168,12 +176,45 @@ export function createEventHandler(
         logger.error({ err }, 'Error handling Feishu message event');
       }
     },
-  });
+    'card.action.trigger': async (data: any) => {
+      try {
+        const event = data;
+        const value = event?.action?.value;
+        if (!value?.sessionKey || !value?.chatId) {
+          logger.debug({ event }, 'Card action missing sessionKey/chatId, ignoring');
+          return;
+        }
+
+        const operatorId = event?.operator?.open_id || '';
+        logger.info(
+          { sessionKey: value.sessionKey, actionId: value.action, label: value.label, operatorId },
+          'Card button clicked',
+        );
+
+        if (cardActionHandler) {
+          Promise.resolve(cardActionHandler({
+            sessionKey: value.sessionKey,
+            chatId: value.chatId,
+            actionId: value.action,
+            label: value.label,
+            operatorId,
+          })).catch((err: any) => {
+            logger.error({ err }, 'Error in card action handler');
+          });
+        }
+      } catch (err) {
+        logger.error({ err }, 'Error handling card action event');
+      }
+    },
+  } as any);
 
   return {
     dispatcher,
     onMessage: (handler: MessageHandler) => {
       messageHandler = handler;
+    },
+    onCardAction: (handler: CardActionHandler) => {
+      cardActionHandler = handler;
     },
   };
 }

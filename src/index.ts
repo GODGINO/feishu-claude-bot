@@ -105,7 +105,7 @@ async function main() {
 
   // Create core components (botStartTime filters out stale events from before startup)
   const botStartTime = Date.now();
-  const { dispatcher, onMessage } = createEventHandler(botOpenId, logger, botStartTime);
+  const { dispatcher, onMessage, onCardAction } = createEventHandler(botOpenId, logger, botStartTime);
   const sender = new MessageSender(client, logger);
   const typing = new TypingIndicator(client, logger);
   const runner = new ClaudeRunner(config, logger, config.sessionsDir);
@@ -119,8 +119,16 @@ async function main() {
     await bridge.handleMessage(msg);
   });
 
+  // Handle card button clicks — send as natural language to Claude
+  onCardAction(async ({ sessionKey, chatId, actionId, label, operatorId }) => {
+    const userName = await sender.resolveUserName(operatorId) || operatorId;
+    logger.info({ sessionKey, chatId, actionId, label, operatorId, userName }, 'Processing card button click');
+    await bridge.executeButtonAction(sessionKey, chatId, label, userName);
+  });
+
   // Start cron scheduler for skills
   const scheduler = new CronRunner(runner, sessionMgr, sender, logger);
+  scheduler.setMessageBridge(bridge);
   scheduler.start();
 
   // Start email IDLE monitor (push notifications for new emails)

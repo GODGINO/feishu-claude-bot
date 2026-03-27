@@ -441,9 +441,12 @@ export class ProcessPool {
           this.logger.info({ sessionKey, lineNum: lineCount, raw: line.slice(0, 100) }, 'Stdout non-JSON line');
         }
       }
-      // Log task_progress events to understand subagent protocol
+      // Log rate_limit_event with full payload
       try {
         const raw = JSON.parse(line);
+        if (raw.type === 'rate_limit_event') {
+          this.logger.warn({ sessionKey, payload: JSON.stringify(raw).slice(0, 500) }, 'Rate limit event');
+        }
         if (raw.type === 'system' && (raw.subtype === 'task_progress' || raw.subtype === 'task_started' || raw.subtype === 'task_notification')) {
           this.logger.info({ sessionKey, subtype: raw.subtype, payload: JSON.stringify(raw).slice(0, 500) }, 'Subagent event');
         }

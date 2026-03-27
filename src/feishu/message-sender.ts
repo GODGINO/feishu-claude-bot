@@ -275,24 +275,14 @@ export class MessageSender {
         },
       });
 
-      // Thread reply: use im.message.create with root_id (creates message inside thread)
-      if (rootId) {
-        const resp = await this._client.im.message.create({
-          params: { receive_id_type: 'chat_id' },
-          data: {
-            receive_id: chatId,
-            content,
-            msg_type: 'post',
-            root_id: rootId,
-          } as any,
-        });
-        return (resp as any).data?.message_id || null;
-      }
-
       if (replyToMessageId) {
         const resp = await this._client.im.message.reply({
           path: { message_id: replyToMessageId },
-          data: { content, msg_type: 'post' },
+          data: {
+            content,
+            msg_type: 'post',
+            ...(rootId ? { reply_in_thread: true } : {}),
+          } as any,
         });
         return (resp as any).data?.message_id || null;
       }
@@ -319,24 +309,14 @@ export class MessageSender {
     try {
       const content = JSON.stringify(cardJson);
 
-      // Thread reply: use im.message.create with root_id
-      if (rootId) {
-        const resp = await this._client.im.message.create({
-          params: { receive_id_type: 'chat_id' },
-          data: {
-            receive_id: chatId,
-            content,
-            msg_type: 'interactive',
-            root_id: rootId,
-          } as any,
-        });
-        return (resp as any).data?.message_id || null;
-      }
-
       if (replyToMessageId) {
         const resp = await this._client.im.message.reply({
           path: { message_id: replyToMessageId },
-          data: { content, msg_type: 'interactive' },
+          data: {
+            content,
+            msg_type: 'interactive',
+            ...(rootId ? { reply_in_thread: true } : {}),
+          } as any,
         });
         return (resp as any).data?.message_id || null;
       }
@@ -429,26 +409,21 @@ export class MessageSender {
 
       this.logger.info({ fileName, fileKey, fileType }, 'Uploaded file to Feishu');
 
-      // Step 2: Send file message
-      const content = JSON.stringify({ file_key: fileKey });
-
-      if (rootId) {
-        const resp = await this._client.im.message.create({
-          params: { receive_id_type: 'chat_id' },
-          data: {
-            receive_id: chatId,
-            content,
-            msg_type: 'file',
-            root_id: rootId,
-          } as any,
-        });
-        return (resp as any).data?.message_id || null;
-      }
+      // Step 2: Send message — mp4 uses 'media' msg_type, others use 'file'
+      const isVideo = ext === '.mp4';
+      const msgType = isVideo ? 'media' : 'file';
+      const content = isVideo
+        ? JSON.stringify({ file_key: fileKey, image_key: '' })
+        : JSON.stringify({ file_key: fileKey });
 
       if (replyToMessageId) {
         const resp = await this._client.im.message.reply({
           path: { message_id: replyToMessageId },
-          data: { content, msg_type: 'file' },
+          data: {
+            content,
+            msg_type: msgType,
+            ...(rootId ? { reply_in_thread: true } : {}),
+          } as any,
         });
         return (resp as any).data?.message_id || null;
       }
@@ -458,7 +433,7 @@ export class MessageSender {
         data: {
           receive_id: chatId,
           content,
-          msg_type: 'file',
+          msg_type: msgType,
         },
       });
       return (resp as any).data?.message_id || null;
@@ -498,23 +473,14 @@ export class MessageSender {
       // Step 2: Send image message
       const content = JSON.stringify({ image_key: imageKey });
 
-      if (rootId) {
-        const resp = await this._client.im.message.create({
-          params: { receive_id_type: 'chat_id' },
-          data: {
-            receive_id: chatId,
-            content,
-            msg_type: 'image',
-            root_id: rootId,
-          } as any,
-        });
-        return (resp as any).data?.message_id || null;
-      }
-
       if (replyToMessageId) {
         const resp = await this._client.im.message.reply({
           path: { message_id: replyToMessageId },
-          data: { content, msg_type: 'image' },
+          data: {
+            content,
+            msg_type: 'image',
+            ...(rootId ? { reply_in_thread: true } : {}),
+          } as any,
         });
         return (resp as any).data?.message_id || null;
       }

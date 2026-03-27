@@ -10,9 +10,11 @@ import {
   buildThinkingCard,
   buildStreamingCard,
   buildCompleteCard,
+  extractButtons,
   STREAMING_ELEMENT_ID,
   TOOL_CALLS_ELEMENT_ID,
   type ToolCallInfo,
+  type ButtonInfo,
 } from './card-builder.js';
 
 const THROTTLE_MS = 500; // Minimum interval between card updates
@@ -37,6 +39,9 @@ export class CardStreamer {
   private deferredUserMessageId?: string;
   // Track in-flight flush to prevent race with complete()
   private inflightFlush: Promise<void> | null = null;
+  // For button rendering — set by caller before complete()
+  sessionKey?: string;
+  chatId?: string;
   private completed = false;
 
   constructor(
@@ -117,14 +122,11 @@ export class CardStreamer {
     this.messageSent = true;
 
     const wantsThread = text?.includes('<<THREAD>>') || false;
-    const rootId = this.deferredExistingRootId || (wantsThread ? this.deferredUserMessageId : undefined);
 
     this.logger.info({
       cardId: this.cardId,
       wantsThread,
-      rootId,
-      existingRootId: this.deferredExistingRootId,
-      userMessageId: this.deferredUserMessageId,
+      userMessageId: this.deferredReplyToMessageId,
     }, 'Sending card IM message (deferred)');
 
     try {
@@ -133,21 +135,14 @@ export class CardStreamer {
         data: { card_id: this.cardId },
       });
 
-      if (rootId) {
-        const resp = await this.client.im.message.create({
-          params: { receive_id_type: 'chat_id' },
-          data: {
-            receive_id: this.deferredChatId,
-            content,
-            msg_type: 'interactive',
-            root_id: rootId,
-          } as any,
-        });
-        this.messageId = (resp as any).data?.message_id || null;
-      } else if (this.deferredReplyToMessageId) {
+      if (this.deferredReplyToMessageId) {
         const resp = await this.client.im.message.reply({
           path: { message_id: this.deferredReplyToMessageId },
-          data: { content, msg_type: 'interactive' },
+          data: {
+            content,
+            msg_type: 'interactive',
+            ...(wantsThread ? { reply_in_thread: true } : {}),
+          } as any,
         });
         this.messageId = (resp as any).data?.message_id || null;
       } else {
@@ -162,7 +157,7 @@ export class CardStreamer {
         this.messageId = (resp as any).data?.message_id || null;
       }
 
-      this.logger.info({ cardId: this.cardId, messageId: this.messageId, rootId }, 'Card message sent');
+      this.logger.info({ cardId: this.cardId, messageId: this.messageId, wantsThread }, 'Card message sent');
     } catch (err: any) {
       this.logger.warn({ err: err?.message, cardId: this.cardId }, 'Failed to send card IM message');
     }
@@ -259,11 +254,26 @@ export class CardStreamer {
 
     this.completed = true;
 
+    // Use streaming-accumulated text if it's longer than result text.
+    // The result event often contains a short summary that would overwrite
+    // the full content shown during streaming.
+    if (this.pendingText && this.pendingText.length > fullText.length) {
+      this.logger.info(
+        { pendingLen: this.pendingText.length, resultLen: fullText.length },
+        'Using streaming text (longer than result text)',
+      );
+      fullText = this.pendingText;
+    }
+
     // Ensure IM message is sent before completing
     await this.ensureMessageSent(fullText);
 
     // Strip <<THREAD>> and <<REACT:...>> tags from display text
     fullText = fullText.replace(/<<THREAD>>\s*/g, '').replace(/<<REACT:\w+>>\s*/g, '');
+
+    // Extract <<BUTTON:...>> tags
+    const { cleanText: textWithoutButtons, buttons } = extractButtons(fullText);
+    fullText = textWithoutButtons;
 
     if (this.updateTimer) {
       clearTimeout(this.updateTimer);
@@ -291,6 +301,10 @@ export class CardStreamer {
         fullText,
         this.toolCalls.length > 0 ? this.toolCalls : undefined,
         elapsed,
+        undefined,
+        buttons.length > 0 ? buttons : undefined,
+        this.sessionKey,
+        this.chatId,
       );
 
       this.sequence++;
@@ -499,10 +513,11 @@ export class CardStreamer {
     this.lastUpdateTime = Date.now();
     this.sequence++;
 
-    // Strip <<THREAD>>, <<REACT:...>> and <<TITLE:...>> tags from display text
+    // Strip <<THREAD>>, <<REACT:...>>, <<BUTTON:...>> and <<TITLE:...>> tags from display text
     const displayText = this.pendingText
       .replace(/<<THREAD>>\s*/g, '')
       .replace(/<<REACT:\w+>>\s*/g, '')
+      .replace(/<<BUTTON:[^>]+>>\s*/g, '')
       .replace(/<?<<TITLE:.+?>>>?\s*\n?/g, '')
       .replace(/<TITLE:.+?>\s*\n?/g, '');
 

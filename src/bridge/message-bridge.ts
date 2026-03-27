@@ -115,16 +115,18 @@ export class MessageBridge {
   }
 
   /**
-   * Check if text is a REACT-only response. If so, send reaction and return empty string.
-   * REACT is mutually exclusive with text — like NO_REPLY.
+   * Extract all <<REACT:emoji>> tags from text, send reactions, return text with tags stripped.
+   * REACT is an annotation — can coexist with text and tool calls.
    */
   private async processReactions(text: string, messageId: string): Promise<string> {
-    const match = text.trim().match(/^<<REACT:(\w+)>>$/);
-    if (!match) return text; // Not a REACT-only response, return unchanged
-    const emojiType = match[1];
-    this.typing.start(messageId, emojiType).catch(() => {});
-    this.logger.info({ messageId, emojiType }, 'Sending reaction');
-    return '';
+    const pattern = /<<REACT:(\w+)>>/g;
+    const matches = [...text.matchAll(pattern)];
+    if (matches.length === 0) return text;
+    for (const match of matches) {
+      this.typing.start(messageId, match[1]).catch(() => {});
+      this.logger.info({ messageId, emojiType: match[1] }, 'Sending reaction');
+    }
+    return text.replace(pattern, '').trim();
   }
 
   /**
@@ -291,7 +293,7 @@ export class MessageBridge {
 
         // Add behavior hint
         if (isNonMentionGroup) {
-          prompt = `[群聊消息，未@你。不需要回复（闲聊、表情、"好的/收到"等）就只输出 NO_REPLY，不要输出任何其他内容。有人提问、讨论你擅长的话题、或提到你的名字(Sigma)则正常回复。]\n${prompt}`;
+          prompt = `[群聊消息，未@你。请从第一个 token 开始判断：不需要回复（闲聊、表情、"好的/收到"等无关消息）→ 只输出 NO_REPLY；以下情况正常回复：有人提问、下达指令或任务、用户的消息与你上一条回复高度相关（追问/补充/确认）、讨论你擅长的话题、提到 Sigma。]\n${prompt}`;
         } else {
           prompt = `[你被@提及，必须回复]\n${prompt}`;
         }
@@ -371,161 +373,18 @@ export class MessageBridge {
         }
       }
 
-      // Streaming card path: card created on-demand (when tools are used).
-      // Simple text replies are sent as plain text messages.
-      {
-        this.logger.info({ sessionKey, isNonMentionGroup }, 'Entering streaming path');
-        const streamer = new CardStreamer(this.sender.larkClient, this.logger);
-
-        {
-          // Register stream callbacks scoped to this session
-          let cardCreated = false;
-          let cardCreating = false;
-
-          // Create streaming card (called on first tool use, or at result for long text)
-          let bufferedText = ''; // Buffer text until card is created or result arrives
-          const ensureCard = () => {
-            if (cardCreated || cardCreating) return;
-            cardCreating = true;
-            this.logger.info({ sessionKey }, 'Creating streaming card');
-            const p = streamer.start(msg.chatId, msg.messageId, existingRootId, msg.messageId).then(() => {
-              cardCreating = false;
-              cardCreated = true;
-              // Flush buffered text
-              if (bufferedText) streamer.updateText(bufferedText);
-            });
-            streamer.startPromise = p;
-          };
-
-          const onText = (key: string, text: string) => {
-            if (key !== sessionKey) return;
-            bufferedText = text; // Always buffer latest accumulated text
-            if (cardCreated && !cardCreating) {
-              streamer.updateText(text);
-            }
-            // If card not created yet: text stays buffered until tool call or result
-          };
-          const onTool = (key: string, event: { type: 'start' | 'end'; toolName: string; toolInput?: string; toolUseId?: string; isError?: boolean }) => {
-            if (key !== sessionKey) return;
-            // First tool call triggers card creation
-            if (event.type === 'start' && !cardCreated && !cardCreating) {
-              ensureCard();
-            }
-            if (event.type === 'start') {
-              streamer.addToolCall(event.toolName, event.toolInput, event.toolUseId);
-            } else if (event.type === 'end' && event.toolUseId) {
-              streamer.updateToolCall(event.toolUseId, event.isError ? 'failed' : 'complete');
-            }
-          };
-          this.runner.onTextStream(sessionKey, onText);
-          this.runner.onToolStream(sessionKey, onTool);
-
-          // Track running subagents for this card
-          const runningAgents = new Map<string, { toolUseId?: string; description?: string }>();
-
-          // Register persistent subagent listener (survives after result)
-          this.runner.onSubagentStream(sessionKey, (_key, event) => {
-            if (event.type === 'started') {
-              runningAgents.set(event.taskId, { toolUseId: event.toolUseId, description: event.description });
-              if (event.toolUseId) streamer.registerSubagent(event.taskId, event.toolUseId);
-            } else if (event.type === 'progress') {
-              // Subagent tool call step — add as child of the Agent tool
-              if (event.toolName) {
-                streamer.addSubagentStep(event.taskId, event.toolName, event.description);
-              }
-            } else {
-              // completed or stopped
-              const agent = runningAgents.get(event.taskId);
-              runningAgents.delete(event.taskId);
-              // Mark last running child as complete
-              streamer.completeSubagentSteps(event.taskId);
-              // Update card tool status
-              if (agent?.toolUseId) {
-                streamer.updateToolCall(agent.toolUseId, event.type === 'completed' ? 'complete' : 'failed');
-              }
-              // All agents done → finalize card
-              if (runningAgents.size === 0 && streamer.isWaitingForAgents()) {
-                this.logger.info({ sessionKey }, 'All subagents completed, finalizing card');
-                streamer.finalizeAfterAgents();
-                this.runner.onSubagentStream(sessionKey, undefined);
-              }
-            }
-          });
-
-          try {
-            const result = await this.runner.run({
-              sessionKey,
-              message: prompt + TITLE_INSTRUCTION,
-              sessionDir: session.sessionDir,
-              abortSignal: abortController.signal,
-              images,
-            });
-
-            let rawText = result.fullText || '';
-            // Process <<REACT:emoji>> — send reaction, clear text if REACT-only
-            rawText = await this.processReactions(rawText, msg.messageId);
-            const replyText = rawText.trim();
-            // Detect <<THREAD>> for sendMentionedFiles rootId
-            const streamWantsThread = rawText.includes('<<THREAD>>');
-            const streamRootId = existingRootId || (streamWantsThread ? msg.messageId : undefined);
-            const isReactOnly = !rawText && !!result.fullText;
-            const cleanText = rawText.replace(/<<THREAD>>\s*/g, '').replace(/<<REACT:\w+>>\s*/g, '').trim();
-            if (replyText === 'NO_REPLY' || (isNonMentionGroup && replyText === '') || isReactOnly) {
-              // NO_REPLY, empty non-mention, or REACT-only — no reply needed
-            } else if (runningAgents.size > 0) {
-              // Agents still running — need card for progress display
-              if (!cardCreated) ensureCard();
-              if (streamer.startPromise) await streamer.startPromise;
-              streamer.completeTextOnly(rawText || '(空回复)');
-              await this.sendMentionedFiles(msg.chatId, cleanText, session.sessionDir, undefined, streamRootId);
-              this.logger.info({ sessionKey, runningAgents: runningAgents.size }, 'Turn done but agents still running, keeping card alive');
-              setTimeout(() => {
-                if (streamer.isWaitingForAgents()) {
-                  this.logger.warn({ sessionKey, remaining: runningAgents.size }, 'Agent timeout — finalizing card');
-                  streamer.finalizeAfterAgents();
-                  this.runner.onSubagentStream(sessionKey, undefined);
-                }
-              }, 10 * 60 * 1000);
-            } else if (!cardCreated) {
-              // No card was created (no tool calls) — send as plain text
-              this.logger.info({ sessionKey, textLen: cleanText.length }, 'No tools used, sending plain text reply');
-              await this.sender.sendReply(msg.chatId, cleanText || '(空回复)', undefined, session.sessionDir, streamRootId);
-              await this.sendMentionedFiles(msg.chatId, cleanText, session.sessionDir, undefined, streamRootId);
-              this.runner.onSubagentStream(sessionKey, undefined);
-            } else {
-              // Card exists (tools were used) — complete normally
-              await streamer.complete(rawText || '(空回复)');
-              await this.sendMentionedFiles(msg.chatId, cleanText, session.sessionDir, undefined, streamRootId);
-              this.runner.onSubagentStream(sessionKey, undefined);
-            }
-
-            // Write bot reply to context buffer
-            const cleanReply = replyText.replace(/<<THREAD>>\s*/g, '');
-            if ((msg.chatType === 'group' || msg.chatType === 'p2p') && cleanReply && cleanReply !== 'NO_REPLY') {
-              const entries = this.groupContext['buffers'].get(msg.chatId);
-              if (entries && entries.length > 0) {
-                entries[entries.length - 1].botReply = cleanReply.length > 500
-                  ? cleanReply.slice(0, 500) + '...' : cleanReply;
-              }
-              this.groupContext.save(session.sessionDir, msg.chatId);
-            }
-          } catch (err) {
-            if (abortController.signal.aborted) {
-              this.logger.info({ sessionKey }, 'Streaming task stopped by user');
-              await streamer.complete(streamer.getCurrentText() || '⏹ 任务已中止');
-            } else {
-              this.logger.error({ err, sessionKey }, 'Streaming task failed');
-              await streamer.abort(`❌ 出错了: ${err instanceof Error ? err.message : String(err)}`);
-            }
-            this.runner.onSubagentStream(sessionKey, undefined);
-          } finally {
-            this.runner.onTextStream(sessionKey, undefined);
-            this.runner.onToolStream(sessionKey, undefined);
-          }
-          // Skip the normal reply flow below — streaming handled everything
-          return;
-        }
-      }
+      // Execute and reply using the shared pipeline
+      await this.executeAndReply({
+        sessionKey,
+        chatId: msg.chatId,
+        prompt,
+        sessionDir: session.sessionDir,
+        replyToMessageId: msg.messageId,
+        existingRootId,
+        isNonMentionGroup,
+        abortSignal: abortController.signal,
+        images,
+      });
 
 
     } catch (err) {
@@ -569,6 +428,232 @@ export class MessageBridge {
           ? replyText.slice(0, 500) + '...' : replyText;
       }
       this.groupContext.save(session.sessionDir, msg.chatId);
+    }
+  }
+
+  /**
+   * Execute a cron job through the standard reply pipeline.
+   * No typing indicator, no引用回复, no NO_REPLY injection.
+   */
+  async executeCronJob(sessionKey: string, chatId: string, prompt: string, jobName: string): Promise<void> {
+    const session = this.sessionMgr.getOrCreate(sessionKey);
+    const cronPrompt = `[定时任务执行: ${jobName}] ${prompt}\n[这是定时任务，必须输出实际文字内容发送给用户]`;
+
+    this.logger.info({ sessionKey, jobName }, 'Executing cron job via reply pipeline');
+
+    try {
+      await this.executeAndReply({
+        sessionKey,
+        chatId,
+        prompt: cronPrompt,
+        sessionDir: session.sessionDir,
+        replyToMessageId: undefined, // No message to reply to
+        existingRootId: undefined,
+        isNonMentionGroup: false,
+        isCronJob: true,
+      });
+    } catch (err) {
+      this.logger.error({ err, sessionKey, jobName }, 'Cron job execution failed');
+      await this.sender.sendReply(chatId, `⚠️ 定时任务 **${jobName}** 执行失败: ${(err as Error).message}`);
+    }
+  }
+
+  /**
+   * Execute a card button action — sends the click as natural language to Claude.
+   */
+  async executeButtonAction(sessionKey: string, chatId: string, label: string, userName: string): Promise<void> {
+    const session = this.sessionMgr.getOrCreate(sessionKey);
+    const prompt = `[${userName} 点击了按钮: ${label}]`;
+
+    this.logger.info({ sessionKey, label, userName }, 'Executing button action via reply pipeline');
+
+    try {
+      await this.executeAndReply({
+        sessionKey,
+        chatId,
+        prompt,
+        sessionDir: session.sessionDir,
+        replyToMessageId: undefined,
+        existingRootId: undefined,
+        isNonMentionGroup: false,
+      });
+    } catch (err) {
+      this.logger.error({ err, sessionKey, label }, 'Button action execution failed');
+      await this.sender.sendReply(chatId, `⚠️ 按钮操作失败: ${(err as Error).message}`);
+    }
+  }
+
+  /**
+   * Shared reply pipeline: run Claude, stream results, send reply.
+   * Used by both normal messages and cron jobs.
+   */
+  private async executeAndReply(opts: {
+    sessionKey: string;
+    chatId: string;
+    prompt: string;
+    sessionDir: string;
+    replyToMessageId?: string;
+    existingRootId?: string;
+    isNonMentionGroup: boolean;
+    abortSignal?: AbortSignal;
+    images?: ImageAttachment[];
+    isCronJob?: boolean;
+  }): Promise<void> {
+    const { sessionKey, chatId, prompt, sessionDir, replyToMessageId, existingRootId, isNonMentionGroup, abortSignal, images, isCronJob } = opts;
+
+    this.logger.info({ sessionKey, isNonMentionGroup, isCronJob }, 'Entering reply pipeline');
+    const streamer = new CardStreamer(this.sender.larkClient, this.logger);
+
+    // Pass session info to streamer for button rendering
+    streamer.sessionKey = sessionKey;
+    streamer.chatId = chatId;
+
+    let cardCreated = false;
+    let cardCreating = false;
+    let bufferedText = '';
+
+    const ensureCard = () => {
+      if (cardCreated || cardCreating) return;
+      cardCreating = true;
+      this.logger.info({ sessionKey }, 'Creating streaming card');
+      const p = streamer.start(chatId, replyToMessageId, existingRootId, replyToMessageId).then(() => {
+        cardCreating = false;
+        cardCreated = true;
+        if (bufferedText) streamer.updateText(bufferedText);
+      });
+      streamer.startPromise = p;
+    };
+
+    const onText = (key: string, text: string) => {
+      if (key !== sessionKey) return;
+      bufferedText = text;
+      if (cardCreated && !cardCreating) {
+        streamer.updateText(text);
+      }
+    };
+    const onTool = (key: string, event: { type: 'start' | 'end'; toolName: string; toolInput?: string; toolUseId?: string; isError?: boolean }) => {
+      if (key !== sessionKey) return;
+      if (event.type === 'start' && !cardCreated && !cardCreating) {
+        ensureCard();
+      }
+      if (event.type === 'start') {
+        streamer.addToolCall(event.toolName, event.toolInput, event.toolUseId);
+      } else if (event.type === 'end' && event.toolUseId) {
+        streamer.updateToolCall(event.toolUseId, event.isError ? 'failed' : 'complete');
+      }
+    };
+    this.runner.onTextStream(sessionKey, onText);
+    this.runner.onToolStream(sessionKey, onTool);
+
+    // Track running subagents
+    const runningAgents = new Map<string, { toolUseId?: string; description?: string }>();
+    this.runner.onSubagentStream(sessionKey, (_key, event) => {
+      if (event.type === 'started') {
+        runningAgents.set(event.taskId, { toolUseId: event.toolUseId, description: event.description });
+        if (event.toolUseId) streamer.registerSubagent(event.taskId, event.toolUseId);
+      } else if (event.type === 'progress') {
+        if (event.toolName) streamer.addSubagentStep(event.taskId, event.toolName, event.description);
+      } else {
+        const agent = runningAgents.get(event.taskId);
+        runningAgents.delete(event.taskId);
+        streamer.completeSubagentSteps(event.taskId);
+        if (agent?.toolUseId) streamer.updateToolCall(agent.toolUseId, event.type === 'completed' ? 'complete' : 'failed');
+        if (runningAgents.size === 0 && streamer.isWaitingForAgents()) {
+          this.logger.info({ sessionKey }, 'All subagents completed, finalizing card');
+          streamer.finalizeAfterAgents();
+          this.runner.onSubagentStream(sessionKey, undefined);
+        }
+      }
+    });
+
+    try {
+      const result = await this.runner.run({
+        sessionKey,
+        message: prompt + TITLE_INSTRUCTION,
+        sessionDir,
+        abortSignal,
+        images,
+      });
+
+      let rawText = result.fullText || '';
+      // Process <<REACT:emoji>> — send reactions only if there's a real message to react to
+      if (replyToMessageId) {
+        rawText = await this.processReactions(rawText, replyToMessageId);
+      } else {
+        // Cron job: strip REACT tags but don't send reactions (no message to react to)
+        rawText = rawText.replace(/<<REACT:\w+>>/g, '').trim();
+      }
+      const replyText = rawText.trim();
+      const streamWantsThread = rawText.includes('<<THREAD>>');
+      const streamRootId = existingRootId || (streamWantsThread ? replyToMessageId : undefined);
+      const cleanText = rawText.replace(/<<THREAD>>\s*/g, '').trim();
+
+      if (replyText === 'NO_REPLY' || (!cardCreated && isNonMentionGroup && !replyText) || (!cardCreated && !replyText)) {
+        // NO_REPLY or empty text without card — nothing to show
+      } else if (runningAgents.size > 0) {
+        if (!cardCreated) ensureCard();
+        if (streamer.startPromise) await streamer.startPromise;
+        streamer.completeTextOnly(rawText || '(空回复)');
+        await this.sendMentionedFiles(chatId, cleanText, sessionDir, undefined, streamRootId);
+        this.logger.info({ sessionKey, runningAgents: runningAgents.size }, 'Turn done but agents still running');
+        setTimeout(() => {
+          if (streamer.isWaitingForAgents()) {
+            this.logger.warn({ sessionKey }, 'Agent timeout — finalizing card');
+            streamer.finalizeAfterAgents();
+            this.runner.onSubagentStream(sessionKey, undefined);
+          }
+        }, 10 * 60 * 1000);
+      } else if (!cardCreated && !rawText.includes('<<BUTTON:')) {
+        // No card, no buttons — send as plain text
+        this.logger.info({ sessionKey, textLen: cleanText.length }, 'No tools used, sending plain text reply');
+        await this.sender.sendReply(chatId, cleanText || '(空回复)', replyToMessageId, sessionDir, streamRootId);
+        await this.sendMentionedFiles(chatId, cleanText, sessionDir, undefined, streamRootId);
+        this.runner.onSubagentStream(sessionKey, undefined);
+      } else {
+        // Card exists (tools used) or buttons present — complete as card
+        if (!cardCreated) {
+          // Buttons present but no card yet — create card now
+          ensureCard();
+          if (streamer.startPromise) await streamer.startPromise;
+        }
+        await streamer.complete(rawText || '(空回复)');
+        await this.sendMentionedFiles(chatId, cleanText, sessionDir, undefined, streamRootId);
+        this.runner.onSubagentStream(sessionKey, undefined);
+      }
+
+      // Write bot reply to context buffer
+      const cleanReply = replyText.replace(/<<THREAD>>\s*/g, '');
+      if (cleanReply && cleanReply !== 'NO_REPLY') {
+        if (!this.groupContext['buffers'].has(chatId)) {
+          this.groupContext.load(sessionDir, chatId);
+        }
+        const entries = this.groupContext['buffers'].get(chatId);
+        if (isCronJob) {
+          // Cron: add as new context entry
+          this.groupContext.add(chatId, {
+            timestamp: Date.now(),
+            senderName: `⏰ 定时任务`,
+            text: prompt,
+            botReply: cleanReply.length > 500 ? cleanReply.slice(0, 500) + '...' : cleanReply,
+          });
+        } else if (entries && entries.length > 0) {
+          entries[entries.length - 1].botReply = cleanReply.length > 500
+            ? cleanReply.slice(0, 500) + '...' : cleanReply;
+        }
+        this.groupContext.save(sessionDir, chatId);
+      }
+    } catch (err) {
+      if (abortSignal?.aborted) {
+        this.logger.info({ sessionKey }, 'Task stopped by user');
+        await streamer.complete(streamer.getCurrentText() || '⏹ 任务已中止');
+      } else {
+        this.logger.error({ err, sessionKey }, 'Reply pipeline failed');
+        await streamer.abort(`❌ 出错了: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      this.runner.onSubagentStream(sessionKey, undefined);
+    } finally {
+      this.runner.onTextStream(sessionKey, undefined);
+      this.runner.onToolStream(sessionKey, undefined);
     }
   }
 
