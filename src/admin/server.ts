@@ -41,6 +41,7 @@ export function startAdminServer(
   logger: { info: (...args: any[]) => void; warn: (...args: any[]) => void; error: (...args: any[]) => void },
   feishuClient?: lark.Client,
   adminPassword?: string,
+  usageTracker?: any,
 ): AdminServerResult {
   const app = express();
   app.use(express.json());
@@ -98,6 +99,11 @@ export function startAdminServer(
         res.status(401).json({ error: 'Unauthorized' });
       }
     });
+  }
+
+  // Attach usageTracker to all requests
+  if (usageTracker) {
+    app.use((req, _res, next) => { (req as any).usageTracker = usageTracker; next(); });
   }
 
   // API routes

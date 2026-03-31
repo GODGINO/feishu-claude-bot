@@ -61,6 +61,7 @@ export class ProcessPool {
   private statePath: string;
   private unsolicitedCallback?: UnsolicitedResultCallback;
   private progressCallback?: ProgressCallback;
+  private usageCallback?: (sessionKey: string, inputTokens: number, outputTokens: number, costUsd: number) => void;
   private textStreamCallbacks = new Map<string, TextStreamCallback>();
   private toolStreamCallbacks = new Map<string, ToolStreamCallback>();
   private subagentStreamCallbacks = new Map<string, SubagentStreamCallback>();
@@ -87,6 +88,10 @@ export class ProcessPool {
    */
   onProgress(callback: ProgressCallback): void {
     this.progressCallback = callback;
+  }
+
+  onUsage(callback: (sessionKey: string, inputTokens: number, outputTokens: number, costUsd: number) => void): void {
+    this.usageCallback = callback;
   }
 
   /**
@@ -273,6 +278,20 @@ export class ProcessPool {
   }
 
   /**
+   * Get the model for a session (per-session override or global default).
+   */
+  private getSessionModel(sessionKey: string, sessionDir: string): string {
+    try {
+      const modelFile = path.join(sessionDir, 'model');
+      if (fs.existsSync(modelFile)) {
+        const model = fs.readFileSync(modelFile, 'utf-8').trim();
+        if (model) return model;
+      }
+    } catch { /* ignore */ }
+    return this.config.claude.model;
+  }
+
+  /**
    * Number of currently busy processes.
    */
   get activeCount(): number {
@@ -294,7 +313,7 @@ export class ProcessPool {
       '--input-format', 'stream-json',
       '--output-format', 'stream-json',
       '--verbose',
-      '--model', this.config.claude.model,
+      '--model', this.getSessionModel(sessionKey, sessionDir),
       '--dangerously-skip-permissions',
     ];
 
@@ -322,8 +341,9 @@ export class ProcessPool {
       args.push('--resume', resumeId);
     }
 
+    const model = args[args.indexOf('--model') + 1];
     this.logger.info(
-      { sessionKey, sessionDir, hasResume: !!resumeId },
+      { sessionKey, sessionDir, hasResume: !!resumeId, model },
       'Spawning persistent Claude process',
     );
 
@@ -349,14 +369,16 @@ export class ProcessPool {
       }
     } catch { /* no session.env */ }
 
+    const realHome = process.env.HOME || '';
     const spawnEnv = {
       ...cleanEnv,
       ...sessionEnvVars,
       ENABLE_TOOL_SEARCH: 'true',
       MCP_TIMEOUT: '30000',
-      PATH: `${path.dirname(process.execPath)}:${process.env.HOME}/.local/bin:${process.env.HOME}/.bun/bin:${process.env.PATH}`,
+      // HOME: keep original (changing breaks Claude Code CLI)
+      PATH: `${path.dirname(process.execPath)}:${realHome}/.local/bin:${realHome}/.bun/bin:${realHome}/homebrew/bin:${process.env.PATH}`,
       // Session isolation: prevent git from traversing above session dir
-      GIT_CEILING_DIRECTORIES: sessionDir,
+      GIT_CEILING_DIRECTORIES: path.dirname(sessionDir),
       // SESSION_DIR used by skill scripts (cron-cli.cjs, etc.)
       SESSION_DIR: sessionDir,
     };
@@ -551,8 +573,10 @@ export class ProcessPool {
     const toolCb = this.toolStreamCallbacks.get(pp.sessionKey);
 
     // Text stream callback: notify with accumulated text
+    // Only log at warn level when callbacks are missing (debugging aid), otherwise debug
     if (result.text || result.toolUse || result.toolResult) {
-      this.logger.info({
+      const missingCb = pp.currentResolve && ((result.text && !textCb) || (result.toolUse && !toolCb));
+      this.logger[missingCb ? 'warn' : 'debug']({
         sessionKey: pp.sessionKey,
         hasResolve: !!pp.currentResolve,
         hasTextCb: !!textCb,
@@ -560,7 +584,7 @@ export class ProcessPool {
         hasText: !!result.text,
         hasToolUse: !!result.toolUse,
         hasToolResult: !!result.toolResult,
-      }, 'Stream event check');
+      }, missingCb ? 'Stream callback missing' : 'Stream event check');
     }
     if (result.text && pp.currentResolve && textCb) {
       textCb(pp.sessionKey, pp.parser.fullText);
@@ -643,6 +667,11 @@ export class ProcessPool {
         durationMs: result.durationMs,
         error: result.error,
       };
+
+      // Record usage stats
+      if (this.usageCallback && (result.inputTokens || result.outputTokens || result.costUsd)) {
+        this.usageCallback(pp.sessionKey, result.inputTokens || 0, result.outputTokens || 0, result.costUsd || 0);
+      }
 
       // Update saved sessionId — but NOT if this turn had an error
       // (error_during_execution with a corrupted --resume session must not be re-saved)

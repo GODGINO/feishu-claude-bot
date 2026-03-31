@@ -867,5 +867,46 @@ export function createRoutes(sessionsDir: string, feishuClient?: lark.Client): R
     res.json({ ok: true });
   });
 
+  // ─── Usage Stats API ────────────────────────────────────────
+
+  // GET /api/usage — global usage overview + trends
+  router.get('/api/usage', (req: Request, res: Response) => {
+    const usageTracker = (req as any).usageTracker;
+    if (!usageTracker) return res.json({ error: 'Usage tracking not initialized' });
+    const data = usageTracker.getData();
+    const period = (req.query.period as string) || 'daily';
+    const globalData = period === 'hourly' ? data.globalHourly
+      : period === 'weekly' ? data.globalWeekly
+      : period === 'monthly' ? data.globalMonthly
+      : data.globalDaily;
+    res.json({ period, data: globalData });
+  });
+
+  // GET /api/usage/sessions — top sessions ranked by cost
+  router.get('/api/usage/sessions', (req: Request, res: Response) => {
+    const usageTracker = (req as any).usageTracker;
+    if (!usageTracker) return res.json({ error: 'Usage tracking not initialized' });
+    const period = (req.query.period as string) || 'daily';
+    const limit = parseInt(req.query.limit as string) || 20;
+    const sortBy = (req.query.sort as string) || 'costUsd';
+    let sessions = usageTracker.getTopSessions(period, 100);
+    // Custom sort
+    if (sortBy === 'inputTokens') sessions.sort((a: any, b: any) => b.usage.inputTokens - a.usage.inputTokens);
+    else if (sortBy === 'outputTokens') sessions.sort((a: any, b: any) => b.usage.outputTokens - a.usage.outputTokens);
+    else if (sortBy === 'requests') sessions.sort((a: any, b: any) => b.usage.requests - a.usage.requests);
+    res.json({ period, sessions: sessions.slice(0, limit) });
+  });
+
+  // GET /api/usage/sessions/:key — single session usage detail
+  router.get('/api/usage/sessions/:key', (req: Request, res: Response) => {
+    const usageTracker = (req as any).usageTracker;
+    if (!usageTracker) return res.json({ error: 'Usage tracking not initialized' });
+    const key = param(req, 'key');
+    const data = usageTracker.getData();
+    const session = data.sessions[key];
+    if (!session) return res.json({ error: 'Session not found' });
+    res.json(session);
+  });
+
   return router;
 }

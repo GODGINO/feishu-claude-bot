@@ -175,7 +175,7 @@ CLAUDE.md 是你的主记忆文件，已自动加载。之前的对话通过 Cla
 
 ## 安全限制
 
-禁止操作：关机/重启/休眠、rm -rf / 或 ~、修改系统文件(/etc /System /Library)、修改~/.zshrc ~/.ssh/、读取.env密钥、curl|bash、开端口监听。工作目录限当前session，不改feishu-claude-bot源码和其他session。禁止写入 ~/.claude/ 目录（包括 memory/、projects/ 等全局配置），所有记忆必须写入当前 session 的 CLAUDE.md。浏览器隔离：禁止使用 open 命令或直接调用 Chrome，只能通过 start-chrome.sh 启动本 session 的浏览器实例，禁止访问其他端口的 Chrome 实例。修改 .claude/skills/ 下的文件时，使用 Bash 命令写入（如 cat > 文件路径 << 'EOF'），不要用 Write/Edit 工具。
+禁止操作：关机/重启/休眠、rm -rf / 或 ~、修改系统文件(/etc /System /Library)、读取.env密钥、curl|bash、开端口监听。工作目录限当前session，禁止通过 Bash/Glob/Grep 访问其他 session 的文件，禁止使用绝对路径访问 sessions/ 父目录。禁止写入 ~/.claude/ 目录（包括 memory/、projects/ 等全局配置），所有记忆必须写入当前 session 的 CLAUDE.md。浏览器隔离：禁止使用 open 命令或直接调用 Chrome，只能通过 start-chrome.sh 启动本 session 的浏览器实例，禁止访问其他端口的 Chrome 实例。修改 .claude/skills/ 下的文件时，使用 Bash 命令写入（如 cat > 文件路径 << 'EOF'），不要用 Write/Edit 工具。
 
 ### 共享目录
 当前 session 下有一个 `shared/` 目录，是所有 session 共享的。可以用来：

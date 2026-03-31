@@ -44,6 +44,10 @@ export class MessageBridge {
   private abortControllers = new Map<string, AbortController>();
   // Track background tasks for progress reporting (user can ask about status)
   private backgroundSessions = new Map<string, { chatId: string; messageId: string; startedAt: number; recentTools: { desc: string; time: number }[] }>();
+  // Cache finalized card state for button click updates (cardId → card data)
+  private buttonCardCache = new Map<string, { cardJson: object; sequence: number; expiresAt: number }>();
+  // Pending button actions queued while session is busy
+  private pendingButtonActions = new Map<string, Array<{ sessionKey: string; chatId: string; label: string; userName: string; cardId?: string; messageId?: string }>>();
   private commandHandler: CommandHandler;
   private queue: MessageQueue;
   private groupContext: GroupContextBuffer;
@@ -72,6 +76,14 @@ export class MessageBridge {
       logger,
     );
     this.commandHandler.setEmailSetup(this.emailSetup);
+
+    // Periodically clean up expired button card cache entries
+    setInterval(() => {
+      const now = Date.now();
+      for (const [id, entry] of this.buttonCardCache) {
+        if (entry.expiresAt < now) this.buttonCardCache.delete(id);
+      }
+    }, 60 * 60 * 1000).unref();
 
     // Accumulate progress events for background tasks (user can query status)
     this.runner.onProgress((sessionKey, toolName) => {
@@ -460,12 +472,47 @@ export class MessageBridge {
 
   /**
    * Execute a card button action — sends the click as natural language to Claude.
+   * Respects the same runningTasks queue as normal messages.
    */
-  async executeButtonAction(sessionKey: string, chatId: string, label: string, userName: string): Promise<void> {
+  async executeButtonAction(sessionKey: string, chatId: string, label: string, userName: string, cardId?: string, messageId?: string): Promise<void> {
+    // Update original card immediately (disable buttons + show who clicked) — don't wait for queue
+    if (cardId) {
+      await this.updateCardButtonState(cardId, label, userName);
+    }
+
+    // If session is busy, queue the button action for later
+    if (this.runningTasks.has(sessionKey)) {
+      let queue = this.pendingButtonActions.get(sessionKey);
+      if (!queue) {
+        queue = [];
+        this.pendingButtonActions.set(sessionKey, queue);
+      }
+      queue.push({ sessionKey, chatId, label, userName, cardId, messageId });
+      this.logger.info({ sessionKey, label, queueSize: queue.length }, 'Button action queued (session busy)');
+      return;
+    }
+
+    await this.runButtonAction(sessionKey, chatId, label, userName, messageId);
+  }
+
+  /**
+   * Actually run a button action (called when session is free).
+   */
+  private async runButtonAction(sessionKey: string, chatId: string, label: string, userName: string, messageId?: string): Promise<void> {
     const session = this.sessionMgr.getOrCreate(sessionKey);
     const prompt = `[${userName} 点击了按钮: ${label}]`;
 
-    this.logger.info({ sessionKey, label, userName }, 'Executing button action via reply pipeline');
+    this.logger.info({ sessionKey, label, userName, messageId }, 'Executing button action via reply pipeline');
+
+    this.runningTasks.add(sessionKey);
+    const abortController = new AbortController();
+    this.abortControllers.set(sessionKey, abortController);
+
+    // Add MeMeMe reaction to the card message (same as @bot messages)
+    let reactionId: string | null = null;
+    if (messageId) {
+      reactionId = await this.typing.start(messageId);
+    }
 
     try {
       await this.executeAndReply({
@@ -473,13 +520,74 @@ export class MessageBridge {
         chatId,
         prompt,
         sessionDir: session.sessionDir,
-        replyToMessageId: undefined,
+        replyToMessageId: messageId || undefined,
         existingRootId: undefined,
         isNonMentionGroup: false,
+        abortSignal: abortController.signal,
       });
     } catch (err) {
       this.logger.error({ err, sessionKey, label }, 'Button action execution failed');
       await this.sender.sendReply(chatId, `⚠️ 按钮操作失败: ${(err as Error).message}`);
+    } finally {
+      // Remove typing indicator from card message
+      if (messageId && reactionId) {
+        await this.typing.stop(messageId, reactionId);
+      }
+      this.runningTasks.delete(sessionKey);
+      this.abortControllers.delete(sessionKey);
+
+      // Process next queued item (messages or button actions)
+      await this.processQueue(sessionKey);
+    }
+  }
+
+  /**
+   * Update original card to disable buttons and show who clicked.
+   * Modifies the clicked button label to "label@userName" and disables all buttons.
+   */
+  private async updateCardButtonState(cardId: string, clickedLabel: string, userName: string): Promise<void> {
+    const cached = this.buttonCardCache.get(cardId);
+    this.logger.info({ cardId, cacheHit: !!cached, cacheSize: this.buttonCardCache.size }, 'Button card cache lookup');
+    if (!cached) {
+      return;
+    }
+
+    try {
+      const cardJson = JSON.parse(JSON.stringify(cached.cardJson)) as any; // deep clone
+      const elements = cardJson?.body?.elements;
+      if (!Array.isArray(elements)) return;
+
+      // Find the column_set containing buttons and update them
+      for (const el of elements) {
+        if (el.tag === 'column_set' && Array.isArray(el.columns)) {
+          for (const col of el.columns) {
+            if (!Array.isArray(col.elements)) continue;
+            for (const btn of col.elements) {
+              if (btn.tag !== 'button') continue;
+              btn.disabled = true;
+              // Mark the clicked button with "label@userName"
+              const btnLabel = btn.behaviors?.[0]?.value?.label || btn.text?.content;
+              if (btnLabel === clickedLabel) {
+                btn.text = { tag: 'plain_text', content: `${clickedLabel} @${userName}` };
+                btn.type = 'primary'; // highlight the clicked one
+              }
+            }
+          }
+        }
+      }
+
+      const newSequence = cached.sequence + 1;
+      await (this.sender.larkClient.cardkit as any).v1.card.update({
+        path: { card_id: cardId },
+        data: {
+          card: { type: 'card_json', data: JSON.stringify(cardJson) },
+          sequence: newSequence,
+        },
+      });
+      cached.sequence = newSequence;
+      this.logger.info({ cardId, clickedLabel, userName }, 'Updated card button state');
+    } catch (err) {
+      this.logger.warn({ err, cardId }, 'Failed to update card button state');
     }
   }
 
@@ -504,9 +612,10 @@ export class MessageBridge {
     this.logger.info({ sessionKey, isNonMentionGroup, isCronJob }, 'Entering reply pipeline');
     const streamer = new CardStreamer(this.sender.larkClient, this.logger);
 
-    // Pass session info to streamer for button rendering
+    // Pass session info to streamer for button rendering + card cache
     streamer.sessionKey = sessionKey;
     streamer.chatId = chatId;
+    streamer.buttonCardCache = this.buttonCardCache;
 
     let cardCreated = false;
     let cardCreating = false;
@@ -602,7 +711,7 @@ export class MessageBridge {
             streamer.finalizeAfterAgents();
             this.runner.onSubagentStream(sessionKey, undefined);
           }
-        }, 10 * 60 * 1000);
+        }, 30 * 60 * 1000);
       } else if (!cardCreated && !rawText.includes('<<BUTTON:')) {
         // No card, no buttons — send as plain text
         this.logger.info({ sessionKey, textLen: cleanText.length }, 'No tools used, sending plain text reply');
@@ -654,6 +763,10 @@ export class MessageBridge {
     } finally {
       this.runner.onTextStream(sessionKey, undefined);
       this.runner.onToolStream(sessionKey, undefined);
+
+      const pipelineElapsed = Date.now() - streamer['startTime'];
+      const replyMode = cardCreated ? 'card' : (bufferedText ? 'text' : 'empty');
+      this.logger.info({ sessionKey, replyMode, elapsed: pipelineElapsed, isCronJob }, 'Reply pipeline done');
     }
   }
 
@@ -743,10 +856,21 @@ export class MessageBridge {
   }
 
   private async processQueue(sessionKey: string): Promise<void> {
+    // Messages take priority over button actions
     const next = this.queue.dequeue(sessionKey);
     if (next) {
       this.logger.info({ sessionKey, isMentioned: next.msg.isMentioned }, 'Processing queued message');
       await this.executeMessage(next.msg, next.sessionKey);
+      return;
+    }
+
+    // Then check pending button actions
+    const btnQueue = this.pendingButtonActions.get(sessionKey);
+    if (btnQueue && btnQueue.length > 0) {
+      const btn = btnQueue.shift()!;
+      if (btnQueue.length === 0) this.pendingButtonActions.delete(sessionKey);
+      this.logger.info({ sessionKey, label: btn.label }, 'Processing queued button action');
+      await this.runButtonAction(btn.sessionKey, btn.chatId, btn.label, btn.userName, btn.messageId);
     }
   }
 }

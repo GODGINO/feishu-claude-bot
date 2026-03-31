@@ -113,6 +113,7 @@ export interface ButtonInfo {
   label: string;
   actionId: string;
   type?: string; // default, primary, danger
+  disabled?: boolean;
 }
 
 /**
@@ -127,7 +128,7 @@ export function extractButtons(text: string): { cleanText: string; buttons: Butt
   return { cleanText, buttons };
 }
 
-export function buildCompleteCard(text: string, toolCalls?: ToolCallInfo[], elapsed?: number, title?: string, buttons?: ButtonInfo[], sessionKey?: string, chatId?: string): object {
+export function buildCompleteCard(text: string, toolCalls?: ToolCallInfo[], elapsed?: number, title?: string, buttons?: ButtonInfo[], sessionKey?: string, chatId?: string, cardId?: string, messageId?: string): object {
   // Extract <<TITLE:...>> from text if present and no explicit title
   let displayText = text || '(空回复)';
   let headerTitle = title || '';
@@ -164,15 +165,17 @@ export function buildCompleteCard(text: string, toolCalls?: ToolCallInfo[], elap
     footerParts.push(`${toolCalls.length} 次工具调用`);
   }
 
-  // Buttons (if any)
+  // Buttons (if any) — v2 schema: horizontal layout via column_set
   if (buttons && buttons.length > 0) {
     elements.push({ tag: 'hr' });
-    elements.push({
-      tag: 'action',
-      actions: buttons.map(btn => ({
+    const columns = buttons.map(btn => ({
+      tag: 'column',
+      width: 'auto',
+      elements: [{
         tag: 'button',
         type: btn.type || 'default',
         text: { tag: 'plain_text', content: btn.label },
+        disabled: btn.disabled || false,
         behaviors: [{
           type: 'callback',
           value: {
@@ -180,9 +183,17 @@ export function buildCompleteCard(text: string, toolCalls?: ToolCallInfo[], elap
             label: btn.label,
             sessionKey: sessionKey || '',
             chatId: chatId || '',
+            cardId: cardId || '',
+            messageId: messageId || '',
           },
         }],
-      })),
+      }],
+    }));
+    elements.push({
+      tag: 'column_set',
+      columns,
+      flex_mode: 'none',
+      horizontal_spacing: '8px',
     });
   }
 
@@ -263,7 +274,7 @@ function formatToolCalls(toolCalls: ToolCallInfo[]): string {
     const running = toolCalls.filter(t => t.status === 'running');
     const done = toolCalls.filter(t => t.status !== 'running');
     const doneSlots = Math.max(0, MAX_VISIBLE - running.length);
-    visible = [...done.slice(-doneSlots), ...running];
+    visible = [...(doneSlots > 0 ? done.slice(-doneSlots) : []), ...running];
   }
   const hidden = toolCalls.length - visible.length;
 

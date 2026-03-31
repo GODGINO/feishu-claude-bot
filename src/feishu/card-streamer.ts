@@ -42,6 +42,8 @@ export class CardStreamer {
   // For button rendering — set by caller before complete()
   sessionKey?: string;
   chatId?: string;
+  // Shared cache for button card state (set by caller)
+  buttonCardCache?: Map<string, { cardJson: object; sequence: number; expiresAt: number }>;
   private completed = false;
 
   constructor(
@@ -165,6 +167,11 @@ export class CardStreamer {
 
   get isFallback(): boolean {
     return this.fallback;
+  }
+
+  /** Return the IM message ID of the card (available after ensureMessageSent). */
+  getMessageId(): string | null {
+    return this.messageId;
   }
 
   /**
@@ -305,7 +312,23 @@ export class CardStreamer {
         buttons.length > 0 ? buttons : undefined,
         this.sessionKey,
         this.chatId,
+        this.cardId || undefined,
+        this.messageId || undefined,
       );
+
+      // Cache card state for button click updates
+      if (buttons.length > 0 && this.cardId) {
+        if (this.buttonCardCache) {
+          this.buttonCardCache.set(this.cardId, {
+            cardJson: completeCard,
+            sequence: this.sequence + 2, // account for the update + settings calls below
+            expiresAt: Date.now() + 24 * 60 * 60 * 1000,
+          });
+          this.logger.info({ cardId: this.cardId, buttonCount: buttons.length, cacheSize: this.buttonCardCache.size }, 'Cached button card for click updates');
+        } else {
+          this.logger.warn({ cardId: this.cardId }, 'buttonCardCache not set on streamer, cannot cache');
+        }
+      }
 
       this.sequence++;
       const updateResp = await (this.client.cardkit as any).v1.card.update({

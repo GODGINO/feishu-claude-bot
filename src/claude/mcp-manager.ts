@@ -585,6 +585,15 @@ exec node "${cliPath}" "$@"
       settings.mcpServers = mcpServers;
     }
 
+    // Merge global enabledPlugins (from real ~/.claude/settings.json) so plugins work with HOME=sessionDir
+    try {
+      const globalSettingsPath = path.join(process.env.HOME || '', '.claude', 'settings.json');
+      const globalSettings = JSON.parse(fs.readFileSync(globalSettingsPath, 'utf-8'));
+      if (globalSettings.enabledPlugins) {
+        settings.enabledPlugins = globalSettings.enabledPlugins;
+      }
+    } catch { /* no global settings or parse error */ }
+
     return settings;
   }
 

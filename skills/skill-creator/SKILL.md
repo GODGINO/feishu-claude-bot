@@ -57,11 +57,29 @@ Output: ...
 
 ### 3. 保存 Skill
 
-将 SKILL.md **直接写入**当前 session 的 skills 目录（使用 Write 工具创建文件）：
+**⚠️ Write/Edit 工具对 `.claude/skills/` 无效（系统限制），必须用 Bash 命令写入。**
 
+使用绝对路径 + `tee` 写文件，分两步：
+
+```bash
+# 第一步：创建目录
+mkdir -p /绝对路径/.claude/skills/<skill-name>/
+
+# 第二步：写入文件
+tee /绝对路径/.claude/skills/<skill-name>/SKILL.md > /dev/null << 'EOF'
+---
+name: my-skill
+description: ...
+---
+
+# Skill 内容...
+EOF
 ```
-.claude/skills/<skill-name>/SKILL.md
-```
+
+**注意事项：**
+- **永远用绝对路径**：`cd` 后相对路径会指向错误位置，用 `$(pwd)` 或写死绝对路径
+- **mkdir 和写文件分两步**：先确认目录创建成功再写文件
+- **禁止使用 symlink**：必须创建真实文件，系统会自动检测并修复 symlink
 
 如果 skill 需要辅助脚本，放在同级目录：
 
@@ -71,8 +89,6 @@ Output: ...
 └── scripts/
     └── helper.sh
 ```
-
-**重要：禁止使用 symlink！** 不要创建 `.agents/skills/` 或其他目录再 symlink 到 `.claude/skills/`。必须直接在 `.claude/skills/<skill-name>/` 下创建真实文件。系统会自动检测并修复 symlink。
 
 ### 4. 测试
 
@@ -88,7 +104,7 @@ ls -la .claude/skills/
 
 ### 修改 skill
 
-直接编辑对应的 SKILL.md 文件。改完后下次触发即生效（无需重启）。
+用 Bash 命令重写对应的 SKILL.md 文件（Write/Edit 工具不可用）。改完后下次触发即生效（无需重启）。
 
 ### 删除 skill
 

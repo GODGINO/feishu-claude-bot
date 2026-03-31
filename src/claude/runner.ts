@@ -28,7 +28,7 @@ export interface RunResult {
 }
 
 export class ClaudeRunner {
-  private pool: ProcessPool;
+  readonly pool: ProcessPool;
 
   constructor(
     private config: Config,
@@ -58,23 +58,50 @@ export class ClaudeRunner {
       });
 
       // MCP config changed during the run (e.g. start-chrome.sh added chrome-devtools).
-      // Respawn the process (which happens automatically in next send()) and send a
-      // continuation message so Claude can use the newly available tools immediately.
+      // Just clean up the signal file. New tools will be available on next user message
+      // (process-pool detects mcpConfigChanged and respawns with --resume).
       const mcpSignal = path.join(opts.sessionDir, '.mcp-changed');
-      if (!result.error && fs.existsSync(mcpSignal)) {
-        this.logger.info({ sessionKey: opts.sessionKey }, 'MCP config changed during run, auto-continuing');
+      if (fs.existsSync(mcpSignal)) {
+        try { fs.unlinkSync(mcpSignal); } catch { /* ignore */ }
+      }
+
+      // "Rate limit" — wait and retry up to 3 times to stagger burst
+      if (result.error && /rate limit/i.test(result.error)) {
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          const waitMs = attempt * 5000;
+          this.logger.warn({ sessionKey: opts.sessionKey, attempt, waitMs }, 'Rate limit hit, waiting before retry');
+          await new Promise(r => setTimeout(r, waitMs));
+          try {
+            const retryResult = await this.pool.send({
+              sessionKey: opts.sessionKey,
+              sessionDir: opts.sessionDir,
+              message: opts.message,
+              images: opts.images,
+              abortSignal: opts.abortSignal,
+            });
+            if (!retryResult.error || !/rate limit/i.test(retryResult.error)) {
+              return retryResult;
+            }
+          } catch { /* continue retrying */ }
+        }
+        // All retries failed, return original error
+      }
+
+      // "No conversation found" — invalid resume sessionId, reset and retry fresh.
+      if (result.error && /no conversation found/i.test(result.error)) {
+        this.logger.warn({ sessionKey: opts.sessionKey }, 'Invalid session ID, resetting and retrying fresh');
+        this.pool.reset(opts.sessionKey);
         try {
-          const continueResult = await this.pool.send({
+          const retryResult = await this.pool.send({
             sessionKey: opts.sessionKey,
             sessionDir: opts.sessionDir,
-            message: 'Continue',
+            message: opts.message,
+            images: opts.images,
             abortSignal: opts.abortSignal,
           });
-          // Merge: use the continuation's text as the final response
-          return continueResult;
-        } catch (err: any) {
-          this.logger.warn({ err, sessionKey: opts.sessionKey }, 'MCP auto-continue failed');
-          // Fall through to return original result
+          return retryResult;
+        } catch (retryErr: any) {
+          return { fullText: '', error: retryErr.message || 'Retry failed after session reset' };
         }
       }
 

@@ -65,6 +65,9 @@ export class CommandHandler {
     if (cmd === '/auto' || cmd.startsWith('/auto ')) {
       return this.handleAuto(text.trim(), ctx);
     }
+    if (cmd === '/model' || cmd.startsWith('/model ')) {
+      return this.handleModel(text.trim(), ctx);
+    }
 
     return false;
   }
@@ -306,6 +309,39 @@ export class CommandHandler {
   }
 
 
+  private async handleModel(text: string, ctx: CommandContext): Promise<boolean> {
+    const session = this.sessionMgr.get(ctx.sessionKey) || this.sessionMgr.getOrCreate(ctx.sessionKey);
+    const modelFile = `${session.sessionDir}/model`;
+    const parts = text.split(/\s+/);
+    const sub = parts[1]?.toLowerCase();
+
+    const ALIASES: Record<string, string> = {
+      opus: 'opus',
+      sonnet: 'sonnet',
+      haiku: 'haiku',
+    };
+
+    if (sub && ALIASES[sub]) {
+      const model = ALIASES[sub];
+      fs.writeFileSync(modelFile, model);
+      // Reset process so it respawns with new model
+      this.runner.reset(ctx.sessionKey);
+      await this.sender.sendText(ctx.chatId, `✅ 模型已切换为 **${model}**，上下文已重置`, ctx.messageId);
+      this.logger.info({ sessionKey: ctx.sessionKey, model }, '/model: switched');
+    } else {
+      let current = 'sonnet';
+      try { current = fs.readFileSync(modelFile, 'utf-8').trim(); } catch {}
+      await this.sender.sendReply(ctx.chatId, [
+        `**当前模型: ${current}**`,
+        '',
+        '`/model sonnet` — Claude Sonnet（默认，快速均衡）',
+        '`/model opus` — Claude Opus（最强，适合复杂任务）',
+        '`/model haiku` — Claude Haiku（最快，适合简单任务）',
+      ].join('\n'), ctx.messageId);
+    }
+    return true;
+  }
+
   private async handleHelp(ctx: CommandContext): Promise<boolean> {
     const helpText = [
       '**可用命令**',
@@ -316,6 +352,7 @@ export class CommandHandler {
       '`/email` — 邮箱管理（添加、查看、测试）',
       '`/register` — 注册开发者身份（Git + 飞书 MCP）',
       '`/auto [on|off|always]` — 群聊自动回复（on=AI判断, off=仅@回复, always=全部回复）',
+      '`/model [sonnet|opus|haiku]` — 切换 AI 模型',
       '`/help` — 显示此帮助信息',
       '',
       '直接发送消息即可与 Claude 对话。Claude 可以读写文件、执行命令等。',

@@ -9,6 +9,8 @@ export interface ParseResult {
   done?: boolean;
   costUsd?: number;
   durationMs?: number;
+  inputTokens?: number;
+  outputTokens?: number;
   error?: string;
   toolUse?: { name: string; input?: string; toolUseId?: string };
   toolResult?: { toolUseId: string; isError?: boolean };
@@ -51,8 +53,9 @@ export class StreamParser {
           result.sessionId = msg.session_id;
         }
         // task_started = subagent launched
+        // Don't set result.toolUse here — the assistant message's tool_use block
+        // already triggers addToolCall. Setting it here would duplicate the Agent entry.
         if (msg.subtype === 'task_started') {
-          result.toolUse = { name: 'Agent', input: msg.description, toolUseId: msg.tool_use_id };
           result.subagentStart = {
             taskId: msg.task_id,
             description: msg.description || '',
@@ -126,7 +129,14 @@ export class StreamParser {
         }
         if (msg.total_cost_usd != null) result.costUsd = msg.total_cost_usd;
         if (msg.duration_ms != null) result.durationMs = msg.duration_ms;
-        if (msg.is_error) result.error = msg.result || 'Unknown error';
+        if (msg.usage) {
+          result.inputTokens = msg.usage.input_tokens || 0;
+          result.outputTokens = msg.usage.output_tokens || 0;
+        }
+        if (msg.is_error) {
+          const errorsArray = Array.isArray(msg.errors) ? msg.errors.join('; ') : '';
+          result.error = msg.result || errorsArray || 'Unknown error';
+        }
         return result;
       }
 
@@ -145,9 +155,14 @@ export class StreamParser {
         if (typeof block.input === 'string') {
           input = block.input;
         } else if (block.input && typeof block.input === 'object') {
-          // Stringify object inputs for display (e.g. { command: "git status" } → "git status")
-          const vals = Object.values(block.input as Record<string, unknown>);
-          input = vals.filter(v => typeof v === 'string').join(' ').slice(0, 200);
+          const inputObj = block.input as Record<string, unknown>;
+          // Agent tool: use description field (prompt is too long and all look the same)
+          if (block.name === 'Agent' && typeof inputObj.description === 'string') {
+            input = inputObj.description.slice(0, 200);
+          } else {
+            const vals = Object.values(inputObj);
+            input = vals.filter(v => typeof v === 'string').join(' ').slice(0, 200);
+          }
         }
         return { name: block.name, input, toolUseId: block.id };
       }

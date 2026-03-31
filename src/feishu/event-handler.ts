@@ -33,7 +33,7 @@ export type MessageHandler = (msg: IncomingMessage) => void | Promise<void>;
 const recentMessageIds = new Set<string>();
 const DEDUP_TTL_MS = 600_000; // 10 minutes
 
-export type CardActionHandler = (action: { sessionKey: string; chatId: string; actionId: string; label: string; operatorId: string }) => void | Promise<void>;
+export type CardActionHandler = (action: { sessionKey: string; chatId: string; actionId: string; label: string; operatorId: string; cardId?: string; messageId?: string }) => void | Promise<void>;
 
 export function createEventHandler(
   botOpenId: string,
@@ -186,8 +186,9 @@ export function createEventHandler(
         }
 
         const operatorId = event?.operator?.open_id || '';
+        const messageId = event?.open_message_id || value?.messageId || '';
         logger.info(
-          { sessionKey: value.sessionKey, actionId: value.action, label: value.label, operatorId },
+          { sessionKey: value.sessionKey, actionId: value.action, label: value.label, operatorId, cardId: value.cardId, messageId },
           'Card button clicked',
         );
 
@@ -198,6 +199,8 @@ export function createEventHandler(
             actionId: value.action,
             label: value.label,
             operatorId,
+            cardId: value.cardId || '',
+            messageId,
           })).catch((err: any) => {
             logger.error({ err }, 'Error in card action handler');
           });

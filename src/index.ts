@@ -10,6 +10,7 @@ import { SessionManager } from './claude/session-manager.js';
 import { MessageBridge } from './bridge/message-bridge.js';
 import { CronRunner } from './scheduler/cron-runner.js';
 import { ChromeIdleChecker } from './chrome/idle-checker.js';
+import { UsageTracker } from './admin/usage-tracker.js';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { execSync } from 'node:child_process';
@@ -111,6 +112,12 @@ async function main() {
   const runner = new ClaudeRunner(config, logger, config.sessionsDir);
   const sessionMgr = new SessionManager(config.sessionsDir, logger);
 
+  // Usage tracking
+  const usageTracker = new UsageTracker(path.dirname(config.sessionsDir), logger);
+  runner.pool.onUsage((sessionKey, inputTokens, outputTokens, costUsd) => {
+    usageTracker.record(sessionKey, inputTokens, outputTokens, costUsd);
+  });
+
   // Create message bridge (orchestrates everything)
   const bridge = new MessageBridge(sender, typing, runner, sessionMgr, config, logger);
 
@@ -120,10 +127,10 @@ async function main() {
   });
 
   // Handle card button clicks — send as natural language to Claude
-  onCardAction(async ({ sessionKey, chatId, actionId, label, operatorId }) => {
+  onCardAction(async ({ sessionKey, chatId, actionId, label, operatorId, cardId, messageId }) => {
     const userName = await sender.resolveUserName(operatorId) || operatorId;
-    logger.info({ sessionKey, chatId, actionId, label, operatorId, userName }, 'Processing card button click');
-    await bridge.executeButtonAction(sessionKey, chatId, label, userName);
+    logger.info({ sessionKey, chatId, actionId, label, operatorId, userName, cardId, messageId }, 'Processing card button click');
+    await bridge.executeButtonAction(sessionKey, chatId, label, userName, cardId, messageId);
   });
 
   // Start cron scheduler for skills
@@ -167,7 +174,7 @@ async function main() {
   chromeChecker.start();
 
   // Start admin dashboard + relay server
-  const { relayServer } = startAdminServer(config.sessionsDir, config.adminPort, logger, client, config.adminPassword);
+  const { relayServer } = startAdminServer(config.sessionsDir, config.adminPort, logger, client, config.adminPassword, usageTracker);
 
   // Start WebSocket connection
   await wsClient.start({ eventDispatcher: dispatcher });
@@ -181,6 +188,7 @@ async function main() {
     chromeChecker.stop();
     scheduler.stop();
     runner.killAll();
+    usageTracker.destroy();
     sessionMgr.destroy();
     try { fs.unlinkSync(PID_FILE); } catch {}
     process.exit(0);
