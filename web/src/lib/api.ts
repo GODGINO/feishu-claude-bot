@@ -51,6 +51,7 @@ export interface SessionSummary {
 export interface SessionDetail extends SessionSummary {
   authors: Record<string, { name: string; feishuMcpUrl?: string }>;
   sshPublicKey: string | null;
+  model: string | null;
 }
 
 export interface CronJob {
@@ -152,6 +153,17 @@ export interface EnvResponse {
   skillEnvMap: Record<string, string[]>
 }
 
+export interface Member {
+  openId: string
+  name: string
+  feishuMcpUrl?: string
+  sessions: string[]
+  muted: boolean
+  createdAt: number
+  updatedAt: number
+  memberMd?: string
+}
+
 export const api = {
   sessions: () => fetchJson<SessionSummary[]>('/sessions'),
   session: (key: string) => fetchJson<SessionDetail>(`/sessions/${key}`),
@@ -219,4 +231,18 @@ export const api = {
   },
   setSessionConfig: (sessionKey: string, configName: string, value: string) =>
     mutate('PUT', `/sessions/${sessionKey}/config/${configName}`, { value }),
+
+  // Members
+  members: () => fetchJson<Member[]>('/members'),
+  member: (openId: string) => fetchJson<Member>(`/members/${openId}`),
+  updateMember: (openId: string, data: Record<string, unknown>) =>
+    mutate('PUT', `/members/${openId}`, data),
+  toggleMemberMute: (openId: string, muted: boolean) =>
+    mutate('PUT', `/members/${openId}/mute`, { muted }),
+  getMemberMd: (openId: string) =>
+    fetchJson<{ content: string }>(`/members/${openId}/member-md`),
+  updateMemberMd: (openId: string, content: string) =>
+    mutate('PUT', `/members/${openId}/member-md`, { content }),
+  deleteMember: (openId: string) =>
+    mutate('DELETE', `/members/${openId}`),
 };

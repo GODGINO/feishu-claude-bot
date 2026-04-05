@@ -502,31 +502,33 @@ export class MessageSender {
 }
 
 /**
- * Replace @名字 and @所有人 with Feishu <at> tags using authors.json mapping.
+ * Replace @名字 and @所有人 with Feishu <at> tags using member profiles.
  */
 function resolveAtMentions(text: string, sessionDir: string): string {
   // Replace @所有人 first
   text = text.replace(/@所有人/g, '<at id=all></at>');
 
-  // Load authors.json for name→openId mapping
-  const authorsFile = path.join(sessionDir, 'authors.json');
+  // Load name→openId mapping from members/ directory (symlinked into session)
+  const membersDir = path.join(sessionDir, 'members');
   try {
-    if (!fs.existsSync(authorsFile)) return text;
-    const data = JSON.parse(fs.readFileSync(authorsFile, 'utf-8'));
-    const authors = data.authors as Record<string, { name: string }> | undefined;
-    if (!authors) return text;
+    if (!fs.existsSync(membersDir)) return text;
 
-    // Build name→openId map (longer names first to avoid partial matches)
     const nameMap: Array<[string, string]> = [];
-    for (const [openId, author] of Object.entries(authors)) {
-      if (author.name) {
-        nameMap.push([author.name, openId]);
-      }
+    for (const entry of fs.readdirSync(membersDir, { withFileTypes: true })) {
+      if (!entry.isDirectory() || !entry.name.startsWith('ou_')) continue;
+      try {
+        const profilePath = path.join(membersDir, entry.name, 'profile.json');
+        if (!fs.existsSync(profilePath)) continue;
+        const profile = JSON.parse(fs.readFileSync(profilePath, 'utf-8'));
+        if (profile.name && profile.name !== entry.name) {
+          nameMap.push([profile.name, entry.name]);
+        }
+      } catch { /* skip */ }
     }
+    // Sort by name length (longer first to avoid partial matches)
     nameMap.sort((a, b) => b[0].length - a[0].length);
 
     for (const [name, openId] of nameMap) {
-      // Replace @名字 but not already-resolved <at> tags
       const pattern = new RegExp(`@${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?!\\w)`, 'g');
       text = text.replace(pattern, `<at id=${openId}></at>`);
     }

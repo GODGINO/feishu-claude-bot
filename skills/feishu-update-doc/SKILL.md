@@ -23,7 +23,7 @@ description: |
 ### 第一步：获取 MCP URL
 
 从会话目录读取：
-- **群聊**：读取 `authors.json`，找当前发送者 `ou_xxx` 对应的 `feishuMcpUrl`
+- **群聊**：读取 `members/{ou_xxx}/profile.json`，找当前发送者对应的 `feishuMcpUrl`
 - **私聊**：读取 `feishu-mcp-url` 文件
 
 ### 第二步：初始化会话

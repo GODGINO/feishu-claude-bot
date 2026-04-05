@@ -18,6 +18,7 @@ import {
 } from './card-builder.js';
 
 const THROTTLE_MS = 500; // Minimum interval between card updates
+const CARD_TEXT_LIMIT = 28000; // Feishu card markdown content limit
 
 export class CardStreamer {
   private cardId: string | null = null;
@@ -28,6 +29,7 @@ export class CardStreamer {
   private toolCalls: ToolCallInfo[] = [];
   private taskIdToToolUseId = new Map<string, string>(); // taskId → toolUseId (for subagent step routing)
   private updateTimer: ReturnType<typeof setTimeout> | null = null;
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private fallback = false;
   startPromise: Promise<void> | null = null; // Track pending start() for lazy mode
   private startTime = 0;
@@ -226,6 +228,9 @@ export class CardStreamer {
       startTime: Date.now(),
       toolUseId,
     });
+    // Start heartbeat when tool calls are folded (>5), so "总用时" updates every second
+    this.startHeartbeatIfNeeded();
+
     // Trigger card update to show tool activity
     this.updateText(this.pendingText);
   }
@@ -260,6 +265,7 @@ export class CardStreamer {
     if (this.fallback || !this.cardId) return;
 
     this.completed = true;
+    this.stopHeartbeat();
 
     // Use streaming-accumulated text if it's longer than result text.
     // The result event often contains a short summary that would overwrite
@@ -281,6 +287,12 @@ export class CardStreamer {
     // Extract <<BUTTON:...>> tags
     const { cleanText: textWithoutButtons, buttons } = extractButtons(fullText);
     fullText = textWithoutButtons;
+
+    // Truncate to avoid Feishu card size limit
+    if (fullText.length > CARD_TEXT_LIMIT) {
+      this.logger.warn({ len: fullText.length, limit: CARD_TEXT_LIMIT }, 'Complete card text truncated');
+      fullText = fullText.slice(0, CARD_TEXT_LIMIT) + '\n\n...(内容过长，已截断显示)';
+    }
 
     if (this.updateTimer) {
       clearTimeout(this.updateTimer);
@@ -452,6 +464,7 @@ export class CardStreamer {
     if (this.fallback || !this.cardId) return;
 
     this.completed = true;
+    this.stopHeartbeat();
 
     // Ensure IM message is sent before aborting
     await this.ensureMessageSent();
@@ -505,6 +518,7 @@ export class CardStreamer {
    */
   async deleteCard(): Promise<void> {
     this.completed = true;
+    this.stopHeartbeat();
     if (this.updateTimer) {
       clearTimeout(this.updateTimer);
       this.updateTimer = null;
@@ -521,6 +535,30 @@ export class CardStreamer {
       } catch (err) {
         this.logger.debug({ err, messageId: this.messageId }, 'Failed to delete card message');
       }
+    }
+  }
+
+  /** Start a 1s heartbeat to keep "总用时" ticking when tool calls are folded. */
+  private startHeartbeatIfNeeded(): void {
+    if (this.heartbeatTimer || this.completed) return;
+    if (this.toolCalls.length === 0) return;
+
+    this.heartbeatTimer = setInterval(() => {
+      if (this.completed || !this.cardId) {
+        this.stopHeartbeat();
+        return;
+      }
+      // Force a card refresh so the elapsed time updates
+      this.flushUpdate().catch(err => {
+        this.logger.warn({ err }, 'Heartbeat card update failed');
+      });
+    }, 1000);
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
     }
   }
 
@@ -544,8 +582,13 @@ export class CardStreamer {
       .replace(/<?<<TITLE:.+?>>>?\s*\n?/g, '')
       .replace(/<TITLE:.+?>\s*\n?/g, '');
 
+    // Truncate to avoid Feishu card size limit (card gets silently dropped if too long)
+    const truncatedText = displayText.length > CARD_TEXT_LIMIT
+      ? displayText.slice(0, CARD_TEXT_LIMIT) + '\n\n...(内容过长，已截断显示)'
+      : displayText;
+
     try {
-      const streamingCard = buildStreamingCard(displayText, this.toolCalls);
+      const streamingCard = buildStreamingCard(truncatedText, this.toolCalls, this.startTime);
 
       await (this.client.cardkit as any).v1.card.update({
         path: { card_id: this.cardId },

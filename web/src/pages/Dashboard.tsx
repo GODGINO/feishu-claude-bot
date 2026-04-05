@@ -1,9 +1,6 @@
 import { useEffect, useState } from 'react'
-import { Link } from 'react-router-dom'
-import { Users, MessageSquare, Clock, Mail, Zap, Brain, MessagesSquare } from 'lucide-react'
-import { api, type Stats, type SessionSummary } from '../lib/api'
-import { formatTime } from '../lib/utils'
-import UsageView from '../components/UsageView'
+import { Users, MessageSquare, Clock, Mail, Zap, Brain } from 'lucide-react'
+import { api, type Stats } from '../lib/api'
 
 function StatCard({ icon: Icon, label, value, sub, color }: {
   icon: typeof Users; label: string; value: number | string; sub?: string; color: string
@@ -24,14 +21,9 @@ function StatCard({ icon: Icon, label, value, sub, color }: {
 
 export default function Dashboard() {
   const [stats, setStats] = useState<Stats | null>(null)
-  const [sessions, setSessions] = useState<SessionSummary[]>([])
-
   useEffect(() => {
     api.stats().then(setStats)
-    api.sessions().then(setSessions)
   }, [])
-
-  const recentSessions = sessions.slice(0, 8)
 
   return (
     <div>
@@ -80,7 +72,6 @@ export default function Dashboard() {
         </div>
       )}
 
-      <UsageView />
     </div>
   )
 }

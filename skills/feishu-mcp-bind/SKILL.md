@@ -36,33 +36,23 @@ https://open.feishu.cn/page/mcp
 当用户发送了 MCP URL（以 `https://mcp.feishu.cn` 开头）：
 
 1. 从消息上下文获取用户的 open_id（`ou_xxx`）和名字
-2. 读取 `authors.json`，更新该用户的 `feishuMcpUrl` 字段：
-
-```bash
-# 读取现有 authors.json
-cat authors.json
-
-# 更新 feishuMcpUrl 字段（使用 jq 或手动编辑）
-# 确保 authors.json 结构正确
-```
-
-3. 写入更新后的 `authors.json`
-4. 执行 `touch .mcp-changed` 触发 MCP 配置热重载
+2. 用 Edit 工具更新 `members/{ou_xxx}/profile.json` 中的 `feishuMcpUrl` 字段
+3. 执行 `touch .mcp-changed` 触发 MCP 配置热重载
 
 ### 步骤 3：验证绑定
 
 绑定完成后，尝试调用一个简单的飞书 MCP 工具（如 list-tools）来验证连通性。
 
-## 关于 authors.json 结构
+## 关于 members/{openId}/profile.json 结构
 
 ```json
 {
-  "authors": {
-    "ou_xxx": {
-      "name": "用户名",
-      "feishuMcpUrl": "https://mcp.feishu.cn/sse/xxx..."
-    }
-  }
+  "openId": "ou_xxx",
+  "name": "用户名",
+  "feishuMcpUrl": "https://mcp.feishu.cn/mcp/xxx...",
+  "sessions": ["group_oc_xxx", "dm_ou_xxx"],
+  "createdAt": 1711792432000,
+  "updatedAt": 1711792432000
 }
 ```
 

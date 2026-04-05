@@ -10,7 +10,6 @@ import { SessionManager } from './claude/session-manager.js';
 import { MessageBridge } from './bridge/message-bridge.js';
 import { CronRunner } from './scheduler/cron-runner.js';
 import { ChromeIdleChecker } from './chrome/idle-checker.js';
-import { UsageTracker } from './admin/usage-tracker.js';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { execSync } from 'node:child_process';
@@ -112,14 +111,18 @@ async function main() {
   const runner = new ClaudeRunner(config, logger, config.sessionsDir);
   const sessionMgr = new SessionManager(config.sessionsDir, logger);
 
-  // Usage tracking
-  const usageTracker = new UsageTracker(path.dirname(config.sessionsDir), logger);
-  runner.pool.onUsage((sessionKey, inputTokens, outputTokens, costUsd) => {
-    usageTracker.record(sessionKey, inputTokens, outputTokens, costUsd);
-  });
+  // Initialize member profiles
+  const { MemberManager } = await import('./members/member-manager.js');
+  const memberMgr = new MemberManager(path.dirname(config.sessionsDir), logger);
+  memberMgr.migrateFromAuthors(config.sessionsDir);
+
+  // Sync members from all group chats (startup + every 6 hours)
+  memberMgr.syncFromChats(config.sessionsDir, client).catch(() => {});
+  setInterval(() => memberMgr.syncFromChats(config.sessionsDir, client).catch(() => {}), 6 * 60 * 60 * 1000);
 
   // Create message bridge (orchestrates everything)
   const bridge = new MessageBridge(sender, typing, runner, sessionMgr, config, logger);
+  bridge.setMemberManager(memberMgr);
 
   // Route all messages through the bridge
   onMessage(async (msg) => {
@@ -174,7 +177,7 @@ async function main() {
   chromeChecker.start();
 
   // Start admin dashboard + relay server
-  const { relayServer } = startAdminServer(config.sessionsDir, config.adminPort, logger, client, config.adminPassword, usageTracker);
+  const { relayServer } = startAdminServer(config.sessionsDir, config.adminPort, logger, client, config.adminPassword, memberMgr);
 
   // Start WebSocket connection
   await wsClient.start({ eventDispatcher: dispatcher });
@@ -188,7 +191,6 @@ async function main() {
     chromeChecker.stop();
     scheduler.stop();
     runner.killAll();
-    usageTracker.destroy();
     sessionMgr.destroy();
     try { fs.unlinkSync(PID_FILE); } catch {}
     process.exit(0);

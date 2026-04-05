@@ -74,6 +74,83 @@ bash {SESSION_DIR}/start-chrome.sh
 - "Extension not connected" → 用户未连接扩展，重新引导安装
 - 工具超时 → 用户可能关闭了浏览器或扩展断开，提醒重新连接
 
+## Chrome MCP 断连 Fallback：CDP 直连
+
+当 `chrome-devtools` MCP 工具在会话中途断开（ToolSearch 返回空、标记为 disconnected）且**无法重连**时，可以绕过 MCP，用 Python websocket 直接通过 Chrome DevTools Protocol (CDP) 操作浏览器。
+
+### 前置：确认 Chrome 运行中并获取 WebSocket URL
+
+```bash
+# 确认 Chrome 端口（从 session 的 .chrome-port 文件读取）
+CHROME_PORT=$(cat {SESSION_DIR}/.chrome-port)
+curl -s http://127.0.0.1:$CHROME_PORT/json/version
+
+# 获取 browser WebSocket URL
+BROWSER_WS=$(curl -s http://127.0.0.1:$CHROME_PORT/json/version | python3 -c "import sys,json; print(json.load(sys.stdin)['webSocketDebuggerUrl'])")
+```
+
+### CDP 直连代码模板
+
+```python
+import websocket, json, base64, time
+
+# 关键：用 browser-level WebSocket（/devtools/browser/xxx），不是 page-level
+# suppress_origin=True 绕过 CORS 403（旧 Chrome 可能需要）
+ws = websocket.create_connection(BROWSER_WS, suppress_origin=True)
+
+# 1. 打开页面
+ws.send(json.dumps({"id": 1, "method": "Target.createTarget", "params": {"url": "https://example.com"}}))
+target_id = None
+for _ in range(20):
+    msg = json.loads(ws.recv())
+    if msg.get("id") == 1:
+        target_id = msg["result"]["targetId"]
+        break
+
+time.sleep(3)
+
+# 2. 附加到页面（必须 flatten=True 才能用 sessionId 发命令）
+ws.send(json.dumps({"id": 2, "method": "Target.attachToTarget", "params": {"targetId": target_id, "flatten": True}}))
+session_id = None
+for _ in range(20):
+    msg = json.loads(ws.recv())
+    if msg.get("id") == 2:
+        session_id = msg["result"]["sessionId"]
+        break
+
+time.sleep(2)
+
+# 3. 通过 sessionId 执行操作（截图示例）
+ws.send(json.dumps({"id": 3, "method": "Page.captureScreenshot", "params": {"format": "png"}, "sessionId": session_id}))
+for _ in range(30):
+    msg = json.loads(ws.recv())
+    if msg.get("id") == 3:
+        with open("screenshot.png", "wb") as f:
+            f.write(base64.b64decode(msg["result"]["data"]))
+        break
+
+ws.close()
+```
+
+### 常用 CDP 方法
+
+| 操作 | CDP 方法 | 说明 |
+|------|----------|------|
+| 打开页面 | `Target.createTarget` | `{"url": "..."}` |
+| 附加页面 | `Target.attachToTarget` | `{"targetId": "...", "flatten": true}` |
+| 导航 | `Page.navigate` | 需 sessionId |
+| 截图 | `Page.captureScreenshot` | 需 sessionId |
+| 执行 JS | `Runtime.evaluate` | `{"expression": "..."}` + sessionId |
+| 获取 DOM | `DOM.getDocument` | 需 sessionId |
+| 点击 | `Input.dispatchMouseEvent` | `{"type":"mousePressed","x":..,"y":..}` + sessionId |
+| 输入 | `Input.dispatchKeyEvent` | `{"type":"keyDown","text":"..."}` + sessionId |
+
+### 使用时机
+
+1. 先尝试正常的 `chrome-devtools` MCP 工具
+2. 如果 MCP 断连且 ToolSearch 返回空，切换到 CDP 直连
+3. CDP 直连不依赖 MCP，只要 Chrome 进程还在就能用
+
 ## 判断规则
 
 | 用户说的话 | 使用 |

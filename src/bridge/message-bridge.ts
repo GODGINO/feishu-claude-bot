@@ -14,6 +14,7 @@ import { GroupContextBuffer } from './group-context.js';
 import { EmailSetup } from './email-setup.js';
 import type { IdleMonitor } from '../email/idle-monitor.js';
 import { CardStreamer } from '../feishu/card-streamer.js';
+import type { MemberManager } from '../members/member-manager.js';
 
 const TITLE_INSTRUCTION = '\n\n[当你的回复包含 markdown 格式（表格、列表、代码块、加粗、链接、分隔线等）时，必须在第一行写 <<TITLE:简短标题>>，然后空一行写正文。标题10字以内，概括主题。纯文字短回复（打招呼、一两句话确认）不要写标题。]';
 
@@ -23,19 +24,16 @@ const TITLE_INSTRUCTION = '\n\n[当你的回复包含 markdown 格式（表格�
  */
 function getFeishuMcpHint(sessionDir: string, userId: string): string {
   try {
-    const authorsFile = path.join(sessionDir, 'authors.json');
-    if (!fs.existsSync(authorsFile)) return '';
-    const data = JSON.parse(fs.readFileSync(authorsFile, 'utf-8'));
-    const author = data.authors?.[userId];
-    if (author?.feishuMcpUrl) {
-      return `[身份绑定: 当前操作者是「${author.name}」(${userId})。所有操作（编写文档、日报、创建内容等）必须以此人身份执行。飞书MCP仅限调用 mcp__feishu_${userId}__* 系列工具，严禁使用其他用户的飞书MCP工具。文档署名、作者信息必须是「${author.name}」，不得使用群内其他人的姓名。使用 feishu-tools MCP 的任务/日历/多维表格工具时，user_id 参数传 ${userId}。如果工具返回未授权错误，先调用 feishu_auth_start 引导用户完成飞书 OAuth 授权。]`;
-    }
-    // User exists but no MCP URL — provide binding guidance
-    if (author) {
-      return `[身份: 当前操作者是「${author.name}」(${userId})，但尚未绑定飞书 MCP。如果用户需要使用飞书文档/表格/日历/任务等功能，引导用户访问 https://open.feishu.cn/page/mcp 获取 MCP URL 并发送给我完成绑定。使用 feishu-tools MCP 的任务/日历/多维表格工具时，user_id 参数传 ${userId}。]`;
+    // Read from members/{userId}/profile.json (via symlink)
+    const profilePath = path.join(sessionDir, 'members', userId, 'profile.json');
+    if (fs.existsSync(profilePath)) {
+      const profile = JSON.parse(fs.readFileSync(profilePath, 'utf-8'));
+      if (profile.feishuMcpUrl) {
+        return `[身份绑定: 当前操作者是「${profile.name}」(${userId})。所有操作（编写文档、日报、创建内容等）必须以此人身份执行。飞书MCP仅限调用 mcp__feishu_${userId}__* 系列工具，严禁使用其他用户的飞书MCP工具。文档署名、作者信息必须是「${profile.name}」，不得使用群内其他人的姓名。使用 feishu-tools MCP 的任务/日历/多维表格工具时，user_id 参数传 ${userId}。如果工具返回未授权错误，先调用 feishu_auth_start 引导用户完成飞书 OAuth 授权。]`;
+      }
+      return `[身份: 当前操作者是「${profile.name}」(${userId})，但尚未绑定飞书 MCP。如果用户需要使用飞书文档/表格/日历/任务等功能，引导用户访问 https://open.feishu.cn/page/mcp 获取 MCP URL 并发送给我完成绑定。使用 feishu-tools MCP 的任务/日历/多维表格工具时，user_id 参数传 ${userId}。]`;
     }
   } catch { /* ignore */ }
-  // DM sessions (no authors.json): still provide feishu-tools hint
   return `[使用 feishu-tools MCP 的任务/日历/多维表格工具时，user_id 参数传 ${userId}。如果工具返回未授权错误，先调用 feishu_auth_start 引导用户完成飞书 OAuth 授权。]`;
 }
 
@@ -54,6 +52,7 @@ export class MessageBridge {
   private emailSetup: EmailSetup;
   // Dedup: Feishu WebSocket can re-deliver events on reconnect, bypassing event-handler dedup
   private recentMessageIds = new Set<string>();
+  private memberMgr?: MemberManager;
 
 
   constructor(
@@ -126,6 +125,21 @@ export class MessageBridge {
     this.commandHandler.setIdleMonitor(monitor);
   }
 
+  /** Set the MemberManager for per-user profile tracking. */
+  setMemberManager(mgr: MemberManager): void {
+    this.memberMgr = mgr;
+  }
+
+  /** Resolve a display name: event name → member profile name → fallback. */
+  private resolveSenderName(eventName: string | undefined, userId: string): string {
+    if (eventName) return eventName;
+    if (this.memberMgr) {
+      const member = this.memberMgr.get(userId);
+      if (member?.name && member.name !== userId) return member.name;
+    }
+    return '未知用户';
+  }
+
   /**
    * Extract all <<REACT:emoji>> tags from text, send reactions, return text with tags stripped.
    * REACT is an annotation — can coexist with text and tool calls.
@@ -160,6 +174,36 @@ export class MessageBridge {
     try {
       fs.writeFileSync(path.join(session.sessionDir, 'chat-id'), msg.chatId);
     } catch { /* ignore */ }
+
+    // Check if session is muted (admin-only toggle)
+    try {
+      if (fs.existsSync(path.join(session.sessionDir, 'muted'))) {
+        this.logger.debug({ sessionKey }, 'Session muted, ignoring message');
+        return;
+      }
+    } catch { /* ignore */ }
+
+    // Check if individual member is muted (across all sessions)
+    try {
+      if (fs.existsSync(path.join(session.sessionDir, 'members', msg.userId, 'muted'))) {
+        this.logger.debug({ sessionKey, userId: msg.userId }, 'Member muted, ignoring message');
+        return;
+      }
+    } catch { /* ignore */ }
+
+    // Ensure member exists (sync already creates most, this is fallback for new users)
+    if (this.memberMgr && msg.userId.startsWith('ou_')) {
+      const existing = this.memberMgr.get(msg.userId);
+      if (!existing) {
+        // New user not yet synced — resolve name via API
+        const resolvedName = await this.sender.resolveUserName(msg.userId) || msg.senderName || null;
+        this.memberMgr.getOrCreate(msg.userId, resolvedName || msg.userId);
+      } else if (existing.name === msg.userId && msg.senderName) {
+        // Has profile but no real name yet — update from event
+        this.memberMgr.update(msg.userId, { name: msg.senderName });
+      }
+      this.memberMgr.addSession(msg.userId, sessionKey);
+    }
 
     // Check for slash commands
     const isCommand = await this.commandHandler.handle(msg.text, {
@@ -206,7 +250,7 @@ export class MessageBridge {
           }
           this.groupContext.add(msg.chatId, {
             timestamp: Date.now(),
-            senderName: msg.senderName || '未知用户',
+            senderName: this.resolveSenderName(msg.senderName, msg.userId),
             senderId: msg.userId,
             text: msg.text,
           });
@@ -245,7 +289,7 @@ export class MessageBridge {
       if (shouldBuffer) {
         this.groupContext.add(msg.chatId, {
           timestamp: Date.now(),
-          senderName: msg.senderName || '未知用户',
+          senderName: this.resolveSenderName(msg.senderName, msg.userId),
           senderId: msg.userId,
           text: msg.text,
         });
@@ -272,8 +316,7 @@ export class MessageBridge {
     }
     const isNonMentionGroup = msg.chatType === 'group' && !msg.isMentioned && autoReplyMode !== 'always';
 
-    // Thread reply: only use existing thread root if message is already in a thread.
-    // Sigma can request new thread via <<THREAD>> tag in response.
+    // Thread reply: auto-inherit if user's message is already in a thread.
     const existingRootId = msg.rootId;
     let threadRootId: string | undefined = existingRootId;
 
@@ -281,9 +324,13 @@ export class MessageBridge {
     const reactionId = await this.typing.start(msg.messageId, isNonMentionGroup ? 'THINKING' : undefined);
 
     try {
-      // Resolve user name: try API first, fall back to event sender name
-      const userName = await this.sender.resolveUserName(msg.userId) || msg.senderName || null;
-
+      // Resolve user name: member profile (already created in handleMessage), then fallback
+      let userName: string | null = null;
+      if (this.memberMgr) {
+        const member = this.memberMgr.get(msg.userId);
+        if (member?.name && member.name !== msg.userId) userName = member.name;
+      }
+      if (!userName) userName = msg.senderName || null;
       // Build prompt with context
       let prompt = msg.text;
 
@@ -292,6 +339,18 @@ export class MessageBridge {
         const mcpHint = getFeishuMcpHint(session.sessionDir, msg.userId);
         prompt = `[发送者: ${userName} | id: ${msg.userId}]${mcpHint ? ' ' + mcpHint : ''} ${prompt}`;
       }
+
+      // Inject MEMBER.md (per-user profile, via symlinked members/ dir)
+      try {
+        const memberMdPath = path.join(session.sessionDir, 'members', msg.userId, 'MEMBER.md');
+        if (fs.existsSync(memberMdPath)) {
+          const memberMd = fs.readFileSync(memberMdPath, 'utf-8').trim();
+          if (memberMd && memberMd.length > 50) { // skip near-empty templates
+            const truncated = memberMd.length > 1000 ? memberMd.slice(0, 1000) + '\n...(truncated)' : memberMd;
+            prompt = `[用户档案]\n${truncated}\n[/用户档案]\n\n${prompt}`;
+          }
+        }
+      } catch { /* ignore */ }
 
       // Group messages: the Claude subprocess is persistent and manages its own context.
       // We only inject missed messages (buffered while auto-reply=off or bot was busy).
@@ -313,7 +372,7 @@ export class MessageBridge {
         // Record + mark sent (for admin dashboard + missed message tracking)
         this.groupContext.add(msg.chatId, {
           timestamp: Date.now(),
-          senderName: userName || msg.senderName || '未知用户',
+          senderName: userName || this.resolveSenderName(msg.senderName, msg.userId),
           senderId: msg.userId,
           text: msg.text,
         });
@@ -322,7 +381,7 @@ export class MessageBridge {
         // Record DM message (for admin dashboard only)
         this.groupContext.add(msg.chatId, {
           timestamp: Date.now(),
-          senderName: userName || msg.senderName || '未知用户',
+          senderName: userName || this.resolveSenderName(msg.senderName, msg.userId),
           senderId: msg.userId,
           text: msg.text,
         });
@@ -449,6 +508,15 @@ export class MessageBridge {
    */
   async executeCronJob(sessionKey: string, chatId: string, prompt: string, jobName: string): Promise<void> {
     const session = this.sessionMgr.getOrCreate(sessionKey);
+
+    // Check if session is muted
+    try {
+      if (fs.existsSync(path.join(session.sessionDir, 'muted'))) {
+        this.logger.info({ sessionKey, jobName }, 'Session muted, skipping cron job');
+        return;
+      }
+    } catch { /* ignore */ }
+
     const cronPrompt = `[定时任务执行: ${jobName}] ${prompt}\n[这是定时任务，必须输出实际文字内容发送给用户]`;
 
     this.logger.info({ sessionKey, jobName }, 'Executing cron job via reply pipeline');
@@ -479,6 +547,15 @@ export class MessageBridge {
     if (cardId) {
       await this.updateCardButtonState(cardId, label, userName);
     }
+
+    // Check if session is muted
+    const session = this.sessionMgr.getOrCreate(sessionKey);
+    try {
+      if (fs.existsSync(path.join(session.sessionDir, 'muted'))) {
+        this.logger.debug({ sessionKey }, 'Session muted, ignoring button action');
+        return;
+      }
+    } catch { /* ignore */ }
 
     // If session is busy, queue the button action for later
     if (this.runningTasks.has(sessionKey)) {
@@ -692,10 +769,9 @@ export class MessageBridge {
         // Cron job: strip REACT tags but don't send reactions (no message to react to)
         rawText = rawText.replace(/<<REACT:\w+>>/g, '').trim();
       }
-      const replyText = rawText.trim();
-      const streamWantsThread = rawText.includes('<<THREAD>>');
-      const streamRootId = existingRootId || (streamWantsThread ? replyToMessageId : undefined);
-      const cleanText = rawText.replace(/<<THREAD>>\s*/g, '').trim();
+      const replyText = rawText.replace(/<<THREAD>>\s*/g, '').trim();
+      const streamRootId = existingRootId;
+      const cleanText = replyText;
 
       if (replyText === 'NO_REPLY' || (!cardCreated && isNonMentionGroup && !replyText) || (!cardCreated && !replyText)) {
         // NO_REPLY or empty text without card — nothing to show

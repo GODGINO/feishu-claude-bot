@@ -59,14 +59,16 @@ export class SessionManager {
       // Initialize CLAUDE.md with session settings template if it doesn't exist
       this.initClaudeMd(sessionDir);
 
-      // Create symlink to shared directory for cross-session knowledge transfer
+      // Create symlinks to shared and members directories
       this.ensureSharedLink(sessionDir);
+      this.ensureMembersLink(sessionDir);
 
       this.logger.info({ sessionKey }, 'Created new session');
     }
 
-    // Ensure shared link exists (also for existing sessions)
+    // Ensure links exist (also for existing sessions)
     this.ensureSharedLink(session.sessionDir);
+    this.ensureMembersLink(session.sessionDir);
 
     session.lastUsed = Date.now();
 
@@ -144,6 +146,20 @@ export class SessionManager {
     } catch {
       // Ignore — race condition or permission issue
     }
+  }
+
+  /** Ensure members/ symlink exists in session directory. */
+  private ensureMembersLink(sessionDir: string): void {
+    const linkPath = path.join(sessionDir, 'members');
+    const target = path.join(path.dirname(this.sessionsDir), 'members');
+    try {
+      const stat = fs.lstatSync(linkPath);
+      if (stat.isSymbolicLink()) return;
+      return; // Not a symlink — don't overwrite
+    } catch { /* doesn't exist */ }
+    try {
+      fs.symlinkSync(target, linkPath, 'dir');
+    } catch { /* ignore */ }
   }
 
   /**

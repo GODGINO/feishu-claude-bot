@@ -18,3 +18,5 @@ sessions.json
 sigma-browser-extension.zip
 _email_processor/
 web/dist/
+/members/
+/shared/

@@ -1,10 +1,12 @@
 import { Routes, Route, NavLink, useLocation } from 'react-router-dom'
 import { useEffect, useState } from 'react'
-import { LayoutDashboard, LogOut } from 'lucide-react'
+import { LayoutDashboard, LogOut, Users } from 'lucide-react'
 import { api, type SessionSummary } from './lib/api'
 import { formatTime } from './lib/utils'
 import Dashboard from './pages/Dashboard'
 import SessionDetail from './pages/SessionDetail'
+import MemberList from './pages/MemberList'
+import MemberDetail from './pages/MemberDetail'
 import BlogList from './pages/BlogList'
 
 function LoginPage({ onLogin }: { onLogin: () => void }) {
@@ -96,6 +98,10 @@ function Sidebar({ onLogout }: { onLogout: () => void }) {
           <LayoutDashboard size={18} />
           Dashboard
         </NavLink>
+        <NavLink to="/members" className={navClass}>
+          <Users size={18} />
+          Members
+        </NavLink>
       </nav>
 
       <div className="px-3 mt-1 pb-4 flex flex-col gap-0.5">
@@ -150,6 +156,8 @@ export default function App() {
         <Routes>
           <Route path="/" element={<Dashboard />} />
           <Route path="/session/:key" element={<SessionDetail />} />
+          <Route path="/members" element={<MemberList />} />
+          <Route path="/members/:openId" element={<MemberDetail />} />
           <Route path="/blog" element={<BlogList />} />
         </Routes>
       </main>

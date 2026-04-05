@@ -41,7 +41,7 @@ export function startAdminServer(
   logger: { info: (...args: any[]) => void; warn: (...args: any[]) => void; error: (...args: any[]) => void },
   feishuClient?: lark.Client,
   adminPassword?: string,
-  usageTracker?: any,
+  memberMgr?: any,
 ): AdminServerResult {
   const app = express();
   app.use(express.json());
@@ -101,9 +101,9 @@ export function startAdminServer(
     });
   }
 
-  // Attach usageTracker to all requests
-  if (usageTracker) {
-    app.use((req, _res, next) => { (req as any).usageTracker = usageTracker; next(); });
+  // Attach memberMgr to requests
+  if (memberMgr) {
+    app.use((req, _res, next) => { (req as any).memberMgr = memberMgr; next(); });
   }
 
   // API routes

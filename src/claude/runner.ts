@@ -203,6 +203,14 @@ export class ClaudeRunner {
   }
 
   /**
+   * Respawn a session (e.g. model change) — kill process but keep sessionId.
+   * Next message spawns with --resume = same context, new config.
+   */
+  respawn(sessionKey: string): void {
+    this.pool.respawn(sessionKey);
+  }
+
+  /**
    * Kill all processes (shutdown).
    */
   killAll(): void {

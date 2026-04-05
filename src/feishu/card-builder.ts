@@ -63,7 +63,7 @@ export function buildThinkingCard(): object {
 /**
  * Build a streaming card — updated periodically with new text and tool calls.
  */
-export function buildStreamingCard(text: string, toolCalls?: ToolCallInfo[]): object {
+export function buildStreamingCard(text: string, toolCalls?: ToolCallInfo[], startTime?: number): object {
   const elements: object[] = [];
 
   // Main text content
@@ -89,6 +89,16 @@ export function buildStreamingCard(text: string, toolCalls?: ToolCallInfo[]): ob
       content: formatToolCalls(toolCalls),
       element_id: TOOL_CALLS_ELEMENT_ID,
     });
+
+    // Always show elapsed time at the bottom when tools are active
+    if (startTime) {
+      const elapsed = Date.now() - startTime;
+      const timeStr = formatDuration(elapsed);
+      elements.push({
+        tag: 'markdown',
+        content: `⏱ 总用时 ${timeStr}`,
+      });
+    }
   }
 
   return {
@@ -280,10 +290,7 @@ function formatToolCalls(toolCalls: ToolCallInfo[]): string {
 
   const lines: string[] = [];
   if (hidden > 0) {
-    const elapsed = Date.now() - toolCalls[0].startTime;
-    const totalSecs = Math.round(elapsed / 1000);
-    const timeStr = totalSecs < 60 ? `${totalSecs}s` : `${Math.floor(totalSecs / 60)}:${(totalSecs % 60).toString().padStart(2, '0')}`;
-    lines.push(`... ${hidden} 条已折叠，总用时 ${timeStr}`);
+    lines.push(`... ${hidden} 条已折叠`);
   }
   for (const tc of visible) {
     lines.push(`- ${formatSingleTool(tc)}`);

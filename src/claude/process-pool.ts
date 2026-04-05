@@ -61,7 +61,6 @@ export class ProcessPool {
   private statePath: string;
   private unsolicitedCallback?: UnsolicitedResultCallback;
   private progressCallback?: ProgressCallback;
-  private usageCallback?: (sessionKey: string, inputTokens: number, outputTokens: number, costUsd: number) => void;
   private textStreamCallbacks = new Map<string, TextStreamCallback>();
   private toolStreamCallbacks = new Map<string, ToolStreamCallback>();
   private subagentStreamCallbacks = new Map<string, SubagentStreamCallback>();
@@ -90,9 +89,6 @@ export class ProcessPool {
     this.progressCallback = callback;
   }
 
-  onUsage(callback: (sessionKey: string, inputTokens: number, outputTokens: number, costUsd: number) => void): void {
-    this.usageCallback = callback;
-  }
 
   /**
    * Register callback for text streaming (called with accumulated full text on each assistant event).
@@ -243,6 +239,25 @@ export class ProcessPool {
       this.logger.info({ sessionKey }, 'Sending SIGINT to stop current task');
       pp.proc.kill('SIGINT');
     }
+  }
+
+  /**
+   * Respawn a session (e.g. model change).
+   * Kills the process but KEEPS saved sessionId.
+   * Next message will spawn with --resume = same context, new config.
+   */
+  respawn(sessionKey: string): void {
+    const pp = this.processes.get(sessionKey);
+    if (pp) {
+      this.killProcessHard(pp.proc);
+      if (pp.currentReject) {
+        pp.currentReject(new Error('Session respawn'));
+        pp.currentResolve = undefined;
+        pp.currentReject = undefined;
+      }
+      this.processes.delete(sessionKey);
+    }
+    // Keep savedSessionIds intact — next spawn uses --resume
   }
 
   /**
@@ -667,11 +682,6 @@ export class ProcessPool {
         durationMs: result.durationMs,
         error: result.error,
       };
-
-      // Record usage stats
-      if (this.usageCallback && (result.inputTokens || result.outputTokens || result.costUsd)) {
-        this.usageCallback(pp.sessionKey, result.inputTokens || 0, result.outputTokens || 0, result.costUsd || 0);
-      }
 
       // Update saved sessionId — but NOT if this turn had an error
       // (error_during_execution with a corrupted --resume session must not be re-saved)

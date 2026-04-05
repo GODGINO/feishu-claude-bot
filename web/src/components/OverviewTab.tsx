@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import { Link } from 'react-router-dom'
 import type { SessionDetail, EnvVariable } from '../lib/api'
 import { api } from '../lib/api'
 import ConfirmDialog from './ConfirmDialog'
@@ -49,22 +50,13 @@ export default function OverviewTab({ session, sessionKey, onRefresh }: Props) {
     <div className="space-y-6">
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
         <InfoCard label="Chat ID" value={session.chatId || '-'} />
-        <InfoCard label="Auto Reply" value={session.autoReply || 'off'} />
-        <InfoCard label="Messages" value={String(session.messageCount)} />
+        {session.type === 'group' ? (
+          <AutoReplyCard sessionKey={sessionKey} initial={session.autoReply} />
+        ) : (
+          <InfoCard label="Auto Reply" value="N/A (DM)" />
+        )}
+        <ModelCard sessionKey={sessionKey} initial={session.model} />
         <InfoCard label="Cron Jobs" value={String(session.cronJobCount)} />
-      </div>
-
-      {/* Session Toggles */}
-      <div className="bg-white rounded-xl border border-slate-200">
-        <div className="px-5 py-4 border-b border-slate-200">
-          <h3 className="font-semibold">Settings</h3>
-        </div>
-        <div className="px-5 py-4 flex flex-wrap gap-x-12 gap-y-4">
-          <StreamingToggle sessionKey={sessionKey} />
-          {session.type === 'group' && (
-            <AutoReplyToggle sessionKey={sessionKey} initial={session.autoReply} />
-          )}
-        </div>
       </div>
 
       {/* Members */}
@@ -109,7 +101,7 @@ export default function OverviewTab({ session, sessionKey, onRefresh }: Props) {
                 <div className="flex items-center justify-between">
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2">
-                      <p className="font-medium text-sm">{info.name}</p>
+                      <Link to={`/members/${openId}`} className="font-medium text-sm text-blue-600 hover:underline">{info.name}</Link>
                       {info.feishuMcpUrl && (
                         <span className="text-xs bg-blue-50 text-blue-600 px-2 py-0.5 rounded font-medium">Feishu MCP</span>
                       )}
@@ -388,74 +380,73 @@ function EnvSection({ sessionKey }: { sessionKey: string }) {
   )
 }
 
-function StreamingToggle({ sessionKey }: { sessionKey: string }) {
-  const [value, setValue] = useState('off')
+const AUTO_REPLY_OPTIONS = ['off', 'on', 'always'] as const
+
+function AutoReplyCard({ sessionKey, initial }: { sessionKey: string; initial: string | null }) {
+  const [value, setValue] = useState(initial || 'off')
   const [loading, setLoading] = useState(false)
 
-  useEffect(() => {
-    api.getSessionConfig(sessionKey, 'streaming-reply').then(v => setValue(v || 'off'))
-  }, [sessionKey])
-
-  const toggle = async () => {
-    const newVal = value === 'on' ? 'off' : 'on'
+  const cycle = async () => {
+    const idx = AUTO_REPLY_OPTIONS.indexOf(value as any)
+    const next = AUTO_REPLY_OPTIONS[(idx + 1) % AUTO_REPLY_OPTIONS.length]
     setLoading(true)
     try {
-      await api.setSessionConfig(sessionKey, 'streaming-reply', newVal)
-      setValue(newVal)
+      await api.setSessionConfig(sessionKey, 'auto-reply', next === 'off' ? '' : next)
+      setValue(next)
     } finally { setLoading(false) }
   }
 
+  const colors: Record<string, string> = {
+    off: 'text-slate-500',
+    on: 'text-blue-600',
+    always: 'text-green-600',
+  }
+
   return (
-    <div className="flex items-center gap-4">
-      <div>
-        <p className="text-sm font-medium">Streaming Reply</p>
-        <p className="text-xs text-slate-400">Real-time card updates as Claude generates responses</p>
-      </div>
-      <button
-        onClick={toggle}
-        disabled={loading}
-        className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-          value === 'on' ? 'bg-blue-500' : 'bg-slate-200'
-        } ${loading ? 'opacity-50' : ''}`}
-      >
-        <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-          value === 'on' ? 'translate-x-6' : 'translate-x-1'
-        }`} />
-      </button>
+    <div
+      className={`bg-white rounded-xl border border-slate-200 p-4 cursor-pointer hover:border-slate-300 transition-colors ${loading ? 'opacity-50' : ''}`}
+      onClick={cycle}
+    >
+      <p className="text-xs text-slate-500 mb-1">Auto Reply</p>
+      <p className={`font-semibold text-sm ${colors[value] || ''}`}>{value}</p>
     </div>
   )
 }
 
-function AutoReplyToggle({ sessionKey, initial }: { sessionKey: string; initial: string | null }) {
-  const [value, setValue] = useState(initial || 'off')
+const MODEL_OPTIONS = [
+  { value: 'sonnet', label: 'Sonnet 200K', desc: '默认，快速均衡' },
+  { value: 'sonnet 1m', label: 'Sonnet 1M', desc: '长上下文' },
+  { value: 'opus', label: 'Opus 200K', desc: '强力' },
+  { value: 'opus 1m', label: 'Opus 1M', desc: '最强，复杂任务' },
+  { value: 'haiku', label: 'Haiku 200K', desc: '最快，简单任务' },
+] as const
+
+function ModelCard({ sessionKey, initial }: { sessionKey: string; initial: string | null }) {
+  const [value, setValue] = useState(initial || 'sonnet')
   const [loading, setLoading] = useState(false)
 
-  const toggle = async () => {
-    const newVal = value === 'on' ? 'off' : 'on'
+  const handleChange = async (e: React.ChangeEvent<HTMLSelectElement>) => {
+    const next = e.target.value
     setLoading(true)
     try {
-      await api.setSessionConfig(sessionKey, 'auto-reply', newVal)
-      setValue(newVal)
+      await api.setSessionConfig(sessionKey, 'model', next)
+      setValue(next)
     } finally { setLoading(false) }
   }
 
   return (
-    <div className="flex items-center gap-4">
-      <div>
-        <p className="text-sm font-medium">Auto Reply</p>
-        <p className="text-xs text-slate-400">Reply to all messages without @mention</p>
-      </div>
-      <button
-        onClick={toggle}
+    <div className={`bg-white rounded-xl border border-slate-200 p-4 ${loading ? 'opacity-50' : ''}`}>
+      <p className="text-xs text-slate-500 mb-1">Model</p>
+      <select
+        value={value}
+        onChange={handleChange}
         disabled={loading}
-        className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-          value === 'on' ? 'bg-blue-500' : 'bg-slate-200'
-        } ${loading ? 'opacity-50' : ''}`}
+        className="font-semibold text-sm bg-transparent border-none outline-none cursor-pointer p-0 -ml-1 w-full"
       >
-        <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-          value === 'on' ? 'translate-x-6' : 'translate-x-1'
-        }`} />
-      </button>
+        {MODEL_OPTIONS.map(m => (
+          <option key={m.value} value={m.value}>{m.label} — {m.desc}</option>
+        ))}
+      </select>
     </div>
   )
 }

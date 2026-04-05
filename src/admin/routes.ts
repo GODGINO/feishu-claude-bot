@@ -109,11 +109,6 @@ export function createRoutes(sessionsDir: string, feishuClient?: lark.Client): R
             const chatId = readText(path.join(sessionsDir, e.name, 'chat-id')) || e.name.replace('group_', '');
             if (chatId && !chatNameCache.has(chatId)) chatIds.add(chatId);
           }
-          // Extract from authors.json
-          const authors = readJson(path.join(sessionsDir, e.name, 'authors.json'));
-          if (authors?.authors) {
-            for (const id of Object.keys(authors.authors)) openIds.add(id);
-          }
           // Extract from group-context.json senderOpenId
           const ctx = readJson(path.join(sessionsDir, e.name, 'group-context.json'));
           if (Array.isArray(ctx)) {
@@ -268,44 +263,46 @@ export function createRoutes(sessionsDir: string, feishuClient?: lark.Client): R
     const isDm = key.startsWith('dm_');
     const chatId = readText(path.join(dir, 'chat-id')) || (isGroup ? key.replace('group_', '') : null);
     const autoReply = readText(path.join(dir, 'auto-reply'));
-    const authors = readJson(path.join(dir, 'authors.json'));
     const cronJobs = readJson(path.join(dir, 'cron-jobs.json'));
     const context = readJson(path.join(dir, 'group-context.json'));
     const hasEmail = fs.existsSync(path.join(dir, 'email-accounts.json'));
     const hasKnowledge = fs.existsSync(path.join(dir, 'CLAUDE.md'));
     const skills = readSkills(dir);
 
-    // Collect all known open_ids and their names
+    // Collect members from group-context (actual message senders) + DM owner
     const memberNames = new Map<string, string>();
+    const membersDir = path.join(dir, 'members');
 
-    // From authors.json
-    if (authors?.authors) {
-      for (const [id, info] of Object.entries(authors.authors)) {
-        memberNames.set(id, (info as any).name || nameCache.get(id) || id);
-      }
-    }
-
-    // From group-context.json senderOpenId + senderName
-    if (Array.isArray(context)) {
-      for (const msg of context) {
-        if (msg.senderOpenId && msg.senderName && msg.senderName !== '未知用户') {
-          if (!memberNames.has(msg.senderOpenId)) {
-            memberNames.set(msg.senderOpenId, msg.senderName);
-          }
+    // From group-context: real senders in this session
+    if (context) {
+      const entries = Array.isArray(context) ? context : Object.values(context).flat();
+      for (const msg of entries as any[]) {
+        const sid = msg?.senderId;
+        if (sid?.startsWith('ou_') && !memberNames.has(sid)) {
+          memberNames.set(sid, msg.senderName && msg.senderName !== '未知用户' ? msg.senderName : sid);
         }
       }
     }
 
-    // Resolve from nameCache (feishu API results)
+    // DM: ensure the owner is included
     if (isDm) {
       const openId = key.replace('dm_', '');
-      const cached = nameCache.get(openId);
-      if (cached && !memberNames.has(openId)) {
-        memberNames.set(openId, cached);
-      }
+      if (!memberNames.has(openId)) memberNames.set(openId, openId);
     }
 
-    // Enrich names from cache for any open_id we know
+    // Enrich names from member profiles
+    try {
+      if (fs.existsSync(membersDir)) {
+        for (const [openId] of memberNames) {
+          try {
+            const profile = readJson(path.join(membersDir, openId, 'profile.json'));
+            if (profile?.name && profile.name !== openId) memberNames.set(openId, profile.name);
+          } catch { /* skip */ }
+        }
+      }
+    } catch { /* ignore */ }
+
+    // Enrich from name cache
     for (const [id] of memberNames) {
       const cached = nameCache.get(id);
       if (cached) memberNames.set(id, cached);
@@ -339,7 +336,7 @@ export function createRoutes(sessionsDir: string, feishuClient?: lark.Client): R
       type: isGroup ? 'group' : isDm ? 'dm' : 'other',
       chatId,
       autoReply,
-      memberCount: memberNames.size || (authors?.authors ? Object.keys(authors.authors).length : 0),
+      memberCount: memberNames.size,
       cronJobCount: Array.isArray(cronJobs) ? cronJobs.length : 0,
       messageCount: Array.isArray(context) ? context.length : 0,
       hasEmail,
@@ -366,10 +363,6 @@ export function createRoutes(sessionsDir: string, feishuClient?: lark.Client): R
         if (e.name.startsWith('group_')) {
           const chatId = readText(path.join(sessionsDir, e.name, 'chat-id')) || e.name.replace('group_', '');
           if (chatId) chatIds.add(chatId);
-        }
-        const authors = readJson(path.join(sessionsDir, e.name, 'authors.json'));
-        if (authors?.authors) {
-          for (const id of Object.keys(authors.authors)) openIds.add(id);
         }
       }
     } catch { /* ignore */ }
@@ -403,10 +396,39 @@ export function createRoutes(sessionsDir: string, feishuClient?: lark.Client): R
       return;
     }
     const summary = getSessionSummary(key);
-    const authors = readJson(path.join(dir, 'authors.json'));
+    // Build members from summary (already includes context-derived members)
+    const sessionMembers: Record<string, { name: string; feishuMcpUrl?: string }> = {};
+    const membersDir = path.join(dir, 'members');
+    // summary.memberCount already has the list from getSessionSummary
+    // Re-extract from context for the detail view
+    const ctx = readJson(path.join(dir, 'group-context.json'));
+    const ctxEntries = ctx ? (Array.isArray(ctx) ? ctx : Object.values(ctx).flat()) : [];
+    for (const msg of ctxEntries as any[]) {
+      const sid = msg?.senderId;
+      if (sid?.startsWith('ou_') && !sessionMembers[sid]) {
+        sessionMembers[sid] = { name: msg.senderName && msg.senderName !== '未知用户' ? msg.senderName : sid };
+      }
+    }
+    if (key.startsWith('dm_ou_')) {
+      const openId = key.replace('dm_', '');
+      if (!sessionMembers[openId]) sessionMembers[openId] = { name: openId };
+    }
+    // Enrich from member profiles
+    try {
+      if (fs.existsSync(membersDir)) {
+        for (const openId of Object.keys(sessionMembers)) {
+          try {
+            const profile = readJson(path.join(membersDir, openId, 'profile.json'));
+            if (profile?.name && profile.name !== openId) sessionMembers[openId].name = profile.name;
+            if (profile?.feishuMcpUrl) sessionMembers[openId].feishuMcpUrl = profile.feishuMcpUrl;
+          } catch { /* skip */ }
+        }
+      }
+    } catch { /* ignore */ }
     const sshPubKeyPath = path.join(dir, 'ssh_key', 'id_ed25519.pub');
     const sshPublicKey = readText(sshPubKeyPath)?.trim() || null;
-    res.json({ ...summary, authors: authors?.authors || {}, sshPublicKey });
+    const model = readText(path.join(dir, 'model'))?.trim() || null;
+    res.json({ ...summary, authors: sessionMembers, sshPublicKey, model });
   });
 
   // GET /api/sessions/:key/knowledge — CLAUDE.md
@@ -815,16 +837,19 @@ export function createRoutes(sessionsDir: string, feishuClient?: lark.Client): R
     res.json({ ok: true, enabled: job.enabled });
   });
 
-  // DELETE /api/sessions/:key/authors/:openId — delete author
+  // DELETE /api/sessions/:key/authors/:openId — remove member from session
   router.delete('/api/sessions/:key/authors/:openId', (req: Request, res: Response) => {
     const key = param(req, 'key');
     const openId = param(req, 'openId');
     if (!validSessionKey(key)) { res.status(400).json({ error: 'Invalid session key' }); return; }
-    const filePath = path.join(sessionsDir, key, 'authors.json');
-    const data = readJson(filePath);
-    if (!data?.authors?.[openId]) { res.status(404).json({ error: 'Author not found' }); return; }
-    delete data.authors[openId];
-    fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+    const mgr = (req as any).memberMgr;
+    if (mgr) {
+      const profile = mgr.get(openId);
+      if (profile) {
+        profile.sessions = profile.sessions.filter((s: string) => s !== key);
+        mgr.update(openId, { sessions: profile.sessions });
+      }
+    }
     signalMcpChanged(path.join(sessionsDir, key));
     res.json({ ok: true });
   });
@@ -847,65 +872,89 @@ export function createRoutes(sessionsDir: string, feishuClient?: lark.Client): R
     if (!fs.existsSync(dir)) { res.status(404).json({ error: 'Session not found' }); return; }
     const { value } = req.body;
     if (typeof value !== 'string') { res.status(400).json({ error: 'Invalid value' }); return; }
-    fs.writeFileSync(path.join(dir, name), value);
+    const filePath = path.join(dir, name);
+    if (value) {
+      fs.writeFileSync(filePath, value);
+    } else {
+      // Empty value = delete the config file
+      try { fs.unlinkSync(filePath); } catch { /* ignore if not exists */ }
+    }
     res.json({ ok: true });
   });
 
-  // PUT /api/sessions/:key/authors/:openId — update author
+  // PUT /api/sessions/:key/authors/:openId — update member profile
   router.put('/api/sessions/:key/authors/:openId', (req: Request, res: Response) => {
     const key = param(req, 'key');
     const openId = param(req, 'openId');
     if (!validSessionKey(key)) { res.status(400).json({ error: 'Invalid session key' }); return; }
-    const filePath = path.join(sessionsDir, key, 'authors.json');
-    const data = readJson(filePath) || { authors: {} };
-    if (!data.authors[openId]) { res.status(404).json({ error: 'Author not found' }); return; }
+    const mgr = (req as any).memberMgr;
+    if (!mgr) { res.status(500).json({ error: 'Member manager not initialized' }); return; }
+    const profile = mgr.get(openId);
+    if (!profile) { res.status(404).json({ error: 'Member not found' }); return; }
     const { name, feishuMcpUrl } = req.body;
-    if (name !== undefined) data.authors[openId].name = name;
-    if (feishuMcpUrl !== undefined) data.authors[openId].feishuMcpUrl = feishuMcpUrl || undefined;
-    fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+    mgr.update(openId, { ...(name !== undefined ? { name } : {}), ...(feishuMcpUrl !== undefined ? { feishuMcpUrl } : {}) });
     signalMcpChanged(path.join(sessionsDir, key));
     res.json({ ok: true });
   });
 
-  // ─── Usage Stats API ────────────────────────────────────────
 
-  // GET /api/usage — global usage overview + trends
-  router.get('/api/usage', (req: Request, res: Response) => {
-    const usageTracker = (req as any).usageTracker;
-    if (!usageTracker) return res.json({ error: 'Usage tracking not initialized' });
-    const data = usageTracker.getData();
-    const period = (req.query.period as string) || 'daily';
-    const globalData = period === 'hourly' ? data.globalHourly
-      : period === 'weekly' ? data.globalWeekly
-      : period === 'monthly' ? data.globalMonthly
-      : data.globalDaily;
-    res.json({ period, data: globalData });
+  // ─── Members API ──────────────────────────────────────────
+
+  const membersDir = path.join(path.dirname(sessionsDir), 'members');
+
+  router.get('/api/members', (req: Request, res: Response) => {
+    const mgr = (req as any).memberMgr;
+    if (!mgr) return res.json([]);
+    const members = mgr.getAll().map((m: any) => ({ ...m, muted: mgr.isMuted(m.openId) }));
+    res.json(members);
   });
 
-  // GET /api/usage/sessions — top sessions ranked by cost
-  router.get('/api/usage/sessions', (req: Request, res: Response) => {
-    const usageTracker = (req as any).usageTracker;
-    if (!usageTracker) return res.json({ error: 'Usage tracking not initialized' });
-    const period = (req.query.period as string) || 'daily';
-    const limit = parseInt(req.query.limit as string) || 20;
-    const sortBy = (req.query.sort as string) || 'costUsd';
-    let sessions = usageTracker.getTopSessions(period, 100);
-    // Custom sort
-    if (sortBy === 'inputTokens') sessions.sort((a: any, b: any) => b.usage.inputTokens - a.usage.inputTokens);
-    else if (sortBy === 'outputTokens') sessions.sort((a: any, b: any) => b.usage.outputTokens - a.usage.outputTokens);
-    else if (sortBy === 'requests') sessions.sort((a: any, b: any) => b.usage.requests - a.usage.requests);
-    res.json({ period, sessions: sessions.slice(0, limit) });
+  router.get('/api/members/:openId', (req: Request, res: Response) => {
+    const mgr = (req as any).memberMgr;
+    if (!mgr) return res.status(500).json({ error: 'Member manager not initialized' });
+    const openId = param(req, 'openId');
+    const profile = mgr.get(openId);
+    if (!profile) return res.status(404).json({ error: 'Member not found' });
+    const memberMd = mgr.getMemberMd(openId);
+    res.json({ ...profile, muted: mgr.isMuted(openId), memberMd });
   });
 
-  // GET /api/usage/sessions/:key — single session usage detail
-  router.get('/api/usage/sessions/:key', (req: Request, res: Response) => {
-    const usageTracker = (req as any).usageTracker;
-    if (!usageTracker) return res.json({ error: 'Usage tracking not initialized' });
-    const key = param(req, 'key');
-    const data = usageTracker.getData();
-    const session = data.sessions[key];
-    if (!session) return res.json({ error: 'Session not found' });
-    res.json(session);
+  router.put('/api/members/:openId', (req: Request, res: Response) => {
+    const mgr = (req as any).memberMgr;
+    if (!mgr) return res.status(500).json({ error: 'Member manager not initialized' });
+    const openId = param(req, 'openId');
+    const updated = mgr.update(openId, req.body);
+    if (!updated) return res.status(404).json({ error: 'Member not found' });
+    res.json({ ok: true, profile: updated });
+  });
+
+  router.put('/api/members/:openId/mute', (req: Request, res: Response) => {
+    const mgr = (req as any).memberMgr;
+    if (!mgr) return res.status(500).json({ error: 'Member manager not initialized' });
+    const openId = param(req, 'openId');
+    mgr.setMuted(openId, !!req.body.muted);
+    res.json({ ok: true });
+  });
+
+  router.get('/api/members/:openId/member-md', (req: Request, res: Response) => {
+    const mgr = (req as any).memberMgr;
+    if (!mgr) return res.status(500).json({ error: 'Member manager not initialized' });
+    const content = mgr.getMemberMd(param(req, 'openId'));
+    res.json({ content });
+  });
+
+  router.put('/api/members/:openId/member-md', (req: Request, res: Response) => {
+    const mgr = (req as any).memberMgr;
+    if (!mgr) return res.status(500).json({ error: 'Member manager not initialized' });
+    mgr.saveMemberMd(param(req, 'openId'), req.body.content || '');
+    res.json({ ok: true });
+  });
+
+  router.delete('/api/members/:openId', (req: Request, res: Response) => {
+    const mgr = (req as any).memberMgr;
+    if (!mgr) return res.status(500).json({ error: 'Member manager not initialized' });
+    const ok = mgr.delete(param(req, 'openId'));
+    res.json({ ok });
   });
 
   return router;

@@ -214,6 +214,7 @@ mkdir -p "${chromeDataDir}"
   --user-data-dir="${chromeDataDir}" \\
   --no-first-run \\
   --no-default-browser-check \\
+  --remote-allow-origins=* \\
   &
 
 # Wait for Chrome to be ready
@@ -456,32 +457,31 @@ exec node "${cliPath}" "$@"
   }
 
   /**
-   * Add Feishu MCP servers from session config.
-   * - If authors.json exists (group multi-user): per-openid "feishu_ou_xxx" entries ONLY.
-   *   The single "feishu" server is NOT added to prevent cross-user document access.
-   * - Otherwise (DM sessions): single "feishu" from feishu-mcp-url file.
+   * Add Feishu MCP servers from member profiles.
+   * Scans members/ directory for profiles with feishuMcpUrl, adds per-openid servers.
+   * If any per-user MCP is found, the default "feishu" server is NOT added.
    */
   private addFeishuMcpServers(sessionDir: string, mcpServers: Record<string, any>): void {
-    // Multi-user: authors.json with per-openid feishu MCP URLs (takes priority)
-    const authorsFile = path.join(sessionDir, 'authors.json');
+    // Read from members/ directory (symlinked into session)
+    const membersDir = path.join(sessionDir, 'members');
+    let foundPerUser = false;
     try {
-      if (fs.existsSync(authorsFile)) {
-        const data = JSON.parse(fs.readFileSync(authorsFile, 'utf-8'));
-        const authors = data.authors as Record<string, any> | undefined;
-        if (authors && Object.keys(authors).length > 0) {
-          for (const [openId, author] of Object.entries(authors)) {
-            if (author.feishuMcpUrl) {
-              // Name by openid for strict sender-based access control.
-              // Claude sees [发送者: name | id: ou_xxx] and must only use feishu_ou_xxx tools.
-              mcpServers[`feishu_${openId}`] = { url: author.feishuMcpUrl };
+      if (fs.existsSync(membersDir)) {
+        for (const entry of fs.readdirSync(membersDir, { withFileTypes: true })) {
+          if (!entry.isDirectory() || !entry.name.startsWith('ou_')) continue;
+          try {
+            const profilePath = path.join(membersDir, entry.name, 'profile.json');
+            if (!fs.existsSync(profilePath)) continue;
+            const profile = JSON.parse(fs.readFileSync(profilePath, 'utf-8'));
+            if (profile.feishuMcpUrl) {
+              mcpServers[`feishu_${entry.name}`] = { url: profile.feishuMcpUrl };
+              foundPerUser = true;
             }
-          }
-          // Do NOT add the default "feishu" server when authors.json exists.
-          // This prevents accidentally using the wrong user's MCP.
-          return;
+          } catch { /* skip */ }
         }
       }
-    } catch { /* ignore parse errors */ }
+    } catch { /* ignore */ }
+    if (foundPerUser) return;
 
     // Fallback: single-user (DM sessions) — feishu-mcp-url file
     const singleUrlFile = path.join(sessionDir, 'feishu-mcp-url');
@@ -556,15 +556,18 @@ exec node "${cliPath}" "$@"
           `Read(${sessionDir}/**)`,
           `Read(${sessionDir}/.claude/**)`,
           `Read(${projectRoot}/shared/**)`,
+          `Read(${projectRoot}/members/**)`,
           'Read(/tmp/**)', 'Read(/private/tmp/**)',
-          // Write/Edit: only current session (including .claude/), shared, tmp
+          // Write/Edit: only current session (including .claude/), shared, members, tmp
           `Write(${sessionDir}/**)`,
           `Write(${sessionDir}/.claude/**)`,
           `Write(${projectRoot}/shared/**)`,
+          `Write(${projectRoot}/members/**)`,
           'Write(/tmp/**)', 'Write(/private/tmp/**)',
           `Edit(${sessionDir}/**)`,
           `Edit(${sessionDir}/.claude/**)`,
           `Edit(${projectRoot}/shared/**)`,
+          `Edit(${projectRoot}/members/**)`,
           'Edit(/tmp/**)', 'Edit(/private/tmp/**)',
         ],
         deny: [

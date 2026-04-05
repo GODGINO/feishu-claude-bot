@@ -48,9 +48,7 @@ GIT_SSH_COMMAND="ssh -i ssh_key/id_ed25519 -o StrictHostKeyChecking=no -o UserKn
 1. 从消息前缀 `[发送者: 名字 | id: ou_xxx]` 提取 openId 和名字
 2. 引导用户打开 https://open.feishu.cn/page/mcp 获取 MCP 链接
 3. 收到链接后（以 `https://mcp.feishu.cn` 开头的 URL）：
-   - 读取 `authors.json`
-   - 设置该用户的 `feishuMcpUrl` 字段
-   - 写入更新后的 `authors.json`
+   - 用 Edit 工具更新 `members/{ou_xxx}/profile.json` 中的 `feishuMcpUrl` 字段
    - 执行 `touch .mcp-changed` 触发 MCP 配置热重载
 4. 验证绑定：尝试调用一个简单的飞书 MCP 工具确认连通性
 
@@ -60,4 +58,4 @@ GIT_SSH_COMMAND="ssh -i ssh_key/id_ed25519 -o StrictHostKeyChecking=no -o UserKn
 
 ## 管理命令
 
-用户说"查看已注册的开发者"时，读取 authors.json 展示各用户的绑定状态。
+用户说"查看已注册的开发者"时，扫描 `members/` 目录展示各用户的绑定状态。

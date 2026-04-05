@@ -316,31 +316,46 @@ export class CommandHandler {
     const sub = parts[1]?.toLowerCase();
 
     const ALIASES: Record<string, string> = {
-      opus: 'opus',
-      sonnet: 'sonnet',
-      haiku: 'haiku',
+      'opus': 'opus',
+      'opus 1m': 'claude-opus-4-6[1m]',
+      'sonnet': 'sonnet',
+      'sonnet 1m': 'claude-sonnet-4-6[1m]',
+      'haiku': 'haiku',
     };
 
-    if (sub && ALIASES[sub]) {
-      const model = ALIASES[sub];
+    const DISPLAY: Record<string, string> = {
+      'opus': 'Opus 200K',
+      'claude-opus-4-6[1m]': 'Opus 1M',
+      'sonnet': 'Sonnet 200K',
+      'claude-sonnet-4-6[1m]': 'Sonnet 1M',
+      'haiku': 'Haiku 200K',
+    };
+
+    const modelArg = parts.slice(1).join(' ').toLowerCase();
+    if (modelArg && ALIASES[modelArg]) {
+      const model = ALIASES[modelArg];
       fs.writeFileSync(modelFile, model);
-      // Reset process so it respawns with new model
-      this.runner.reset(ctx.sessionKey);
-      await this.sender.sendText(ctx.chatId, `✅ 模型已切换为 **${model}**，上下文已重置`, ctx.messageId);
+      this.runner.respawn(ctx.sessionKey);
+      await this.sender.sendText(ctx.chatId, `✅ 模型已切换为 **${DISPLAY[model] || model}**`, ctx.messageId);
       this.logger.info({ sessionKey: ctx.sessionKey, model }, '/model: switched');
-    } else {
+    } else if (!modelArg) {
       let current = 'sonnet';
       try { current = fs.readFileSync(modelFile, 'utf-8').trim(); } catch {}
       await this.sender.sendReply(ctx.chatId, [
-        `**当前模型: ${current}**`,
+        `**当前模型: ${DISPLAY[current] || current}**`,
         '',
-        '`/model sonnet` — Claude Sonnet（默认，快速均衡）',
-        '`/model opus` — Claude Opus（最强，适合复杂任务）',
-        '`/model haiku` — Claude Haiku（最快，适合简单任务）',
+        '`/model sonnet` — Sonnet 200K（默认，快速均衡）',
+        '`/model sonnet 1m` — Sonnet 1M（长上下文）',
+        '`/model opus` — Opus 200K（强力）',
+        '`/model opus 1m` — Opus 1M（最强，复杂任务）',
+        '`/model haiku` — Haiku 200K（最快，简单任务）',
       ].join('\n'), ctx.messageId);
+    } else {
+      await this.sender.sendText(ctx.chatId, `⚠️ 未知模型: ${modelArg}`, ctx.messageId);
     }
     return true;
   }
+
 
   private async handleHelp(ctx: CommandContext): Promise<boolean> {
     const helpText = [
