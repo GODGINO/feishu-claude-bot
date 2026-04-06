@@ -48,10 +48,20 @@ export interface SessionSummary {
   lastActiveAt: number | null;
 }
 
+export interface WechatBinding {
+  wechatUserId: string;
+  botToken: string;
+  ilinkBotId: string;
+  baseUrl: string;
+  boundAt: number;
+  status: 'active' | 'inactive';
+}
+
 export interface SessionDetail extends SessionSummary {
   authors: Record<string, { name: string; feishuMcpUrl?: string }>;
   sshPublicKey: string | null;
   model: string | null;
+  wechatBinding: WechatBinding | null;
 }
 
 export interface CronJob {
@@ -218,6 +228,8 @@ export const api = {
   // Author management
   deleteAuthor: (sessionKey: string, openId: string) =>
     mutate('DELETE', `/sessions/${sessionKey}/authors/${openId}`),
+  unbindWechat: (sessionKey: string) =>
+    mutate('DELETE', `/sessions/${sessionKey}/wechat`),
   updateAuthor: (sessionKey: string, openId: string, data: { name?: string; feishuMcpUrl?: string }) =>
     mutate('PUT', `/sessions/${sessionKey}/authors/${openId}`, data),
 

@@ -53,7 +53,7 @@ export default function OverviewTab({ session, sessionKey, onRefresh }: Props) {
         {session.type === 'group' ? (
           <AutoReplyCard sessionKey={sessionKey} initial={session.autoReply} />
         ) : (
-          <InfoCard label="Auto Reply" value="N/A (DM)" />
+          <WechatCard sessionKey={sessionKey} binding={session.wechatBinding} onRefresh={onRefresh} />
         )}
         <ModelCard sessionKey={sessionKey} initial={session.model} />
         <InfoCard label="Cron Jobs" value={String(session.cronJobCount)} />
@@ -376,6 +376,49 @@ function EnvSection({ sessionKey }: { sessionKey: string }) {
           <p className="text-xs text-slate-400 py-2">No environment variables. Add variables here for use in skill scripts via $KEY.</p>
         )}
       </div>
+    </div>
+  )
+}
+
+function WechatCard({ sessionKey, binding, onRefresh }: { sessionKey: string; binding: import('../lib/api').WechatBinding | null; onRefresh: () => void }) {
+  const [loading, setLoading] = useState(false)
+
+  const handleUnbind = async () => {
+    if (!confirm('确定解除微信绑定？')) return
+    setLoading(true)
+    try {
+      await api.unbindWechat(sessionKey)
+      onRefresh()
+    } finally { setLoading(false) }
+  }
+
+  if (!binding) {
+    return (
+      <div className="bg-white rounded-xl border border-slate-200 p-4">
+        <p className="text-xs text-slate-500 mb-1">WeChat</p>
+        <p className="text-sm text-slate-400">未绑定</p>
+      </div>
+    )
+  }
+
+  return (
+    <div className={`bg-white rounded-xl border border-slate-200 p-4 ${loading ? 'opacity-50' : ''}`}>
+      <div className="flex items-center justify-between mb-1">
+        <p className="text-xs text-slate-500">WeChat</p>
+        <button
+          onClick={handleUnbind}
+          disabled={loading}
+          className="text-xs text-red-400 hover:text-red-600 transition-colors"
+        >
+          解绑
+        </button>
+      </div>
+      <p className={`font-semibold text-sm ${binding.status === 'active' ? 'text-green-600' : 'text-slate-400'}`}>
+        {binding.status === 'active' ? '已绑定' : '已断开'}
+      </p>
+      <p className="text-xs text-slate-400 font-mono truncate mt-0.5" title={binding.wechatUserId}>
+        {binding.wechatUserId || '等待首条消息'}
+      </p>
     </div>
   )
 }

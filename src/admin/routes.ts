@@ -428,7 +428,19 @@ export function createRoutes(sessionsDir: string, feishuClient?: lark.Client): R
     const sshPubKeyPath = path.join(dir, 'ssh_key', 'id_ed25519.pub');
     const sshPublicKey = readText(sshPubKeyPath)?.trim() || null;
     const model = readText(path.join(dir, 'model'))?.trim() || null;
-    res.json({ ...summary, authors: sessionMembers, sshPublicKey, model });
+    const wechatBinding = readJson(path.join(dir, 'wechat-binding.json'));
+    res.json({ ...summary, authors: sessionMembers, sshPublicKey, model, wechatBinding });
+  });
+
+  // DELETE /api/sessions/:key/wechat — unbind WeChat
+  router.delete('/api/sessions/:key/wechat', (req: Request, res: Response) => {
+    const key = param(req, 'key');
+    const dir = path.join(sessionsDir, key);
+    if (!fs.existsSync(dir)) { res.status(404).json({ error: 'Session not found' }); return; }
+    for (const f of ['wechat-binding.json', 'wechat-sync.json', 'wechat-contexts.json']) {
+      try { fs.unlinkSync(path.join(dir, f)); } catch { /* ignore */ }
+    }
+    res.json({ ok: true });
   });
 
   // GET /api/sessions/:key/knowledge — CLAUDE.md
