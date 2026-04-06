@@ -15,6 +15,7 @@ import { EmailSetup } from './email-setup.js';
 import type { IdleMonitor } from '../email/idle-monitor.js';
 import { CardStreamer } from '../feishu/card-streamer.js';
 import type { MemberManager } from '../members/member-manager.js';
+import type { WechatBridge } from '../wechat/wechat-bridge.js';
 
 const TITLE_INSTRUCTION = '\n\n[当你的回复包含 markdown 格式（表格、列表、代码块、加粗、链接、分隔线等）时，必须在第一行写 <<TITLE:简短标题>>，然后空一行写正文。标题10字以内，概括主题。纯文字短回复（打招呼、一两句话确认）不要写标题。]';
 
@@ -53,6 +54,11 @@ export class MessageBridge {
   // Dedup: Feishu WebSocket can re-deliver events on reconnect, bypassing event-handler dedup
   private recentMessageIds = new Set<string>();
   private memberMgr?: MemberManager;
+  private wechatBridge?: WechatBridge;
+  // Track WeChat original text per session for combined Feishu echo+reply
+  private wechatPendingEcho = new Map<string, string>();
+  // Track Feishu original text per session for combined WeChat echo+reply
+  private feishuPendingEcho = new Map<string, string>();
 
 
   constructor(
@@ -109,7 +115,7 @@ export class MessageBridge {
           'Sending unsolicited result (background agent completion)',
         );
         await this.sender.sendReply(chatId, result.fullText, undefined, session.sessionDir);
-        await this.sendMentionedFiles(chatId, result.fullText, session.sessionDir);
+        await this.sendMentionedFiles(chatId, result.fullText, session.sessionDir, undefined, undefined, sessionKey);
       } catch (err) {
         this.logger.warn({ err, sessionKey }, 'Failed to send unsolicited result');
       }
@@ -128,6 +134,59 @@ export class MessageBridge {
   /** Set the MemberManager for per-user profile tracking. */
   setMemberManager(mgr: MemberManager): void {
     this.memberMgr = mgr;
+  }
+
+  /** Set the WeChat bridge for dual-send and message routing. */
+  setWechatBridge(bridge: WechatBridge): void {
+    this.wechatBridge = bridge;
+    this.commandHandler.setWechatBridge(bridge);
+    // Register callback for WeChat → Claude message routing
+    bridge.onWechatMessage(async (sessionKey, text, wechatUserId, attachments) => {
+      await this.handleWechatMessage(sessionKey, text, wechatUserId, attachments);
+    });
+  }
+
+  /** Handle a message from WeChat — route directly to Claude, then send combined reply to Feishu. */
+  private async handleWechatMessage(sessionKey: string, text: string, wechatUserId: string, attachments?: import('../wechat/wechat-bridge.js').WechatAttachment[]): Promise<void> {
+    const session = this.sessionMgr.getOrCreate(sessionKey);
+    const chatIdFile = path.join(session.sessionDir, 'chat-id');
+    let chatId = '';
+    try { chatId = fs.readFileSync(chatIdFile, 'utf-8').trim(); } catch { /* ignore */ }
+    if (!chatId) {
+      this.logger.warn({ sessionKey }, 'No chat-id for WeChat message routing');
+      return;
+    }
+
+    // Build prompt with sender context
+    const userId = sessionKey.replace('dm_', '');
+    const senderName = this.resolveSenderName(undefined, userId);
+    const mcpHint = getFeishuMcpHint(session.sessionDir, userId);
+    const prompt = `[发送者: ${senderName} | id: ${userId}]${mcpHint}\n${text}`;
+
+    this.logger.info({ sessionKey, textLen: text.length }, 'WeChat message → Claude');
+
+    // Store original WeChat text for combined Feishu echo after Claude replies
+    this.wechatPendingEcho.set(sessionKey, text);
+
+    // Build image attachments for Claude (vision)
+    let images: ImageAttachment[] | undefined;
+    if (attachments) {
+      const imgAtts = attachments.filter(a => a.base64 && a.mediaType.startsWith('image/'));
+      if (imgAtts.length > 0) {
+        images = imgAtts.map(a => ({ base64: a.base64!, mediaType: a.mediaType }));
+      }
+    }
+
+    // Run Claude and get reply (no replyToMessageId — WeChat messages don't have Feishu message IDs)
+    await this.executeAndReply({
+      sessionKey,
+      chatId,
+      prompt,
+      sessionDir: session.sessionDir,
+      replyToMessageId: undefined,
+      isNonMentionGroup: false,
+      images,
+    });
   }
 
   /** Resolve a display name: event name → member profile name → fallback. */
@@ -296,6 +355,11 @@ export class MessageBridge {
         this.groupContext.save(session.sessionDir, msg.chatId);
         return;
       }
+    }
+
+    // Store Feishu message for combined WeChat echo+reply (sent after Claude replies)
+    if (this.wechatBridge?.isActive(sessionKey) && msg.chatType === 'p2p') {
+      this.feishuPendingEcho.set(sessionKey, msg.text);
     }
 
     // Unified: all messages go through executeMessage
@@ -488,7 +552,7 @@ export class MessageBridge {
       await this.sender.sendReply(msg.chatId, `❌ 出错了: ${result.error}`, undefined, undefined, threadRootId);
     } else {
       await this.sender.sendReply(msg.chatId, replyText, undefined, session.sessionDir, threadRootId);
-      await this.sendMentionedFiles(msg.chatId, replyText, session.sessionDir, undefined, threadRootId);
+      await this.sendMentionedFiles(msg.chatId, replyText, session.sessionDir, undefined, threadRootId, sessionKey);
     }
 
     // Write bot reply to context buffer
@@ -687,6 +751,12 @@ export class MessageBridge {
     const { sessionKey, chatId, prompt, sessionDir, replyToMessageId, existingRootId, isNonMentionGroup, abortSignal, images, isCronJob } = opts;
 
     this.logger.info({ sessionKey, isNonMentionGroup, isCronJob }, 'Entering reply pipeline');
+
+    // Start WeChat typing indicator if bound
+    if (this.wechatBridge?.isActive(sessionKey)) {
+      this.wechatBridge.startTyping(sessionKey).catch(() => {});
+    }
+
     const streamer = new CardStreamer(this.sender.larkClient, this.logger);
 
     // Pass session info to streamer for button rendering + card cache
@@ -761,25 +831,43 @@ export class MessageBridge {
         images,
       });
 
+      const isFromWechat = this.wechatPendingEcho.has(sessionKey);
+
       let rawText = result.fullText || '';
       // Process <<REACT:emoji>> — send reactions only if there's a real message to react to
+      // For WeChat messages: keep REACT tags, apply them after the Feishu echo is sent
       if (replyToMessageId) {
         rawText = await this.processReactions(rawText, replyToMessageId);
-      } else {
-        // Cron job: strip REACT tags but don't send reactions (no message to react to)
+      } else if (!isFromWechat) {
+        // Cron job or other no-reply context: strip REACT tags
         rawText = rawText.replace(/<<REACT:\w+>>/g, '').trim();
       }
+      // For isFromWechat: REACT tags stay in rawText, extracted later in dual-send
       const replyText = rawText.replace(/<<THREAD>>\s*/g, '').trim();
       const streamRootId = existingRootId;
       const cleanText = replyText;
 
       if (replyText === 'NO_REPLY' || (!cardCreated && isNonMentionGroup && !replyText) || (!cardCreated && !replyText)) {
         // NO_REPLY or empty text without card — nothing to show
+      } else if (isFromWechat && cardCreated) {
+        // WeChat message with tools → card already streaming on Feishu.
+        // Complete the card with echo prepended, no separate text message needed.
+        const wechatEchoText = this.wechatPendingEcho.get(sessionKey);
+        const echoPrefix = wechatEchoText ? `> [来自微信] ${wechatEchoText}\n\n` : '';
+        await streamer.complete(echoPrefix + rawText || '(空回复)');
+        await this.sendMentionedFiles(chatId, cleanText, sessionDir, undefined, undefined, sessionKey);
+        this.wechatPendingEcho.delete(sessionKey); // consumed by card, skip dual-send Feishu
+        this.runner.onSubagentStream(sessionKey, undefined);
+      } else if (isFromWechat) {
+        // WeChat message without tools → no card, dual-send handles combined Feishu message.
+        this.logger.info({ sessionKey, textLen: cleanText.length }, 'WeChat message — Feishu reply deferred to dual-send');
+        await this.sendMentionedFiles(chatId, cleanText, sessionDir, undefined, undefined, sessionKey);
+        this.runner.onSubagentStream(sessionKey, undefined);
       } else if (runningAgents.size > 0) {
         if (!cardCreated) ensureCard();
         if (streamer.startPromise) await streamer.startPromise;
         streamer.completeTextOnly(rawText || '(空回复)');
-        await this.sendMentionedFiles(chatId, cleanText, sessionDir, undefined, streamRootId);
+        await this.sendMentionedFiles(chatId, cleanText, sessionDir, undefined, streamRootId, sessionKey);
         this.logger.info({ sessionKey, runningAgents: runningAgents.size }, 'Turn done but agents still running');
         setTimeout(() => {
           if (streamer.isWaitingForAgents()) {
@@ -792,7 +880,7 @@ export class MessageBridge {
         // No card, no buttons — send as plain text
         this.logger.info({ sessionKey, textLen: cleanText.length }, 'No tools used, sending plain text reply');
         await this.sender.sendReply(chatId, cleanText || '(空回复)', replyToMessageId, sessionDir, streamRootId);
-        await this.sendMentionedFiles(chatId, cleanText, sessionDir, undefined, streamRootId);
+        await this.sendMentionedFiles(chatId, cleanText, sessionDir, undefined, streamRootId, sessionKey);
         this.runner.onSubagentStream(sessionKey, undefined);
       } else {
         // Card exists (tools used) or buttons present — complete as card
@@ -802,7 +890,7 @@ export class MessageBridge {
           if (streamer.startPromise) await streamer.startPromise;
         }
         await streamer.complete(rawText || '(空回复)');
-        await this.sendMentionedFiles(chatId, cleanText, sessionDir, undefined, streamRootId);
+        await this.sendMentionedFiles(chatId, cleanText, sessionDir, undefined, streamRootId, sessionKey);
         this.runner.onSubagentStream(sessionKey, undefined);
       }
 
@@ -840,6 +928,48 @@ export class MessageBridge {
       this.runner.onTextStream(sessionKey, undefined);
       this.runner.onToolStream(sessionKey, undefined);
 
+      // WeChat dual-send
+      if (this.wechatBridge?.isActive(sessionKey) && bufferedText && bufferedText !== 'NO_REPLY') {
+        const wechatEcho = this.wechatPendingEcho.get(sessionKey);
+        const feishuEcho = this.feishuPendingEcho.get(sessionKey);
+        this.wechatPendingEcho.delete(sessionKey);
+        this.feishuPendingEcho.delete(sessionKey);
+
+        if (wechatEcho) {
+          // Message from WeChat → send reply to WeChat + combined echo+reply to Feishu
+          this.wechatBridge.sendToWechat(sessionKey, bufferedText).catch(err => {
+            this.logger.warn({ err, sessionKey }, 'Failed to send reply to WeChat');
+          });
+          // Strip REACT tags from display text, collect them for the Feishu message
+          const reactPattern = /<<REACT:(\w+)>>/g;
+          const reactEmojis: string[] = [];
+          let displayText = bufferedText.replace(reactPattern, (_, emoji) => { reactEmojis.push(emoji); return ''; }).trim();
+          const combined = `> [来自微信] ${wechatEcho}\n\n${displayText}`;
+          this.sender.sendReply(chatId, combined, undefined, sessionDir).then(msgId => {
+            // Apply REACT emojis to the sent Feishu echo message
+            if (msgId && reactEmojis.length > 0) {
+              for (const emoji of reactEmojis) {
+                this.processReactions(`<<REACT:${emoji}>>`, msgId).catch(() => {});
+              }
+            }
+          }).catch(err => {
+            this.logger.warn({ err, sessionKey }, 'Failed to send combined WeChat echo to Feishu');
+          });
+        } else {
+          // Message from Feishu → send combined echo+reply to WeChat
+          if (feishuEcho) {
+            // Strip markers from reply, then combine with echo prefix
+            this.wechatBridge.sendToWechat(sessionKey, `\`[来自飞书] ${feishuEcho}\`\n\n${bufferedText}`).catch(err => {
+              this.logger.warn({ err, sessionKey }, 'Failed to send reply to WeChat');
+            });
+          } else {
+            this.wechatBridge.sendToWechat(sessionKey, bufferedText).catch(err => {
+              this.logger.warn({ err, sessionKey }, 'Failed to send reply to WeChat');
+            });
+          }
+        }
+      }
+
       const pipelineElapsed = Date.now() - streamer['startTime'];
       const replyMode = cardCreated ? 'card' : (bufferedText ? 'text' : 'empty');
       this.logger.info({ sessionKey, replyMode, elapsed: pipelineElapsed, isCronJob }, 'Reply pipeline done');
@@ -856,6 +986,7 @@ export class MessageBridge {
     sessionDir: string,
     replyToMessageId?: string,
     rootId?: string,
+    sessionKey?: string,
   ): Promise<void> {
     try {
       // Match absolute paths that look like files (with extensions)
@@ -895,8 +1026,14 @@ export class MessageBridge {
         } else {
           await this.sender.sendFile(chatId, filePath, undefined, rootId);
         }
-
         this.logger.info({ filePath }, 'Sent file to Feishu');
+
+        // Also send to WeChat if bound
+        if (sessionKey && this.wechatBridge?.isActive(sessionKey)) {
+          this.wechatBridge.sendFileToWechat(sessionKey, filePath).catch(err => {
+            this.logger.warn({ err, filePath }, 'Failed to send file to WeChat');
+          });
+        }
       }
     } catch (err) {
       this.logger.warn({ err }, 'Failed to send mentioned files');

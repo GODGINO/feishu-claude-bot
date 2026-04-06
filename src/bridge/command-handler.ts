@@ -7,6 +7,7 @@ import { AccountStore } from '../email/account-store.js';
 import { loadRules, saveRules } from '../email/email-processor.js';
 import type { EmailSetup } from './email-setup.js';
 import type { IdleMonitor } from '../email/idle-monitor.js';
+import type { WechatBridge } from '../wechat/wechat-bridge.js';
 
 export interface CommandContext {
   chatId: string;
@@ -23,6 +24,7 @@ export interface CommandContext {
 export class CommandHandler {
   private emailSetup: EmailSetup | null = null;
   private idleMonitor: IdleMonitor | null = null;
+  private wechatBridge: WechatBridge | null = null;
 
   constructor(
     private sender: MessageSender,
@@ -39,6 +41,10 @@ export class CommandHandler {
 
   setIdleMonitor(monitor: IdleMonitor): void {
     this.idleMonitor = monitor;
+  }
+
+  setWechatBridge(bridge: WechatBridge): void {
+    this.wechatBridge = bridge;
   }
 
   async handle(text: string, ctx: CommandContext): Promise<boolean> {
@@ -67,6 +73,9 @@ export class CommandHandler {
     }
     if (cmd === '/model' || cmd.startsWith('/model ')) {
       return this.handleModel(text.trim(), ctx);
+    }
+    if (cmd === '/wechat' || cmd.startsWith('/wechat ')) {
+      return this.handleWechat(text.trim(), ctx);
     }
 
     return false;
@@ -357,6 +366,43 @@ export class CommandHandler {
   }
 
 
+  private async handleWechat(text: string, ctx: CommandContext): Promise<boolean> {
+    // Only allow in DM
+    if (ctx.sessionKey.startsWith('group_')) {
+      await this.sender.sendText(
+        ctx.chatId,
+        '⚠️ 微信绑定需要在私聊中操作\n\n微信号属于个人账号，绑定信息不适合在群聊中展示。请私聊 Sigma 发送 /wechat 完成绑定。',
+        ctx.messageId,
+      );
+      return true;
+    }
+
+    if (!this.wechatBridge) {
+      await this.sender.sendText(ctx.chatId, '⚠️ 微信桥接功能未启用', ctx.messageId);
+      return true;
+    }
+
+    const parts = text.split(/\s+/);
+    const sub = parts[1]?.toLowerCase() || '';
+
+    switch (sub) {
+      case 'status':
+        await this.wechatBridge.showStatus(ctx.sessionKey, ctx.chatId, ctx.messageId);
+        break;
+      case 'unbind':
+        await this.wechatBridge.unbind(ctx.sessionKey, ctx.chatId, ctx.messageId);
+        break;
+      case 'rebind':
+        await this.wechatBridge.rebind(ctx.sessionKey, ctx.chatId, ctx.messageId);
+        break;
+      default:
+        // /wechat or /wechat bind — start binding
+        await this.wechatBridge.startBinding(ctx.sessionKey, ctx.chatId, ctx.messageId);
+        break;
+    }
+    return true;
+  }
+
   private async handleHelp(ctx: CommandContext): Promise<boolean> {
     const helpText = [
       '**可用命令**',
@@ -368,6 +414,7 @@ export class CommandHandler {
       '`/register` — 注册开发者身份（Git + 飞书 MCP）',
       '`/auto [on|off|always]` — 群聊自动回复（on=AI判断, off=仅@回复, always=全部回复）',
       '`/model [sonnet|opus|haiku]` — 切换 AI 模型',
+      '`/wechat` — 绑定微信（扫码后微信消息同步，共享 Claude 会话，仅私聊）',
       '`/help` — 显示此帮助信息',
       '',
       '直接发送消息即可与 Claude 对话。Claude 可以读写文件、执行命令等。',

@@ -16,6 +16,7 @@ import { execSync } from 'node:child_process';
 import { IdleMonitor } from './email/idle-monitor.js';
 import { EmailProcessor, formatPushNotification } from './email/email-processor.js';
 import { startAdminServer } from './admin/server.js';
+import { WechatBridge } from './wechat/wechat-bridge.js';
 
 /**
  * Ensure only one bot instance runs at a time.
@@ -124,6 +125,12 @@ async function main() {
   const bridge = new MessageBridge(sender, typing, runner, sessionMgr, config, logger);
   bridge.setMemberManager(memberMgr);
 
+  // Initialize WeChat bridge (addon layer for DM sessions)
+  const wechatBridge = new WechatBridge(sender, sessionMgr, config.sessionsDir, logger);
+  bridge.setWechatBridge(wechatBridge);
+  wechatBridge.start(); // scan for existing bindings, resume polling
+  logger.info('WeChat bridge initialized');
+
   // Route all messages through the bridge
   onMessage(async (msg) => {
     await bridge.handleMessage(msg);
@@ -187,6 +194,7 @@ async function main() {
   const shutdown = () => {
     logger.info('Shutting down...');
     relayServer.destroy();
+    wechatBridge.stopAll();
     idleMonitor.stopAll();
     chromeChecker.stop();
     scheduler.stop();

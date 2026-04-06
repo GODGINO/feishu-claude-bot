@@ -20,3 +20,4 @@ _email_processor/
 web/dist/
 /members/
 /shared/
+usage-stats.json
