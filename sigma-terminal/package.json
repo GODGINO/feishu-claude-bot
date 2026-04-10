@@ -10,6 +10,7 @@
     "dev": "tsc && electron ."
   },
   "dependencies": {
+    "@nut-tree-fork/nut-js": "^4.2.6",
     "electron-store": "^8.2.0",
     "fast-glob": "^3.3.3",
     "ws": "^8.18.0"

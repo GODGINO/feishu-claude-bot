@@ -23,3 +23,11 @@ dmg:
       y: 220
       type: link
       path: /Applications
+win:
+  icon: assets/icon.ico
+  target:
+    - dir
+nsis:
+  oneClick: true
+  allowToChangeInstallationDirectory: false
+  shortcutName: Sigma Terminal
