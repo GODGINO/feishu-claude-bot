@@ -595,13 +595,26 @@ export class WechatBridge {
   // --- Helpers ---
 
   private stripFeishuMarkers(text: string): string {
-    return text
+    // Convert <<BUTTON:label|action|type?>> tags to numbered list
+    const buttons: string[] = [];
+    let cleaned = text.replace(/<<BUTTON:([^|>]+)\|[^>]*>>\s*/g, (_, label) => {
+      buttons.push(label.trim());
+      return '';
+    });
+
+    cleaned = cleaned
       .replace(/<<TITLE:.*?>>/g, '')
       .replace(/<<REACT:\w+>>/g, '')
-      .replace(/<<BUTTON:[^>]+>>/g, '')
       .replace(/<<THREAD>>/g, '')
       .replace(/^\n+/, '')
       .trim();
+
+    // Append buttons as numbered list
+    if (buttons.length > 0) {
+      cleaned += '\n\n' + buttons.map((b, i) => `${i + 1}. ${b}`).join('\n');
+    }
+
+    return cleaned;
   }
 
   private sleep(ms: number): Promise<void> {

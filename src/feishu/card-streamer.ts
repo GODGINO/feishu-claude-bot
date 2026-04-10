@@ -12,9 +12,9 @@ import {
   buildCompleteCard,
   extractButtons,
   STREAMING_ELEMENT_ID,
-  TOOL_CALLS_ELEMENT_ID,
   type ToolCallInfo,
   type ButtonInfo,
+  type UsageInfo,
 } from './card-builder.js';
 
 const THROTTLE_MS = 500; // Minimum interval between card updates
@@ -125,7 +125,7 @@ export class CardStreamer {
     if (this.messageSent || !this.cardId) return;
     this.messageSent = true;
 
-    const wantsThread = text?.includes('<<THREAD>>') || false;
+    const wantsThread = false; // Thread creation disabled — only follow existing threads via existingRootId
 
     this.logger.info({
       cardId: this.cardId,
@@ -240,12 +240,30 @@ export class CardStreamer {
     if (tc) {
       tc.status = status;
       tc.endTime = Date.now();
+      // Cascade: when an Agent finishes, also mark any still-running children as complete.
+      // Guards against races where completeSubagentSteps missed children.
+      if (tc.children && tc.children.length > 0) {
+        for (const child of tc.children) {
+          if (child.status === 'running') {
+            child.status = 'complete';
+            child.endTime = Date.now();
+          }
+        }
+      }
     }
     if (!tc) {
       const running = [...this.toolCalls].reverse().find(t => t.status === 'running');
       if (running) {
         running.status = status;
         running.endTime = Date.now();
+        if (running.children && running.children.length > 0) {
+          for (const child of running.children) {
+            if (child.status === 'running') {
+              child.status = 'complete';
+              child.endTime = Date.now();
+            }
+          }
+        }
       }
     }
     // Trigger card update to reflect tool status change
@@ -256,7 +274,7 @@ export class CardStreamer {
   /**
    * Finalize the card with complete content.
    */
-  async complete(fullText: string): Promise<void> {
+  async complete(fullText: string, usage?: UsageInfo): Promise<void> {
     // Wait for lazy start() to finish before completing
     if (this.startPromise) {
       await this.startPromise;
@@ -326,6 +344,7 @@ export class CardStreamer {
         this.chatId,
         this.cardId || undefined,
         this.messageId || undefined,
+        usage,
       );
 
       // Cache card state for button click updates

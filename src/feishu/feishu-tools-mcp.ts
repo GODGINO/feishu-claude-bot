@@ -28,6 +28,7 @@ const ALL_SCOPES = [
   'calendar:calendar:read', 'calendar:calendar.event:create', 'calendar:calendar.event:read',
   'calendar:calendar.event:update', 'calendar:calendar.event:delete',
   'base:record:create', 'base:record:retrieve', 'base:record:update', 'base:record:delete',
+  'minutes:minutes.basic:read', 'minutes:minutes.transcript:export',
 ];
 
 // Pending device flows (in-memory, keyed by user_id)
@@ -808,6 +809,88 @@ server.tool(
         records: resp.data?.records || [],
         total: resp.data?.records?.length || 0,
       }, null, 2));
+    } catch (e: any) {
+      return err(e.message);
+    }
+  },
+);
+
+// ============ Minutes (妙记) Tools ============
+
+server.tool(
+  'feishu_minutes_get_info',
+  'Get meeting minutes (妙记) metadata: title, duration, participants, cover image, URL. Extract minute_token from a minutes URL like https://xxx.feishu.cn/minutes/obcnxxxxxx — the token is the last path segment.',
+  {
+    user_id: z.string().describe('User open ID (ou_xxx)'),
+    minute_token: z.string().describe('Minutes token (from URL path, e.g. obcnxxxxxx)'),
+  },
+  async (args) => {
+    const auth = await getUserToken(args.user_id);
+    if (auth.error) return auth.error;
+
+    try {
+      const resp = await (client.minutes.v1.minute.get as any)({
+        path: { minute_token: args.minute_token },
+        params: { user_id_type: 'open_id' },
+      }, withUAT(auth.token!));
+
+      if (resp?.code !== 0) {
+        return err(`Minutes get failed: ${resp?.msg || JSON.stringify(resp)}`);
+      }
+      const data = resp.data?.minute || {};
+      return ok(JSON.stringify({
+        title: data.title,
+        url: data.url,
+        duration: data.duration ? `${Math.floor(data.duration / 60)}m${data.duration % 60}s` : undefined,
+        owner: data.owner,
+        create_time: data.create_time,
+        cover: data.cover,
+        note_id: data.note_id,
+      }, null, 2));
+    } catch (e: any) {
+      return err(e.message);
+    }
+  },
+);
+
+server.tool(
+  'feishu_minutes_get_transcript',
+  'Export meeting minutes (妙记) transcript text with speaker identification. Returns the full transcription with speaker names and optional timestamps.',
+  {
+    user_id: z.string().describe('User open ID (ou_xxx)'),
+    minute_token: z.string().describe('Minutes token (from URL path)'),
+    need_speaker: z.boolean().default(true).describe('Include speaker names in transcript'),
+    need_timestamp: z.boolean().default(false).describe('Include timestamps in transcript'),
+  },
+  async (args) => {
+    const auth = await getUserToken(args.user_id);
+    if (auth.error) return auth.error;
+
+    try {
+      const resp = await (client.minutes.v1.minuteTranscript.get as any)({
+        path: { minute_token: args.minute_token },
+        params: {
+          need_speaker: args.need_speaker,
+          need_timestamp: args.need_timestamp,
+          file_format: 'txt',
+        },
+      }, withUAT(auth.token!));
+
+      // Transcript API returns binary file stream — convert to string
+      if (resp instanceof Buffer) {
+        return ok(resp.toString('utf-8'));
+      }
+      if (resp instanceof ArrayBuffer) {
+        return ok(new TextDecoder().decode(resp));
+      }
+      // Some SDK versions return the data differently
+      if (resp?.code !== undefined && resp.code !== 0) {
+        return err(`Transcript export failed: ${resp?.msg || JSON.stringify(resp)}`);
+      }
+      // If resp is already a string or has data
+      if (typeof resp === 'string') return ok(resp);
+      if (resp?.data) return ok(typeof resp.data === 'string' ? resp.data : JSON.stringify(resp.data));
+      return ok(String(resp));
     } catch (e: any) {
       return err(e.message);
     }

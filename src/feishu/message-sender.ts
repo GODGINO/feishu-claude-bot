@@ -50,6 +50,88 @@ export class MessageSender {
   }
 
   /**
+   * Fetch the full body of a forwarded email card via Mail API.
+   * Parses cardId/ownerId from the card_link URL, then calls get_by_card → get.
+   *
+   * Requires env FEISHU_MAIL_USER_MAILBOX — any valid Feishu tenant email address.
+   * Tenant access token cannot use 'me', and any tenant member's mailbox can fetch any forward card.
+   */
+  async fetchForwardedEmailBody(cardLinkUrl: string): Promise<string | null> {
+    try {
+      const userMailbox = process.env.FEISHU_MAIL_USER_MAILBOX;
+      if (!userMailbox) {
+        this.logger.warn('FEISHU_MAIL_USER_MAILBOX not set, cannot fetch email body');
+        return null;
+      }
+
+      // Parse cardId and ownerId from URL like:
+      // lark://applink.feishu.cn/client/mail/forward/card?cardId=xxx&ownerId=yyy&threadId=zzz
+      const queryStr = cardLinkUrl.split('?')[1] || '';
+      const params = new URLSearchParams(queryStr);
+      const cardId = params.get('cardId');
+      const ownerId = params.get('ownerId');
+      if (!cardId || !ownerId) {
+        this.logger.warn({ cardLinkUrl }, 'Cannot parse cardId/ownerId from card link');
+        return null;
+      }
+
+      // Step 1: get_by_card → message_id
+      const cardResp = await (this._client.mail as any).v1.userMailboxMessage.getByCard({
+        path: { user_mailbox_id: userMailbox },
+        params: { card_id: cardId, owner_id: ownerId },
+      });
+      const messageIds: string[] = cardResp?.data?.message_ids || [];
+      if (messageIds.length === 0) {
+        this.logger.warn({ cardId, ownerId }, 'No message_ids returned from get_by_card');
+        return null;
+      }
+
+      // Step 2: fetch full email body
+      const msgResp = await (this._client.mail as any).v1.userMailboxMessage.get({
+        path: { user_mailbox_id: userMailbox, message_id: messageIds[0] },
+        params: { format: 'full' } as any,
+      });
+      // Note: Feishu API wraps it as data.message, not data directly
+      const mail = msgResp?.data?.message;
+      if (!mail) {
+        this.logger.warn({ resp: JSON.stringify(msgResp?.data) }, 'No message in mail get response');
+        return null;
+      }
+
+      // Decode base64url body (prefer plain text)
+      const decode = (b64url: string): string => {
+        try {
+          const b64 = b64url.replace(/-/g, '+').replace(/_/g, '/');
+          const padded = b64 + '='.repeat((4 - b64.length % 4) % 4);
+          return Buffer.from(padded, 'base64').toString('utf-8');
+        } catch { return ''; }
+      };
+
+      const subject = mail.subject || '';
+      const from = mail.head_from?.mail_address || mail.head_from?.name || '';
+      const bodyPlain = mail.body_plain_text ? decode(mail.body_plain_text) : '';
+      const bodyHtml = mail.body_html ? decode(mail.body_html) : '';
+
+      // Strip HTML tags as fallback if no plain text
+      let body = bodyPlain;
+      if (!body && bodyHtml) {
+        body = bodyHtml.replace(/<[^>]+>/g, '').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim();
+      }
+
+      const parts: string[] = [];
+      if (subject) parts.push(`主题: ${subject}`);
+      if (from) parts.push(`发件人: ${from}`);
+      if (body) parts.push(`\n${body}`);
+
+      this.logger.info({ subject, bodyLen: body.length }, 'Fetched forwarded email body');
+      return parts.join('\n') || null;
+    } catch (err) {
+      this.logger.warn({ err: (err as any)?.message || err, cardLinkUrl }, 'Failed to fetch forwarded email body');
+      return null;
+    }
+  }
+
+  /**
    * Fetch the text content of a message by its ID (for quoted message support)
    */
   async fetchMessageText(messageId: string): Promise<string | null> {
@@ -81,13 +163,49 @@ export class MessageSender {
         return parts.join('') || null;
       }
       if (msgType === 'interactive') {
-        // Card message - try to extract markdown content
-        const elements = content.body?.elements || content.elements || [];
+        // Card message - extract text content from various possible structures
         const parts: string[] = [];
-        for (const el of elements) {
-          if (el.tag === 'markdown') parts.push(el.content || '');
-          else if (el.tag === 'div' && el.text) parts.push(el.text.content || '');
+
+        // Title (forwarded email cards have this)
+        if (content.title) parts.push(content.title);
+
+        // Detect forwarded email card by card_link.url
+        const cardLinkUrl: string = content.card_link?.url || '';
+        const isMailForward = cardLinkUrl.includes('mail/forward/card');
+        if (isMailForward) {
+          const fullBody = await this.fetchForwardedEmailBody(cardLinkUrl);
+          if (fullBody) {
+            parts.push(fullBody);
+            return parts.join('\n');
+          }
+          // Fallback to elements parsing if API fails
         }
+
+        // Format 1: body.elements (Sigma-generated cards with markdown)
+        const bodyElements = content.body?.elements;
+        if (Array.isArray(bodyElements)) {
+          for (const el of bodyElements) {
+            if (el.tag === 'markdown') parts.push(el.content || '');
+            else if (el.tag === 'div' && el.text) parts.push(el.text.content || '');
+          }
+        }
+
+        // Format 2: top-level elements as nested arrays (forwarded emails)
+        const topElements = content.elements;
+        if (Array.isArray(topElements)) {
+          for (const line of topElements) {
+            if (Array.isArray(line)) {
+              for (const el of line) {
+                if (el.tag === 'text' && el.text) parts.push(el.text);
+                else if (el.tag === 'a' && (el.text || el.href)) parts.push(el.text || el.href);
+              }
+            } else if (line && typeof line === 'object') {
+              // Single object (not array) — Sigma's card_link format
+              if ((line as any).tag === 'markdown') parts.push((line as any).content || '');
+            }
+          }
+        }
+
         return parts.join('\n') || null;
       }
 
@@ -558,7 +676,7 @@ function detectRenderMode(text: string): 'card' | 'text' {
     /^[-*]\s/m.test(text) ||             // Unordered lists
     /^\d+\.\s/m.test(text) ||            // Ordered lists
     /\*\*.+?\*\*/.test(text) ||          // Bold text
-    /<<TITLE:.+?>>/.test(text) ||        // Has explicit title
+    /<{1,2}TITLE:.+?>{1,2}/.test(text) ||// Has explicit title (robust to single brackets)
     /<at\s+id=/.test(text) ||            // @mentions (only work in card markdown)
     text.length > 300;                    // Moderate length text
 
@@ -566,17 +684,21 @@ function detectRenderMode(text: string): 'card' | 'text' {
 }
 
 /**
- * Extract <<TITLE:...>> tag from text. Returns { title, body } where body has the tag removed.
+ * Extract <<TITLE:...>> tag from text. Robust to single/double brackets and stray spaces.
+ * Returns { title, body } where body has the tag removed. title is empty when not present.
  */
 function extractTitle(text: string): { title: string; body: string } {
-  const match = text.match(/^<<TITLE:(.+?)>>\s*\n?/);
+  // Match TITLE tag anywhere in text — accept 1-2 angle brackets on each side
+  const match = text.match(/<{1,2}\s*TITLE\s*:\s*(.+?)\s*>{1,2}\s*\n?/);
   if (match) {
+    const body = text.slice(0, match.index).concat(text.slice((match.index || 0) + match[0].length))
+      .replace(/^\n+/, '');
     return {
       title: match[1].trim().slice(0, 40),
-      body: text.slice(match[0].length).replace(/^\n/, ''),
+      body,
     };
   }
-  return { title: 'Σ Sigma', body: text };
+  return { title: '', body: text };
 }
 
 /**
@@ -588,17 +710,21 @@ function buildMarkdownCard(text: string): object {
   // Truncate if too long for card (Feishu limit ~28000 chars)
   const truncated = body.length > 28000 ? body.slice(0, 28000) + '\n\n...(内容已截断)' : body;
 
-  return {
+  const card: any = {
     schema: '2.0',
     config: { wide_screen_mode: true },
-    header: {
-      title: { tag: 'plain_text', content: title },
-      template: 'green',
-    },
     body: {
       elements: [{ tag: 'markdown', content: truncated }],
     },
   };
+  // Only render header when bot emitted a TITLE tag
+  if (title) {
+    card.header = {
+      title: { tag: 'plain_text', content: title },
+      template: 'blue',
+    };
+  }
+  return card;
 }
 
 /**

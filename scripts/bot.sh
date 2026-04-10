@@ -3,6 +3,14 @@
 # 用法: bash scripts/bot.sh [start|stop|status|restart|log]
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+
+# Load .env if present (export vars for subprocesses)
+if [ -f "$PROJECT_DIR/.env" ]; then
+  set -a
+  source "$PROJECT_DIR/.env"
+  set +a
+fi
+
 CF_PID_FILE="$PROJECT_DIR/.cf-tunnel.pid"
 CF_URL_FILE="$PROJECT_DIR/.cf-tunnel.url"
 CF_LOG_FILE="$PROJECT_DIR/.cf-tunnel.log"
@@ -53,8 +61,9 @@ restart() {
   cd "$PROJECT_DIR"
   npx tsc 2>&1 && echo "TypeScript 编译完成" || echo "TypeScript 编译失败"
   if is_running; then
-    pm2_cmd restart "$APP_NAME"
+    pm2_cmd restart "$APP_NAME" --update-env
     echo "Bot 已重启"
+    start_tunnel
   else
     start
   fi

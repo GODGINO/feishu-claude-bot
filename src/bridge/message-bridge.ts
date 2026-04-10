@@ -226,6 +226,20 @@ export class MessageBridge {
     this.recentMessageIds.add(msg.messageId);
     setTimeout(() => this.recentMessageIds.delete(msg.messageId), 600_000);
 
+    // For interactive (card) messages — event payload may be truncated.
+    // Fetch full content via API (esp. for forwarded emails).
+    if (msg.messageType === 'interactive') {
+      try {
+        const fullText = await this.sender.fetchMessageText(msg.messageId);
+        if (fullText && fullText.length > msg.text.length) {
+          this.logger.info({ messageId: msg.messageId, oldLen: msg.text.length, newLen: fullText.length }, 'Fetched full interactive content');
+          msg.text = fullText;
+        }
+      } catch (err) {
+        this.logger.warn({ err, messageId: msg.messageId }, 'Failed to fetch full interactive content');
+      }
+    }
+
     const sessionKey = SessionManager.getSessionKey(msg.chatType, msg.userId, msg.chatId);
 
     // Persist chatId mapping for cron job delivery (DM sessionKey can't derive chatId)
@@ -380,8 +394,9 @@ export class MessageBridge {
     }
     const isNonMentionGroup = msg.chatType === 'group' && !msg.isMentioned && autoReplyMode !== 'always';
 
-    // Thread reply: auto-inherit if user's message is already in a thread.
-    const existingRootId = msg.rootId;
+    // Thread reply: only follow thread if message is actually in a thread (has thread_id).
+    // root_id alone may just be from quote-reply (not a real thread).
+    const existingRootId = msg.threadId ? msg.rootId : undefined;
     let threadRootId: string | undefined = existingRootId;
 
     // Start typing indicator (THINKING emoji for non-@mention, normal for @mention)
@@ -645,6 +660,11 @@ export class MessageBridge {
 
     this.logger.info({ sessionKey, label, userName, messageId }, 'Executing button action via reply pipeline');
 
+    // Store button echo for WeChat dual-send
+    if (this.wechatBridge?.isActive(sessionKey)) {
+      this.feishuPendingEcho.set(sessionKey, `${userName} 点击了按钮: ${label}`);
+    }
+
     this.runningTasks.add(sessionKey);
     const abortController = new AbortController();
     this.abortControllers.set(sessionKey, abortController);
@@ -847,14 +867,18 @@ export class MessageBridge {
       const streamRootId = existingRootId;
       const cleanText = replyText;
 
-      if (replyText === 'NO_REPLY' || (!cardCreated && isNonMentionGroup && !replyText) || (!cardCreated && !replyText)) {
+      if (replyText === 'NO_REPLY' || (!cardCreated && !cardCreating && isNonMentionGroup && !replyText) || (!cardCreated && !cardCreating && !replyText)) {
         // NO_REPLY or empty text without card — nothing to show
       } else if (isFromWechat && cardCreated) {
         // WeChat message with tools → card already streaming on Feishu.
         // Complete the card with echo prepended, no separate text message needed.
         const wechatEchoText = this.wechatPendingEcho.get(sessionKey);
         const echoPrefix = wechatEchoText ? `> [来自微信] ${wechatEchoText}\n\n` : '';
-        await streamer.complete(echoPrefix + rawText || '(空回复)');
+        await streamer.complete(echoPrefix + rawText || '(空回复)', {
+          inputTokens: result.inputTokens,
+          outputTokens: result.outputTokens,
+          costUsd: result.costUsd,
+        });
         await this.sendMentionedFiles(chatId, cleanText, sessionDir, undefined, undefined, sessionKey);
         this.wechatPendingEcho.delete(sessionKey); // consumed by card, skip dual-send Feishu
         this.runner.onSubagentStream(sessionKey, undefined);
@@ -876,20 +900,24 @@ export class MessageBridge {
             this.runner.onSubagentStream(sessionKey, undefined);
           }
         }, 30 * 60 * 1000);
-      } else if (!cardCreated && !rawText.includes('<<BUTTON:')) {
+      } else if (!cardCreated && !cardCreating && !rawText.includes('<<BUTTON:')) {
         // No card, no buttons — send as plain text
         this.logger.info({ sessionKey, textLen: cleanText.length }, 'No tools used, sending plain text reply');
         await this.sender.sendReply(chatId, cleanText || '(空回复)', replyToMessageId, sessionDir, streamRootId);
         await this.sendMentionedFiles(chatId, cleanText, sessionDir, undefined, streamRootId, sessionKey);
         this.runner.onSubagentStream(sessionKey, undefined);
       } else {
-        // Card exists (tools used) or buttons present — complete as card
+        // Card exists (or in flight), or buttons present — complete as card
         if (!cardCreated) {
-          // Buttons present but no card yet — create card now
-          ensureCard();
+          // Card still being created (race) or buttons present without card — wait/create
+          if (!cardCreating) ensureCard();
           if (streamer.startPromise) await streamer.startPromise;
         }
-        await streamer.complete(rawText || '(空回复)');
+        await streamer.complete(rawText || '(空回复)', {
+          inputTokens: result.inputTokens,
+          outputTokens: result.outputTokens,
+          costUsd: result.costUsd,
+        });
         await this.sendMentionedFiles(chatId, cleanText, sessionDir, undefined, streamRootId, sessionKey);
         this.runner.onSubagentStream(sessionKey, undefined);
       }
@@ -1013,7 +1041,7 @@ export class MessageBridge {
       for (const filePath of uniquePaths) {
         if (!fs.existsSync(filePath)) continue;
 
-        // Skip very large files (> 30MB)
+        // Skip very large files (> 30MB, Feishu IM upload API limit)
         const stat = fs.statSync(filePath);
         if (stat.size > 30 * 1024 * 1024) {
           this.logger.warn({ filePath, sizeMB: Math.round(stat.size / 1024 / 1024) }, 'File too large to send');

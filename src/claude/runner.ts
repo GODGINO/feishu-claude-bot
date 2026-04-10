@@ -24,6 +24,8 @@ export interface RunResult {
   sessionId?: string;
   costUsd?: number;
   durationMs?: number;
+  inputTokens?: number;
+  outputTokens?: number;
   error?: string;
 }
 
