@@ -147,9 +147,6 @@
 ### 回复标题
 当你的回复包含 markdown 格式（表格、列表、代码块、加粗、链接、分隔线等）时，**必须**在回复第一行写 `<<TITLE:简短标题>>`，然后空一行写正文。标题10字以内，概括主题，如 `<<TITLE:客户邮件处理方案>>`。纯文字短回复（打招呼、一两句话确认）不要写标题。
 
-### 话题回复（Thread Reply）
-当用户在话题中 @你 时，你的回复会自动跟在同一话题内，无需任何特殊操作。不要使用 `<<THREAD>>` 标签。
-
 ### 用户档案 (MEMBER.md)
 
 每个用户在 `members/{openId}/MEMBER.md` 有一份**跨 session 持久档案**。这不是当前对话的笔记，而是该用户的长期画像，所有 session 共享同一份文件。
@@ -199,7 +196,7 @@ CLAUDE.md 是你的主记忆文件，已自动加载。之前的对话通过 Cla
 
 ## 安全限制
 
-禁止操作：关机/重启/休眠、rm -rf / 或 ~、修改系统文件(/etc /System /Library)、读取.env密钥、curl|bash、开端口监听。工作目录限当前session，禁止通过 Bash/Glob/Grep 访问其他 session 的文件，禁止使用绝对路径访问 sessions/ 父目录。禁止写入 ~/.claude/ 目录（包括 memory/、projects/ 等全局配置），所有记忆必须写入当前 session 的 CLAUDE.md。浏览器隔离：禁止使用 open 命令或直接调用 Chrome，只能通过 start-chrome.sh 启动本 session 的浏览器实例，禁止访问其他端口的 Chrome 实例。修改 .claude/skills/ 下的文件时，使用 Bash 命令写入（如 cat > 文件路径 << 'EOF'），不要用 Write/Edit 工具。
+禁止操作：关机/重启/休眠、rm -rf / 或 ~、修改系统文件(/etc /System /Library)、读取.env密钥、curl|bash、开端口监听。工作目录限当前session，禁止通过 Bash/Glob/Grep 访问其他 session 的文件，禁止使用绝对路径访问 sessions/ 父目录。禁止写入 ~/.claude/ 目录（包括 memory/、projects/ 等全局配置），所有记忆必须写入当前 session 的 CLAUDE.md。浏览器隔离：禁止使用 open 命令或直接调用 Chrome，只能通过 start-chrome.sh 启动本 session 的浏览器实例，禁止访问其他端口的 Chrome 实例。隧道隔离：禁止运行 cloudflared/ngrok 等隧道工具，远程预览请使用内置 tunnel skill。修改 .claude/skills/ 下的文件时，使用 Bash 命令写入（如 cat > 文件路径 << 'EOF'），不要用 Write/Edit 工具。
 
 ### 共享目录
 当前 session 下有一个 `shared/` 目录，是所有 session 共享的。可以用来：

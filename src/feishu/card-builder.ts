@@ -43,7 +43,7 @@ export function buildThinkingCard(): object {
   return {
     schema: '2.0',
     header: {
-      template: 'green',
+      template: 'blue',
       title: { tag: 'plain_text', content: '💭 思考中...' },
     },
     body: {
@@ -66,11 +66,43 @@ export function buildThinkingCard(): object {
 export function buildStreamingCard(text: string, toolCalls?: ToolCallInfo[], startTime?: number): object {
   const elements: object[] = [];
 
+  // Detect <<TITLE:xxx>> in streamed text — strip it and use as header title.
+  // Robust to single/double brackets, stray spaces.
+  let displayText = text || '';
+  let headerTitle = '';
+  const titleMatch = displayText.match(/<{1,2}\s*TITLE\s*:\s*(.+?)\s*>{1,2}\s*\n?/);
+  if (titleMatch) {
+    headerTitle = titleMatch[1].trim().slice(0, 30);
+    displayText = displayText.replace(titleMatch[0], '').replace(/^\n/, '');
+  }
+
+  // Tool calls section — collapsible panel at the top, default collapsed
+  if (toolCalls && toolCalls.length > 0) {
+    let panelTitle = `🔄 ${toolCalls.length} 次工具调用`;
+    if (startTime) {
+      panelTitle += ` · ${formatDuration(Date.now() - startTime)}`;
+    }
+    elements.push({
+      tag: 'collapsible_panel',
+      expanded: false,
+      header: {
+        title: {
+          tag: 'plain_text',
+          content: panelTitle,
+        },
+      },
+      border: { color: 'grey' },
+      vertical_spacing: '8px',
+      padding: '4px 8px 4px 8px',
+      elements: buildToolPanelElements(toolCalls, false),
+    });
+  }
+
   // Main text content
-  if (text) {
+  if (displayText) {
     elements.push({
       tag: 'markdown',
-      content: text,
+      content: displayText,
       element_id: STREAMING_ELEMENT_ID,
     });
   } else {
@@ -81,38 +113,22 @@ export function buildStreamingCard(text: string, toolCalls?: ToolCallInfo[], sta
     });
   }
 
-  // Tool calls section
-  if (toolCalls && toolCalls.length > 0) {
-    elements.push({ tag: 'hr' });
-    elements.push({
-      tag: 'markdown',
-      content: formatToolCalls(toolCalls),
-      element_id: TOOL_CALLS_ELEMENT_ID,
-    });
-
-    // Always show elapsed time at the bottom when tools are active
-    if (startTime) {
-      const elapsed = Date.now() - startTime;
-      const timeStr = formatDuration(elapsed);
-      elements.push({
-        tag: 'markdown',
-        content: `⏱ 总用时 ${timeStr}`,
-      });
-    }
-  }
-
-  return {
+  const card: any = {
     schema: '2.0',
-    header: {
-      template: 'green',
-      title: { tag: 'plain_text', content: '✍️ 生成中...' },
-    },
     body: {
       direction: 'vertical',
       padding: '12px 12px 12px 12px',
       elements,
     },
   };
+  // Only render header when bot has emitted a TITLE tag
+  if (headerTitle) {
+    card.header = {
+      template: 'blue',
+      title: { tag: 'plain_text', content: `✍️ ${headerTitle}` },
+    };
+  }
+  return card;
 }
 
 /**
@@ -124,6 +140,12 @@ export interface ButtonInfo {
   actionId: string;
   type?: string; // default, primary, danger
   disabled?: boolean;
+}
+
+export interface UsageInfo {
+  inputTokens?: number;
+  outputTokens?: number;
+  costUsd?: number;
 }
 
 /**
@@ -138,26 +160,44 @@ export function extractButtons(text: string): { cleanText: string; buttons: Butt
   return { cleanText, buttons };
 }
 
-export function buildCompleteCard(text: string, toolCalls?: ToolCallInfo[], elapsed?: number, title?: string, buttons?: ButtonInfo[], sessionKey?: string, chatId?: string, cardId?: string, messageId?: string): object {
-  // Extract <<TITLE:...>> from text if present and no explicit title
+export function buildCompleteCard(text: string, toolCalls?: ToolCallInfo[], elapsed?: number, title?: string, buttons?: ButtonInfo[], sessionKey?: string, chatId?: string, cardId?: string, messageId?: string, usage?: UsageInfo): object {
+  // Extract <<TITLE:...>> from text if present and no explicit title.
+  // Robust regex: accept 1-2 angle brackets, optional spaces.
   let displayText = text || '(空回复)';
   let headerTitle = title || '';
-  // Match <<TITLE:...>> with flexible syntax: 1-2 angle brackets, anywhere in text
-  const titleMatch = displayText.match(/<?<<TITLE:(.+?)>>>?\s*\n?/);
+  const titleMatch = displayText.match(/<{1,2}\s*TITLE\s*:\s*(.+?)\s*>{1,2}\s*\n?/);
   if (titleMatch) {
     if (!title) {
       headerTitle = `✅ ${titleMatch[1].trim().slice(0, 30)}`;
     }
     displayText = displayText.replace(titleMatch[0], '').replace(/^\n/, '');
   }
-  // Also strip any remaining TITLE tag variants from display text
-  displayText = displayText.replace(/<?<<TITLE:.+?>>>?\s*\n?/g, '').replace(/^<TITLE:.+?>\s*\n?/gm, '');
-  // Auto-generate title from content if no <<TITLE:...>> and no explicit title
-  if (!headerTitle) {
-    headerTitle = `✅ ${extractAutoTitle(displayText)}`;
-  }
+  // Strip any remaining TITLE tag variants from display text
+  displayText = displayText.replace(/<{1,2}\s*TITLE\s*:.+?>{1,2}\s*\n?/g, '');
 
   const elements: object[] = [];
+
+  // Tool calls — collapsible panel at the top, default collapsed
+  if (toolCalls && toolCalls.length > 0) {
+    let toolPanelTitle = `✅ ${toolCalls.length} 次工具调用`;
+    if (elapsed) {
+      toolPanelTitle += ` · ${formatDuration(elapsed)}`;
+    }
+    elements.push({
+      tag: 'collapsible_panel',
+      expanded: false,
+      header: {
+        title: {
+          tag: 'plain_text',
+          content: toolPanelTitle,
+        },
+      },
+      border: { color: 'grey' },
+      vertical_spacing: '8px',
+      padding: '4px 8px 4px 8px',
+      elements: buildToolPanelElements(toolCalls, false),
+    });
+  }
 
   // Main text content
   elements.push({
@@ -165,15 +205,6 @@ export function buildCompleteCard(text: string, toolCalls?: ToolCallInfo[], elap
     content: displayText,
     element_id: STREAMING_ELEMENT_ID,
   });
-
-  // Footer as markdown (note tag not supported in schema 2.0)
-  const footerParts = ['✅ 完成'];
-  if (elapsed) {
-    footerParts.push(`耗时 ${formatDuration(elapsed)}`);
-  }
-  if (toolCalls && toolCalls.length > 0) {
-    footerParts.push(`${toolCalls.length} 次工具调用`);
-  }
 
   // Buttons (if any) — v2 schema: horizontal layout via column_set
   if (buttons && buttons.length > 0) {
@@ -207,29 +238,48 @@ export function buildCompleteCard(text: string, toolCalls?: ToolCallInfo[], elap
     });
   }
 
+  // Footer — status + metrics
   elements.push({ tag: 'hr' });
+  const footerParts = ['✅ 完成'];
+  if (elapsed) {
+    footerParts.push(`耗时 ${formatDuration(elapsed)}`);
+  }
+  if (toolCalls && toolCalls.length > 0) {
+    footerParts.push(`${toolCalls.length} 次工具调用`);
+  }
+  if (usage) {
+    const totalTokens = (usage.inputTokens || 0) + (usage.outputTokens || 0);
+    if (totalTokens > 0) {
+      footerParts.push(`${formatTokenCount(totalTokens)} tokens (in: ${formatTokenCount(usage.inputTokens || 0)} / out: ${formatTokenCount(usage.outputTokens || 0)})`);
+    }
+  }
   elements.push({
     tag: 'markdown',
     content: footerParts.join(' · '),
+    text_size: 'notation',
   });
 
-  return {
+  const card: any = {
     schema: '2.0',
-    header: {
-      template: 'green',
-      title: { tag: 'plain_text', content: headerTitle },
-    },
     body: {
       direction: 'vertical',
       padding: '12px 12px 12px 12px',
       elements,
     },
   };
+  if (headerTitle) {
+    card.header = {
+      template: 'blue',
+      title: { tag: 'plain_text', content: headerTitle },
+    };
+  }
+  return card;
 }
 
 /**
  * Extract a short title from response text for the card header.
  * Takes the first meaningful line, strips markdown, and truncates.
+ * (Currently unused — kept for backward compatibility.)
  */
 function extractAutoTitle(text: string): string {
   // Strip markdown formatting and find first meaningful line
@@ -260,13 +310,23 @@ function extractAutoTitle(text: string): string {
 
 /**
  * Format elapsed milliseconds as M:SS (e.g. 2:05) or Xs for under 60s.
+ * Capped at 30m to avoid runaway display values from orphaned cards.
  */
 function formatDuration(ms: number): string {
+  if (ms > 30 * 60 * 1000) return '> 30m';
   const totalSecs = Math.round(ms / 1000);
   if (totalSecs < 60) return `${totalSecs}s`;
   const mins = Math.floor(totalSecs / 60);
   const secs = totalSecs % 60;
   return `${mins}:${secs.toString().padStart(2, '0')}`;
+}
+
+/**
+ * Format token count as human-readable string (e.g. 1.2k, 45.3k).
+ */
+function formatTokenCount(count: number): string {
+  if (count >= 1000) return `${(count / 1000).toFixed(1)}k`;
+  return String(count);
 }
 
 /**
@@ -318,30 +378,39 @@ function formatToolCalls(toolCalls: ToolCallInfo[]): string {
   return lines.join('\n');
 }
 
-function formatSingleTool(tc: ToolCallInfo): string {
+/**
+ * Compute the parts of a tool call display: status icon, name, time string, input summary.
+ * Used by both markdown and plain-text formatters.
+ */
+function toolCallParts(tc: ToolCallInfo): { statusIcon: string; emoji: string; name: string; statusText: string; inputSummary: string } {
   const statusIcon = tc.status === 'running' ? '🔄' : tc.status === 'complete' ? '✅' : '❌';
   const emoji = toolEmoji(tc.name);
+  const isAgent = tc.name === 'Agent' || tc.name.startsWith('Agent #');
 
   // For Agent with children: compute duration from children's time span
   let durationSecs: number | undefined;
   if (tc.endTime) {
-    if ((tc.name === 'Agent' || tc.name.startsWith('Agent #')) && tc.children && tc.children.length > 0) {
+    if (isAgent && tc.children && tc.children.length > 0) {
       const firstStart = tc.children[0].startTime;
       const lastEnd = tc.children[tc.children.length - 1].endTime || Date.now();
       durationSecs = (lastEnd - firstStart) / 1000;
     } else {
       durationSecs = (tc.endTime - tc.startTime) / 1000;
     }
-  } else if (tc.status === 'running' && (tc.name === 'Agent' || tc.name.startsWith('Agent #')) && tc.children && tc.children.length > 0) {
+  } else if (tc.status === 'running' && isAgent && tc.children && tc.children.length > 0) {
     // Running Agent: show elapsed since first child started
     durationSecs = (Date.now() - tc.children[0].startTime) / 1000;
+  } else if (tc.status === 'running') {
+    // Generic running tool: elapsed since startTime
+    durationSecs = (Date.now() - tc.startTime) / 1000;
   }
 
   let timeStr = '';
   if (durationSecs != null) {
     timeStr = durationSecs < 60 ? `${durationSecs.toFixed(1)}s` : `${Math.floor(durationSecs / 60)}:${Math.round(durationSecs % 60).toString().padStart(2, '0')}`;
   }
-  const statusText = tc.status === 'running' ? '执行中...' : timeStr;
+  // Show elapsed time for running tools (instead of generic "执行中...")
+  const statusText = tc.status === 'running' && !timeStr ? '执行中...' : timeStr;
 
   let inputSummary = '';
   if (tc.input) {
@@ -349,7 +418,21 @@ function formatSingleTool(tc: ToolCallInfo): string {
     inputSummary = ` ${truncated}`;
   }
 
-  return `${statusIcon} ${emoji} **${tc.name}** ${statusText ? `(${statusText})` : ''}${inputSummary}`;
+  return { statusIcon, emoji, name: tc.name, statusText, inputSummary };
+}
+
+function formatSingleTool(tc: ToolCallInfo): string {
+  const { statusIcon, emoji, name, statusText, inputSummary } = toolCallParts(tc);
+  return `${statusIcon} ${emoji} **${name}** ${statusText ? `(${statusText})` : ''}${inputSummary}`;
+}
+
+/**
+ * Plain-text version (no markdown formatting) for use in collapsible_panel headers,
+ * which use plain_text and won't render markdown.
+ */
+function formatSingleToolPlain(tc: ToolCallInfo): string {
+  const { statusIcon, emoji, name, statusText, inputSummary } = toolCallParts(tc);
+  return `${statusIcon} ${emoji} ${name} ${statusText ? `(${statusText})` : ''}${inputSummary}`;
 }
 
 /**
@@ -358,17 +441,58 @@ function formatSingleTool(tc: ToolCallInfo): string {
 function formatToolCallsSummary(toolCalls: ToolCallInfo[]): string {
   const lines: string[] = [];
   for (const tc of toolCalls) {
+    // Skip agents with children — they get their own nested panel
+    if ((tc.name === 'Agent' || tc.name.startsWith('Agent #')) && tc.children && tc.children.length > 0) continue;
     lines.push(`- ${formatSingleTool(tc)}`);
-    if (tc.children && tc.children.length > 0) {
-      if (tc.children.length > 1) {
-        const elapsed = (tc.children[tc.children.length - 1].endTime || Date.now()) - tc.children[0].startTime;
-        const totalSecs = Math.round(elapsed / 1000);
-        const timeStr = totalSecs < 60 ? `${totalSecs}s` : `${Math.floor(totalSecs / 60)}:${(totalSecs % 60).toString().padStart(2, '0')}`;
-        lines.push(`   - ... ${tc.children.length - 1} 条已折叠 · 总用时 ${timeStr}`);
-      }
-      const last = tc.children[tc.children.length - 1];
-      lines.push(`   - ${formatSingleTool(last)}`);
-    }
   }
   return lines.join('\n');
+}
+
+/**
+ * Build card elements for tool calls panel content.
+ * Agent tools with children get nested collapsible_panel; others are markdown lines.
+ * @param expanded Whether agent sub-panels should be expanded (true for streaming, false for complete).
+ */
+function buildToolPanelElements(toolCalls: ToolCallInfo[], expanded: boolean): object[] {
+  const elements: object[] = [];
+
+  // Separate agents-with-children from flat tools
+  const flatTools: ToolCallInfo[] = [];
+  const agents: ToolCallInfo[] = [];
+  for (const tc of toolCalls) {
+    if ((tc.name === 'Agent' || tc.name.startsWith('Agent #')) && tc.children && tc.children.length > 0) {
+      agents.push(tc);
+    } else {
+      flatTools.push(tc);
+    }
+  }
+
+  // Flat tools as a single markdown block
+  if (flatTools.length > 0) {
+    const lines = flatTools.map(tc => formatSingleTool(tc));
+    elements.push({ tag: 'markdown', content: lines.join('\n') });
+  }
+
+  // Each agent with children gets its own nested collapsible_panel
+  for (const agent of agents) {
+    const childLines = (agent.children || []).map(c => formatSingleTool(c));
+    elements.push({
+      tag: 'collapsible_panel',
+      expanded,
+      header: {
+        title: {
+          tag: 'plain_text',
+          content: formatSingleToolPlain(agent),
+        },
+      },
+      border: { color: 'grey' },
+      vertical_spacing: '4px',
+      padding: '4px 8px 4px 8px',
+      elements: [
+        { tag: 'markdown', content: childLines.join('\n') },
+      ],
+    });
+  }
+
+  return elements;
 }

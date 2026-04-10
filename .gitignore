@@ -16,6 +16,10 @@ process-pool-state.json
 .name-cache.json
 sessions.json
 sigma-browser-extension.zip
+sigma-terminal.dmg
+sigma-terminal/node_modules/
+sigma-terminal/dist/
+sigma-terminal/release/
 _email_processor/
 web/dist/
 /members/

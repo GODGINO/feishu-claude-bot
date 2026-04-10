@@ -7,6 +7,7 @@ import { createRoutes } from './routes.js';
 import { RelayServer } from '../relay/relay-server.js';
 import type { RelayCommand } from '../relay/protocol.js';
 import { randomUUID, createHmac } from 'node:crypto';
+import httpProxy from 'http-proxy';
 
 export interface AdminServerResult {
   httpServer: http.Server;
@@ -109,6 +110,23 @@ export function startAdminServer(
   // API routes
   app.use(createRoutes(sessionsDir, feishuClient));
 
+  // Serve downloadable files (DMG, zip) — no auth required
+  const downloadsDir = path.join(process.cwd());
+  app.get('/download/:filename', (req, res) => {
+    const filename = req.params.filename;
+    // Only allow specific file extensions
+    if (!/\.(dmg|zip)$/.test(filename)) {
+      res.status(403).send('Forbidden');
+      return;
+    }
+    const filePath = path.join(downloadsDir, filename);
+    if (!fs.existsSync(filePath)) {
+      res.status(404).send('File not found');
+      return;
+    }
+    res.download(filePath, filename);
+  });
+
   // Relay command API — MCP server sends commands here
   const relayServer = new RelayServer(logger);
 
@@ -135,6 +153,38 @@ export function startAdminServer(
     res.json({ connections: relayServer.getStatus() });
   });
 
+  // ── Tunnel reverse proxy — /tunnel/:sessionKey/* → localhost:{port} ──
+  const tunnelProxy = httpProxy.createProxyServer({ ws: true });
+  tunnelProxy.on('error', (err, _req, res) => {
+    if (res && 'writeHead' in res) {
+      (res as http.ServerResponse).writeHead(502, { 'Content-Type': 'text/plain' });
+      (res as http.ServerResponse).end('Tunnel target not reachable');
+    }
+  });
+
+  const sessionKeyPattern = /^[a-zA-Z0-9_]+$/;
+
+  function getTunnelTarget(sessionKey: string): string | null {
+    if (!sessionKeyPattern.test(sessionKey)) return null;
+    const portFile = path.join(sessionsDir, sessionKey, '.tunnel-port');
+    try {
+      const port = parseInt(fs.readFileSync(portFile, 'utf-8').trim(), 10);
+      if (port > 0 && port < 65536) return `http://127.0.0.1:${port}`;
+    } catch { /* no tunnel port registered */ }
+    return null;
+  }
+
+  // Match /tunnel/:sessionKey and /tunnel/:sessionKey/anything
+  app.use('/tunnel/:sessionKey', (req, res) => {
+    const target = getTunnelTarget(req.params.sessionKey);
+    if (!target) {
+      res.status(404).send('Tunnel not active for this session');
+      return;
+    }
+    // req.url is already stripped of the mount prefix by express
+    tunnelProxy.web(req, res, { target, changeOrigin: true });
+  });
+
   // Serve frontend static files (production)
   const webDist = path.join(process.cwd(), 'web', 'dist');
   if (fs.existsSync(webDist)) {
@@ -146,6 +196,21 @@ export function startAdminServer(
   }
 
   const httpServer = http.createServer(app);
+
+  // WebSocket upgrade for tunnel proxy
+  httpServer.on('upgrade', (req, socket, head) => {
+    const match = req.url?.match(/^\/tunnel\/([^/]+)(\/.*)?$/);
+    if (match) {
+      const target = getTunnelTarget(match[1]);
+      if (target) {
+        req.url = match[2] || '/';
+        tunnelProxy.ws(req, socket, head, { target, changeOrigin: true });
+        return;
+      }
+    }
+    // Let relay server handle other WebSocket upgrades (handled by attach below)
+  });
+
   relayServer.attach(httpServer);
 
   httpServer.listen(port, '127.0.0.1', () => {

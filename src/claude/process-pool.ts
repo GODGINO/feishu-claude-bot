@@ -295,12 +295,17 @@ export class ProcessPool {
   /**
    * Get the model for a session (per-session override or global default).
    */
+  private static MODEL_ALIASES: Record<string, string> = {
+    'opus 1m': 'claude-opus-4-6[1m]',
+    'sonnet 1m': 'claude-sonnet-4-6[1m]',
+  };
+
   private getSessionModel(sessionKey: string, sessionDir: string): string {
     try {
       const modelFile = path.join(sessionDir, 'model');
       if (fs.existsSync(modelFile)) {
         const model = fs.readFileSync(modelFile, 'utf-8').trim();
-        if (model) return model;
+        if (model) return ProcessPool.MODEL_ALIASES[model] || model;
       }
     } catch { /* ignore */ }
     return this.config.claude.model;
@@ -680,6 +685,8 @@ export class ProcessPool {
         sessionId: pp.sessionId,
         costUsd: result.costUsd,
         durationMs: result.durationMs,
+        inputTokens: result.inputTokens,
+        outputTokens: result.outputTokens,
         error: result.error,
       };
 

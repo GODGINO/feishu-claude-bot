@@ -21,6 +21,7 @@ export interface IncomingMessage {
   messageType: string;
   parentId?: string;
   rootId?: string;       // Thread root message ID (for thread/topic replies)
+  threadId?: string;     // Real thread ID — only present when message is actually in a thread
   images?: ImageInfo[];  // Images attached to the message
   files?: FileInfo[];    // Files attached to the message
   isMentioned: boolean;  // Whether the bot was @mentioned
@@ -78,7 +79,7 @@ export function createEventHandler(
         setTimeout(() => recentMessageIds.delete(msgId), DEDUP_TTL_MS);
 
         // Handle text, post, image, file, and merge_forward messages
-        const supportedTypes = ['text', 'post', 'image', 'file', 'merge_forward'];
+        const supportedTypes = ['text', 'post', 'image', 'file', 'merge_forward', 'interactive'];
         if (!supportedTypes.includes(message.message_type)) {
           logger.info({ messageType: message.message_type, content: message.content?.slice(0, 300) }, 'Ignoring unsupported message type');
           return;
@@ -126,6 +127,28 @@ export function createEventHandler(
           text = `[文件] ${content.file_name || 'unknown'}`;
         } else if (message.message_type === 'merge_forward') {
           text = '[合并转发消息]';
+        } else if (message.message_type === 'interactive') {
+          // Forwarded email cards or other interactive messages
+          try {
+            const content = JSON.parse(message.content);
+            const title = content.title || '';
+            // Extract text from elements (same structure as post)
+            const parts: string[] = [];
+            if (title) parts.push(`[邮件] ${title}`);
+            const elements = content.elements;
+            if (Array.isArray(elements)) {
+              for (const line of elements) {
+                if (Array.isArray(line)) {
+                  for (const el of line) {
+                    if (el.tag === 'text' && el.text) parts.push(el.text);
+                  }
+                }
+              }
+            }
+            text = parts.join('\n') || '[卡片消息]';
+          } catch {
+            text = '[卡片消息]';
+          }
         }
 
         // Strip @mention tags from text
@@ -154,6 +177,7 @@ export function createEventHandler(
           messageType: message.message_type,
           parentId: message.parent_id || undefined,
           rootId: message.root_id || undefined,
+          threadId: message.thread_id || undefined,
           images: images.length > 0 ? images : undefined,
           files: files.length > 0 ? files : undefined,
           isMentioned,

@@ -428,6 +428,16 @@ exec node "${cliPath}" "$@"
       ],
     };
 
+    // Always include remote-terminal MCP (used when user explicitly requests terminal access on their Mac).
+    // The terminal skill prompt tells Sigma when to use this based on user's request.
+    mcpServers['remote-terminal'] = {
+      command: 'node',
+      args: [
+        path.join(projectRoot, 'dist', 'relay', 'remote-terminal-mcp.js'),
+        sessionKey,
+      ],
+    };
+
     // Cron MCP — exposes list/create/delete/toggle cron jobs as MCP tools.
     // SESSION_DIR env var is set by process-pool.ts at spawn time.
     mcpServers['cron'] = {
@@ -580,6 +590,9 @@ exec node "${cliPath}" "$@"
           'Bash(*google-chrome*)',
           'Bash(*Google Chrome*)',
           'Bash(*remote-debugging-port*)',
+          // Tunnel isolation — prevent sessions from starting their own tunnels
+          'Bash(*cloudflared*)',
+          'Bash(*ngrok*)',
         ],
       },
     };
@@ -614,6 +627,7 @@ exec node "${cliPath}" "$@"
       CHROME_PORT: String(port),
       HOME: process.env.HOME || '',
       PROJECT_ROOT: path.dirname(this.sessionsDir),
+      TUNNEL_BASE_URL: process.env.CF_TUNNEL_URL || '',
     };
 
     // Add Feishu app credentials from process env (for feishu-im shared MCP)
