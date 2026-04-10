@@ -23,11 +23,27 @@ export function createTray(window: BrowserWindow): void {
       return;
     }
 
-    // Position window below tray icon
-    const { x, y } = bounds;
     const { width, height } = trayWindow.getBounds();
-    const xPos = Math.round(x - width / 2);
-    const yPos = Math.round(y);
+
+    let xPos: number;
+    let yPos: number;
+
+    if (process.platform === 'darwin') {
+      // macOS: tray is at top, popup drops down below icon
+      xPos = Math.round(bounds.x - width / 2);
+      yPos = Math.round(bounds.y);
+    } else {
+      // Windows/Linux: tray is at bottom, popup extends upward from taskbar
+      xPos = Math.round(bounds.x - width / 2);
+      yPos = Math.round(bounds.y - height);
+    }
+
+    // Clamp to screen bounds
+    const { screen } = require('electron');
+    const display = screen.getDisplayNearestPoint({ x: bounds.x, y: bounds.y });
+    const workArea = display.workArea;
+    xPos = Math.max(workArea.x, Math.min(xPos, workArea.x + workArea.width - width));
+    yPos = Math.max(workArea.y, Math.min(yPos, workArea.y + workArea.height - height));
 
     trayWindow.setBounds({ x: xPos, y: yPos, width, height });
     trayWindow.show();
@@ -56,8 +72,12 @@ export function createTray(window: BrowserWindow): void {
   });
 }
 
-export function updateTrayIcon(connected: boolean): void {
+export function updateTrayIcon(connected: boolean, controlling = false): void {
   if (!tray) return;
   // Use tooltip to indicate status (icon stays as template for menubar consistency)
-  tray.setToolTip(connected ? 'Sigma Terminal — Connected' : 'Sigma Terminal — Disconnected');
+  if (controlling) {
+    tray.setToolTip('Sigma Terminal — Controlling (press ESC to stop)');
+  } else {
+    tray.setToolTip(connected ? 'Sigma Terminal — Connected' : 'Sigma Terminal — Disconnected');
+  }
 }

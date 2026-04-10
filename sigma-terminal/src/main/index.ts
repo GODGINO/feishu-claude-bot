@@ -3,10 +3,16 @@ import * as path from 'path';
 import { createTray, updateTrayIcon } from './tray';
 import { connect, disconnect, getState, onStateChange, type ConnectionState } from './relay-client';
 import { executeCommand } from './executor';
+import { requestAllPermissions, showPermissionDialog } from './onboarding';
 import Store from 'electron-store';
 
-const store = new Store<{ sessions: Array<{ key: string; name: string; type: string }> }>({
-  defaults: { sessions: [] },
+interface StoreSchema {
+  sessions: Array<{ key: string; name: string; type: string }>;
+  firstRunComplete?: boolean;
+}
+
+const store = new Store<StoreSchema>({
+  defaults: { sessions: [], firstRunComplete: false },
 });
 
 let mainWindow: BrowserWindow | null = null;
@@ -43,13 +49,27 @@ function createWindow(): BrowserWindow {
   return win;
 }
 
-app.whenReady().then(() => {
-  // Pure menubar app — hide from Dock
-  app.dock?.hide();
+app.whenReady().then(async () => {
+  // Pure menubar/tray app — hide from Dock (macOS only)
+  if (process.platform === 'darwin') app.dock?.hide();
 
   mainWindow = createWindow();
 
   createTray(mainWindow);
+
+  // First-launch: request all permissions immediately so the user grants
+  // everything once instead of being interrupted later.
+  if (!store.get('firstRunComplete')) {
+    const result = await requestAllPermissions();
+    store.set('firstRunComplete', true);
+
+    // If permissions are still missing after the OS prompts, show a follow-up dialog
+    setTimeout(() => {
+      if (!result.accessibility || !result.screenRecording) {
+        showPermissionDialog(result);
+      }
+    }, 2000);
+  }
 
   // Forward state changes to renderer
   onStateChange((state: ConnectionState) => {
@@ -90,6 +110,10 @@ app.whenReady().then(() => {
 
   ipcMain.handle('notify', (_e, title: string, body: string) => {
     new Notification({ title, body }).show();
+  });
+
+  ipcMain.handle('requestPermissions', async () => {
+    return await requestAllPermissions();
   });
 });
 

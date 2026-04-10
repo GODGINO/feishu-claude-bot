@@ -17,6 +17,7 @@ process-pool-state.json
 sessions.json
 sigma-browser-extension.zip
 sigma-terminal.dmg
+sigma-terminal-win.zip
 sigma-terminal/node_modules/
 sigma-terminal/dist/
 sigma-terminal/release/
