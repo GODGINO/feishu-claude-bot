@@ -464,8 +464,9 @@ export class MessageSender {
       text = resolveAtMentions(text, sessionDir);
     }
 
-    // Fix code fences for Feishu Markdown (``` must be on its own line)
+    // Fix Markdown for Feishu (code fences + tables need preceding newline)
     text = text.replace(/([^\n])```/g, '$1\n```');
+    text = text.replace(/([^\n|])\n(\|[^\n]+\|)/g, '$1\n\n$2');
 
     // Strip <<TITLE:...>> tag if present (only used for card headers)
     const cleanText = text.replace(/^<<TITLE:.+?>>\s*\n?/, '');
@@ -625,7 +626,7 @@ export class MessageSender {
 /**
  * Replace @名字 and @所有人 with Feishu <at> tags using member profiles.
  */
-function resolveAtMentions(text: string, sessionDir: string): string {
+export function resolveAtMentions(text: string, sessionDir: string): string {
   // Replace @所有人 first
   text = text.replace(/@所有人/g, '<at id=all></at>');
 

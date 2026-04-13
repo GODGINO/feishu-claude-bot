@@ -6,15 +6,19 @@
 
 import type * as lark from '@larksuiteoapi/node-sdk';
 import type { Logger } from '../utils/logger.js';
+import { resolveAtMentions } from './message-sender.js';
 
 /**
- * Fix Markdown code fences for Feishu rendering.
- * Feishu requires ``` to be on its own line (standard Markdown spec).
- * Ensures \n before ``` when preceded by non-whitespace.
+ * Fix Markdown for Feishu rendering:
+ * 1. Code fences: ``` must be on its own line
+ * 2. Tables: | rows must have a blank line before the first row
  */
-function fixCodeFences(text: string): string {
-  // Add \n before ``` if preceded by non-newline character
-  return text.replace(/([^\n])```/g, '$1\n```');
+function fixMarkdownForFeishu(text: string): string {
+  // Fix code fences: ensure \n before ```
+  text = text.replace(/([^\n])```/g, '$1\n```');
+  // Fix tables: ensure \n before first | row when preceded by non-empty line
+  text = text.replace(/([^\n|])\n(\|[^\n]+\|)/g, '$1\n\n$2');
+  return text;
 }
 import {
   buildThinkingCard,
@@ -53,6 +57,7 @@ export class CardStreamer {
   private inflightFlush: Promise<void> | null = null;
   // For button rendering — set by caller before complete()
   sessionKey?: string;
+  sessionDir?: string;
   chatId?: string;
   // Shared cache for button card state (set by caller)
   buttonCardCache?: Map<string, { cardJson: object; sequence: number; expiresAt: number }>;
@@ -248,6 +253,12 @@ export class CardStreamer {
   updateToolCall(toolUseId: string, status: 'complete' | 'failed'): void {
     const tc = this.toolCalls.find(t => t.toolUseId === toolUseId);
     if (tc) {
+      // If this tool call has a registered background agent (local_agent) still running,
+      // don't mark it complete yet — completeSubagentSteps() will do it when the agent finishes.
+      if (status === 'complete' && toolUseId && [...this.taskIdToToolUseId.values()].includes(toolUseId)) {
+        // Background agent still running — skip completion
+        return;
+      }
       tc.status = status;
       tc.endTime = Date.now();
       // Cascade: when an Agent finishes, also mark any still-running children as complete.
@@ -311,8 +322,13 @@ export class CardStreamer {
     // Strip <<THREAD>> and <<REACT:...>> tags from display text
     fullText = fullText.replace(/<<THREAD>>\s*/g, '').replace(/<<REACT:\w+>>\s*/g, '');
 
-    // Fix code fences for Feishu Markdown rendering
-    fullText = fixCodeFences(fullText);
+    // Fix Markdown for Feishu rendering
+    fullText = fixMarkdownForFeishu(fullText);
+
+    // Resolve @mentions (e.g. @张三 → <at id=ou_xxx></at>)
+    if (this.sessionDir) {
+      fullText = resolveAtMentions(fullText, this.sessionDir);
+    }
 
     // Extract <<BUTTON:...>> tags
     const { cleanText: textWithoutButtons, buttons } = extractButtons(fullText);

@@ -843,6 +843,7 @@ export class MessageBridge {
 
     // Pass session info to streamer for button rendering + card cache
     streamer.sessionKey = sessionKey;
+    streamer.sessionDir = sessionDir;
     streamer.chatId = chatId;
     streamer.buttonCardCache = this.buttonCardCache;
 

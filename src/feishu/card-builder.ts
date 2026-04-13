@@ -480,10 +480,37 @@ function buildToolPanelElements(toolCalls: ToolCallInfo[], expanded: boolean): o
     }
   }
 
-  // Flat tools as a single markdown block
+  // Flat tools: separate completed from running
   if (flatTools.length > 0) {
-    const lines = flatTools.map(tc => formatSingleTool(tc));
-    elements.push({ tag: 'markdown', content: lines.join('\n') });
+    const completed = flatTools.filter(tc => tc.status !== 'running');
+    const running = flatTools.filter(tc => tc.status === 'running');
+
+    // Completed tools → nested collapsible panel (collapsed)
+    if (completed.length > 0) {
+      const completedLines = completed.map(tc => formatSingleTool(tc));
+      elements.push({
+        tag: 'collapsible_panel',
+        expanded: false,
+        header: {
+          title: {
+            tag: 'plain_text',
+            content: `✅ ${completed.length} 次工具调用已完成`,
+          },
+        },
+        border: { color: 'grey' },
+        vertical_spacing: '4px',
+        padding: '4px 8px 4px 8px',
+        elements: [
+          { tag: 'markdown', content: completedLines.join('\n') },
+        ],
+      });
+    }
+
+    // Running tools → show expanded
+    if (running.length > 0) {
+      const runningLines = running.map(tc => formatSingleTool(tc));
+      elements.push({ tag: 'markdown', content: runningLines.join('\n') });
+    }
   }
 
   // Each agent with children gets its own nested collapsible_panel
