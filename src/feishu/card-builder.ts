@@ -140,6 +140,7 @@ export interface ButtonInfo {
   actionId: string;
   type?: string; // default, primary, danger
   disabled?: boolean;
+  url?: string; // if set, button opens URL instead of triggering callback
 }
 
 export interface UsageInfo {
@@ -154,7 +155,14 @@ export interface UsageInfo {
 export function extractButtons(text: string): { cleanText: string; buttons: ButtonInfo[] } {
   const buttons: ButtonInfo[] = [];
   const cleanText = text.replace(/<<BUTTON:([^|>]+)\|([^|>]+)(?:\|([^>]+))?>>[\s]*/g, (_, label, actionId, type) => {
-    buttons.push({ label: label.trim(), actionId: actionId.trim(), type: type?.trim() });
+    const trimmedAction = actionId.trim();
+    const isLink = /^https?:\/\//.test(trimmedAction);
+    buttons.push({
+      label: isLink ? `🔗 ${label.trim()}` : label.trim(),
+      actionId: trimmedAction,
+      type: type?.trim(),
+      url: isLink ? trimmedAction : undefined,
+    });
     return '';
   }).trim();
   return { cleanText, buttons };
@@ -209,27 +217,32 @@ export function buildCompleteCard(text: string, toolCalls?: ToolCallInfo[], elap
   // Buttons (if any) — v2 schema: horizontal layout via column_set
   if (buttons && buttons.length > 0) {
     elements.push({ tag: 'hr' });
-    const columns = buttons.map(btn => ({
-      tag: 'column',
-      width: 'auto',
-      elements: [{
-        tag: 'button',
-        type: btn.type || 'default',
-        text: { tag: 'plain_text', content: btn.label },
-        disabled: btn.disabled || false,
-        behaviors: [{
-          type: 'callback',
-          value: {
-            action: btn.actionId,
-            label: btn.label,
-            sessionKey: sessionKey || '',
-            chatId: chatId || '',
-            cardId: cardId || '',
-            messageId: messageId || '',
-          },
+    const columns = buttons.map(btn => {
+      const behaviors = btn.url
+        ? [{ type: 'open_url', default_url: btn.url }]
+        : [{
+            type: 'callback',
+            value: {
+              action: btn.actionId,
+              label: btn.label,
+              sessionKey: sessionKey || '',
+              chatId: chatId || '',
+              cardId: cardId || '',
+              messageId: messageId || '',
+            },
+          }];
+      return {
+        tag: 'column',
+        width: 'auto',
+        elements: [{
+          tag: 'button',
+          type: btn.type || 'default',
+          text: { tag: 'plain_text', content: btn.label },
+          disabled: btn.disabled || false,
+          behaviors,
         }],
-      }],
-    }));
+      };
+    });
     elements.push({
       tag: 'column_set',
       columns,

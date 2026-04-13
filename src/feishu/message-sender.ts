@@ -464,6 +464,9 @@ export class MessageSender {
       text = resolveAtMentions(text, sessionDir);
     }
 
+    // Fix code fences for Feishu Markdown (``` must be on its own line)
+    text = text.replace(/([^\n])```/g, '$1\n```');
+
     // Strip <<TITLE:...>> tag if present (only used for card headers)
     const cleanText = text.replace(/^<<TITLE:.+?>>\s*\n?/, '');
     const mode = detectRenderMode(text);

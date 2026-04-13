@@ -6,6 +6,7 @@
  */
 
 import WebSocket from 'ws';
+import { createHmac } from 'node:crypto';
 
 export interface ConnectionState {
   connected: boolean;
@@ -18,6 +19,7 @@ export interface ConnectionState {
 type CommandExecutor = (tool: string, params: Record<string, unknown>) => Promise<unknown>;
 
 const connections = new Map<string, WebSocket>();
+const socketToKey = new Map<WebSocket, string>(); // reverse lookup for signature verification
 let state: ConnectionState = { connected: false, connecting: false, sessionKeys: [], relayUrl: '' };
 let manualDisconnect = false;
 let stateCallback: ((state: ConnectionState) => void) | null = null;
@@ -95,6 +97,7 @@ export function connect(relayUrl: string, sessionKeys: string[], exec: CommandEx
       });
 
       connections.set(key, socket);
+      socketToKey.set(socket, key);
     } catch (err: any) {
       console.error('[Sigma] WebSocket creation failed:', key, err.message);
     }
@@ -130,6 +133,19 @@ async function handleMessage(msg: any, socket: WebSocket): Promise<void> {
   switch (msg.type) {
     case 'command': {
       const { id, tool, params } = msg.payload;
+      // Verify command signature — reject unsigned or forged commands
+      const key = socketToKey.get(socket);
+      if (!key || !msg.sig) {
+        console.error('[Sigma] Command rejected — missing signature');
+        send(socket, { type: 'response', payload: { id, error: 'Missing command signature' } });
+        break;
+      }
+      const expected = createHmac('sha256', key).update(id + tool).digest('hex');
+      if (msg.sig !== expected) {
+        console.error('[Sigma] Command rejected — invalid signature');
+        send(socket, { type: 'response', payload: { id, error: 'Invalid command signature' } });
+        break;
+      }
       try {
         const result = executor ? await executor(tool, params) : { error: 'No executor' };
         send(socket, { type: 'response', payload: { id, result } });

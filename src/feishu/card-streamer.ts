@@ -6,6 +6,16 @@
 
 import type * as lark from '@larksuiteoapi/node-sdk';
 import type { Logger } from '../utils/logger.js';
+
+/**
+ * Fix Markdown code fences for Feishu rendering.
+ * Feishu requires ``` to be on its own line (standard Markdown spec).
+ * Ensures \n before ``` when preceded by non-whitespace.
+ */
+function fixCodeFences(text: string): string {
+  // Add \n before ``` if preceded by non-newline character
+  return text.replace(/([^\n])```/g, '$1\n```');
+}
 import {
   buildThinkingCard,
   buildStreamingCard,
@@ -300,6 +310,9 @@ export class CardStreamer {
 
     // Strip <<THREAD>> and <<REACT:...>> tags from display text
     fullText = fullText.replace(/<<THREAD>>\s*/g, '').replace(/<<REACT:\w+>>\s*/g, '');
+
+    // Fix code fences for Feishu Markdown rendering
+    fullText = fixCodeFences(fullText);
 
     // Extract <<BUTTON:...>> tags
     const { cleanText: textWithoutButtons, buttons } = extractButtons(fullText);

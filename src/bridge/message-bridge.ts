@@ -934,7 +934,11 @@ export class MessageBridge {
       const cleanText = replyText;
 
       if (replyText === 'NO_REPLY' || (!cardCreated && !cardCreating && isNonMentionGroup && !replyText) || (!cardCreated && !cardCreating && !replyText)) {
-        // NO_REPLY or empty text without card — nothing to show
+        // NO_REPLY or empty text without card — finalize card if it was already created
+        if (cardCreated || cardCreating) {
+          if (streamer.startPromise) await streamer.startPromise;
+          await streamer.complete(bufferedText || '(无回复)');
+        }
       } else if (isFromWechat && cardCreated) {
         // WeChat message with tools → card already streaming on Feishu.
         // Complete the card with echo prepended, no separate text message needed.

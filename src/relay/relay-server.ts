@@ -1,6 +1,7 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import type { Server as HttpServer } from 'node:http';
 import type { RelayCommand, RelayResponse, RelayMessage, ExtensionStatus } from './protocol.js';
+import { createHmac } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
@@ -125,7 +126,9 @@ export class RelayServer {
       }, COMMAND_TIMEOUT);
 
       conn.pending.set(command.id, { resolve, timer });
-      this.send(conn.ws, { type: 'command', payload: command });
+      // Sign command so client can verify it came from the real server
+      const sig = createHmac('sha256', sessionKey).update(command.id + command.tool).digest('hex');
+      this.send(conn.ws, { type: 'command', payload: command, sig });
     });
   }
 

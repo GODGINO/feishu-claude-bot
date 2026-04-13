@@ -245,15 +245,10 @@ export function startAdminServer(
     return null;
   }
 
-  // Match /tunnel/:sessionKey — requires admin auth (prevents public SSRF)
+  // Match /tunnel/:sessionKey — public access (session must exist + have active tunnel).
+  // Security: sessionKey is unguessable (32-char hex) and not enumerable from any public endpoint.
+  // The tunnel only proxies to a port the session's bot explicitly started, not arbitrary localhost services.
   app.use('/tunnel/:sessionKey', (req, res) => {
-    if (authEnabled) {
-      const token = getCookie(req.headers.cookie, 'sigma_token');
-      if (!token || !isValidToken(token)) {
-        res.status(401).json({ error: 'Unauthorized' });
-        return;
-      }
-    }
     const target = getTunnelTarget(req.params.sessionKey);
     if (!target) {
       res.status(404).send('Tunnel not active for this session');
@@ -290,10 +285,9 @@ export function startAdminServer(
       return !!cookie && isValidToken(cookie);
     };
 
-    // Tunnel proxy — requires admin auth
+    // Tunnel proxy — public access (same security as HTTP: sessionKey is unguessable)
     const tunnelMatch = pathname.match(/^\/tunnel\/([^/]+)(\/.*)?$/);
     if (tunnelMatch) {
-      if (!isAdminAuthed()) { socket.destroy(); return; }
       const target = getTunnelTarget(tunnelMatch[1]);
       if (target) {
         req.url = tunnelMatch[2] || '/';
