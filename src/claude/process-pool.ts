@@ -52,7 +52,8 @@ export type SubagentStreamCallback = (sessionKey: string, event: {
   toolUseId?: string;
   description?: string;
   summary?: string;
-  toolName?: string; // For progress events: the tool being used
+  toolName?: string;
+  taskType?: string; // 'local_agent' = real background agent, 'local_bash' = background bash
 }) => void;
 
 export class ProcessPool {
@@ -647,6 +648,7 @@ export class ProcessPool {
           taskId: result.subagentStart.taskId,
           toolUseId: result.subagentStart.toolUseId,
           description: result.subagentStart.description,
+          taskType: result.subagentStart.taskType,
         });
       }
       if (result.subagentProgress) {

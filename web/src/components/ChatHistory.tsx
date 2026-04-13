@@ -2,22 +2,23 @@ import { useEffect, useState } from 'react'
 import { api, type ChatMessage } from '../lib/api'
 import { formatDate, formatDateTime } from '../lib/utils'
 
-export default function ChatHistory({ sessionKey }: { sessionKey: string }) {
+export default function ChatHistory({ sessionKey, refreshKey }: { sessionKey: string; refreshKey?: number }) {
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [total, setTotal] = useState(0)
   const [page, setPage] = useState(1)
   const limit = 50
 
-  useEffect(() => {
+  const loadHistory = () => {
     api.chat(sessionKey, page, limit).then(r => {
       setMessages(r.messages)
       setTotal(r.total)
     })
-  }, [sessionKey, page])
+  }
+
+  useEffect(() => { loadHistory() }, [sessionKey, page, refreshKey])
 
   const totalPages = Math.ceil(total / limit)
 
-  // Group messages by date (messages are newest first)
   const grouped = new Map<string, ChatMessage[]>()
   for (const msg of messages) {
     const dateKey = formatDate(msg.timestamp)
@@ -26,12 +27,12 @@ export default function ChatHistory({ sessionKey }: { sessionKey: string }) {
     grouped.set(dateKey, arr)
   }
 
-  if (messages.length === 0) {
-    return <p className="text-slate-400">No chat history</p>
-  }
-
   return (
     <div className="space-y-6">
+      {messages.length === 0 && (
+        <p className="text-slate-400">No chat history</p>
+      )}
+
       {Array.from(grouped.entries()).map(([date, msgs]) => (
         <div key={date}>
           <div className="sticky top-0 z-10 flex justify-center mb-3">

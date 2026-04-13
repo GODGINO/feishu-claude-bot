@@ -9,7 +9,7 @@ import * as path from 'path';
 import * as os from 'os';
 import fg from 'fast-glob';
 import { Notification } from 'electron';
-import { checkSecurity } from './security';
+import { checkSecurity, checkPathSecurity } from './security';
 import { withComputerUse } from './abort-controller';
 import * as cu from './computer-use';
 import * as pu from './phone-use';
@@ -32,12 +32,20 @@ function shellExec(command: string, cwd?: string, timeout = 60_000): Promise<unk
     let stdout = '';
     let stderr = '';
 
+    // Whitelist safe environment variables — don't leak app secrets to subprocesses
+    const safeEnv: Record<string, string> = {};
+    const SAFE_VARS = ['PATH', 'HOME', 'SHELL', 'LANG', 'LC_ALL', 'USER', 'LOGNAME', 'TERM', 'TMPDIR',
+      'ANDROID_HOME', 'JAVA_HOME', 'GOPATH', 'GOROOT', 'NVM_DIR', 'PYENV_ROOT', 'CARGO_HOME', 'RUSTUP_HOME'];
+    for (const k of SAFE_VARS) {
+      if (process.env[k]) safeEnv[k] = process.env[k]!;
+    }
+
     const proc = IS_WIN
       ? spawn('powershell.exe', ['-NoProfile', '-Command', command], {
-          cwd: cwd || os.homedir(), timeout, env: { ...process.env },
+          cwd: cwd || os.homedir(), timeout, env: safeEnv,
         })
       : spawn('bash', ['-c', command], {
-          cwd: cwd || os.homedir(), timeout, env: { ...process.env },
+          cwd: cwd || os.homedir(), timeout, env: safeEnv,
         });
 
     proc.stdout.on('data', (d) => { stdout += d; });
@@ -91,7 +99,7 @@ function fileRead(filePath: string, offset = 0, limit = 2000): unknown {
 // ── file_write ──
 
 function fileWrite(filePath: string, content: string): unknown {
-  // Ensure parent directory exists
+  checkPathSecurity(filePath);
   const dir = path.dirname(filePath);
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
@@ -104,6 +112,7 @@ function fileWrite(filePath: string, content: string): unknown {
 // ── file_edit ── (old_string → new_string, like Claude Code Edit)
 
 function fileEdit(filePath: string, oldString: string, newString: string, replaceAll = false): unknown {
+  checkPathSecurity(filePath);
   if (!fs.existsSync(filePath)) {
     throw new Error(`File not found: ${filePath}`);
   }

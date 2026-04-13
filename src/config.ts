@@ -19,7 +19,8 @@ export interface Config {
   processTimeout: number;
   logLevel: string;
   adminPort: number;
-  adminPassword: string;
+  adminPasswords: string[];
+  relaySecret: string;
   tunnelUrl: string;
 }
 
@@ -76,7 +77,8 @@ export function loadConfig(): Config {
     processTimeout: parseInt(optional('PROCESS_TIMEOUT', '120000'), 10),
     logLevel: optional('LOG_LEVEL', 'info'),
     adminPort: parseInt(optional('ADMIN_PORT', '3333'), 10),
-    adminPassword: optional('ADMIN_PASSWORD', ''),
+    adminPasswords: optional('ADMIN_PASSWORD', '').split(',').map(s => s.trim()).filter(Boolean),
+    relaySecret: optional('RELAY_SECRET', 'sigma-relay-default-secret'),
     tunnelUrl: optional('CF_TUNNEL_URL', ''),
   };
 }

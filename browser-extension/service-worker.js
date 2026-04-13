@@ -159,13 +159,45 @@ function sendToSocket(socket, msg) {
   }
 }
 
+// ── Command signature verification (Web Crypto API) ──
+
+async function hmacSha256(key, message) {
+  const enc = new TextEncoder();
+  const cryptoKey = await crypto.subtle.importKey(
+    'raw', enc.encode(key), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+  );
+  const sig = await crypto.subtle.sign('HMAC', cryptoKey, enc.encode(message));
+  return Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+function getSessionKeyForSocket(socket) {
+  for (const [key, ws] of connections) {
+    if (ws === socket) return key;
+  }
+  return null;
+}
+
 // ── Message handling ──
 
 async function handleRelayMessage(msg, socket) {
   switch (msg.type) {
-    case 'command':
+    case 'command': {
+      // Verify command signature — reject unsigned or forged commands
+      const key = getSessionKeyForSocket(socket);
+      if (!key || !msg.sig) {
+        console.error('[Sigma] Command rejected — missing signature');
+        sendToSocket(socket, { type: 'response', payload: { id: msg.payload.id, error: 'Missing command signature' } });
+        break;
+      }
+      const expected = await hmacSha256(key, msg.payload.id + msg.payload.tool);
+      if (msg.sig !== expected) {
+        console.error('[Sigma] Command rejected — invalid signature');
+        sendToSocket(socket, { type: 'response', payload: { id: msg.payload.id, error: 'Invalid command signature' } });
+        break;
+      }
       await handleCommand(msg.payload, socket);
       break;
+    }
     case 'ping':
       sendToSocket(socket, { type: 'pong' });
       break;

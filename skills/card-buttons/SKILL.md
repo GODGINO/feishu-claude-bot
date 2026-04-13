@@ -31,18 +31,18 @@ description: >
 <<BUTTON:撤销修改|revert|danger>>
 ```
 
-### 2. 链接入口
+### 2. 链接按钮
 
-当回复中包含链接时，将关键链接转为按钮方便用户点击：
+当操作标识是一个 URL（http:// 或 https://）时，按钮会**直接在浏览器中打开链接**，不触发回调，不通知你。按钮文案会自动加上 🔗 前缀。
 
 ```
-文档已创建完成！
+页面已部署完成！
 
-<<BUTTON:打开文档|open_doc|primary>>
-<<BUTTON:分享给团队|share_doc>>
+<<BUTTON:查看页面|https://sigma.tixool.com/tunnel/xxx/index.html|primary>>
+<<BUTTON:打开文档|https://docs.example.com/xxx|primary>>
 ```
 
-注意：链接按钮的操作标识中可以描述意图，你收到点击通知后执行对应操作（如打开链接、分享文档等）。
+适用于：tunnel 页面链接、外部文档、预览 URL 等用户需要直接打开的链接。
 
 ### 3. 多选项
 

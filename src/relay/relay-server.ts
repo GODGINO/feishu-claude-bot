@@ -1,6 +1,9 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import type { Server as HttpServer } from 'node:http';
 import type { RelayCommand, RelayResponse, RelayMessage, ExtensionStatus } from './protocol.js';
+import { createHmac } from 'node:crypto';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 
 const PING_INTERVAL = 30_000;
 const COMMAND_TIMEOUT = 60_000;
@@ -21,24 +24,36 @@ interface Connection {
 
 export class RelayServer {
   private wss!: WebSocketServer;
-  private connections = new Map<string, Connection>(); // sessionKey -> connection
+  private connections = new Map<string, Connection>();
   private pingTimer?: ReturnType<typeof setInterval>;
+  private sessionsDir: string;
   private logger: { info: (...a: any[]) => void; warn: (...a: any[]) => void; error: (...a: any[]) => void };
 
-  constructor(logger: { info: (...a: any[]) => void; warn: (...a: any[]) => void; error: (...a: any[]) => void }) {
+  constructor(
+    logger: { info: (...a: any[]) => void; warn: (...a: any[]) => void; error: (...a: any[]) => void },
+    sessionsDir: string,
+  ) {
     this.logger = logger;
+    this.sessionsDir = sessionsDir;
   }
 
   attach(server: HttpServer): void {
-    this.wss = new WebSocketServer({ server, path: '/relay' });
+    this.wss = new WebSocketServer({ noServer: true });
 
     this.wss.on('connection', (ws, req) => {
-      // Extract session key from URL: /relay?session=<key>
       const url = new URL(req.url || '', 'http://localhost');
       const sessionKey = url.searchParams.get('session');
 
       if (!sessionKey) {
         ws.close(4001, 'Missing session parameter');
+        return;
+      }
+
+      // Session directory must exist — prevents connection to arbitrary/guessed keys
+      const sessionDir = path.join(this.sessionsDir, sessionKey);
+      if (!fs.existsSync(sessionDir)) {
+        this.logger.warn({ sessionKey }, 'Relay rejected: session does not exist');
+        ws.close(4004, 'Session not found');
         return;
       }
 
@@ -58,7 +73,7 @@ export class RelayServer {
         pending: new Map(),
       };
       this.connections.set(sessionKey, conn);
-      this.logger.info({ sessionKey }, 'Extension connected');
+      this.logger.info({ sessionKey }, 'Relay connected');
 
       ws.on('message', (data) => {
         try {
@@ -71,15 +86,14 @@ export class RelayServer {
 
       ws.on('close', () => {
         this.cleanupConnection(sessionKey);
-        this.logger.info({ sessionKey }, 'Extension disconnected');
+        this.logger.info({ sessionKey }, 'Relay disconnected');
       });
 
       ws.on('error', (err) => {
-        this.logger.error({ sessionKey, err }, 'Extension WebSocket error');
+        this.logger.error({ sessionKey, err }, 'Relay WebSocket error');
       });
     });
 
-    // Periodic ping to keep connections alive
     this.pingTimer = setInterval(() => {
       for (const [key, conn] of this.connections) {
         if (conn.ws.readyState === WebSocket.OPEN) {
@@ -93,7 +107,12 @@ export class RelayServer {
     this.logger.info('Relay WebSocket server attached');
   }
 
-  /** Send a command to an extension and wait for response */
+  handleUpgrade(req: any, socket: any, head: any): void {
+    this.wss.handleUpgrade(req, socket, head, (ws) => {
+      this.wss.emit('connection', ws, req);
+    });
+  }
+
   async sendCommand(sessionKey: string, command: RelayCommand): Promise<RelayResponse> {
     const conn = this.connections.get(sessionKey);
     if (!conn || conn.ws.readyState !== WebSocket.OPEN) {
@@ -107,17 +126,17 @@ export class RelayServer {
       }, COMMAND_TIMEOUT);
 
       conn.pending.set(command.id, { resolve, timer });
-      this.send(conn.ws, { type: 'command', payload: command });
+      // Sign command so client can verify it came from the real server
+      const sig = createHmac('sha256', sessionKey).update(command.id + command.tool).digest('hex');
+      this.send(conn.ws, { type: 'command', payload: command, sig });
     });
   }
 
-  /** Check if an extension is connected for a session */
   isConnected(sessionKey: string): boolean {
     const conn = this.connections.get(sessionKey);
     return !!conn && conn.ws.readyState === WebSocket.OPEN;
   }
 
-  /** Get status of all connected extensions */
   getStatus(): ExtensionStatus[] {
     const result: ExtensionStatus[] = [];
     for (const conn of this.connections.values()) {
@@ -164,7 +183,6 @@ export class RelayServer {
   private cleanupConnection(sessionKey: string): void {
     const conn = this.connections.get(sessionKey);
     if (!conn) return;
-    // Reject all pending commands
     for (const [id, pending] of conn.pending) {
       clearTimeout(pending.timer);
       pending.resolve({ id, error: 'Extension disconnected' });
@@ -173,7 +191,7 @@ export class RelayServer {
     this.connections.delete(sessionKey);
   }
 
-  private send(ws: WebSocket, msg: RelayMessage): void {
+  private send(ws: WebSocket, msg: unknown): void {
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify(msg));
     }

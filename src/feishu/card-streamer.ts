@@ -6,6 +6,16 @@
 
 import type * as lark from '@larksuiteoapi/node-sdk';
 import type { Logger } from '../utils/logger.js';
+
+/**
+ * Fix Markdown code fences for Feishu rendering.
+ * Feishu requires ``` to be on its own line (standard Markdown spec).
+ * Ensures \n before ``` when preceded by non-whitespace.
+ */
+function fixCodeFences(text: string): string {
+  // Add \n before ``` if preceded by non-newline character
+  return text.replace(/([^\n])```/g, '$1\n```');
+}
 import {
   buildThinkingCard,
   buildStreamingCard,
@@ -241,7 +251,6 @@ export class CardStreamer {
       tc.status = status;
       tc.endTime = Date.now();
       // Cascade: when an Agent finishes, also mark any still-running children as complete.
-      // Guards against races where completeSubagentSteps missed children.
       if (tc.children && tc.children.length > 0) {
         for (const child of tc.children) {
           if (child.status === 'running') {
@@ -301,6 +310,9 @@ export class CardStreamer {
 
     // Strip <<THREAD>> and <<REACT:...>> tags from display text
     fullText = fullText.replace(/<<THREAD>>\s*/g, '').replace(/<<REACT:\w+>>\s*/g, '');
+
+    // Fix code fences for Feishu Markdown rendering
+    fullText = fixCodeFences(fullText);
 
     // Extract <<BUTTON:...>> tags
     const { cleanText: textWithoutButtons, buttons } = extractButtons(fullText);
@@ -434,21 +446,32 @@ export class CardStreamer {
     this.updateText(this.pendingText);
   }
 
-  /** Mark all running children of a subagent as complete. */
+  /** Mark all running children of a subagent as complete, and the Agent itself. */
   completeSubagentSteps(taskId: string): void {
     const agentToolUseId = this.taskIdToToolUseId.get(taskId);
     const agent = agentToolUseId
       ? this.toolCalls.find(t => t.toolUseId === agentToolUseId)
       : undefined;
-    if (!agent?.children) return;
 
-    for (const child of agent.children) {
-      if (child.status === 'running') {
-        child.status = 'complete';
-        child.endTime = Date.now();
+    this.taskIdToToolUseId.delete(taskId);
+
+    if (agent) {
+      // Mark children as complete
+      if (agent.children) {
+        for (const child of agent.children) {
+          if (child.status === 'running') {
+            child.status = 'complete';
+            child.endTime = Date.now();
+          }
+        }
+      }
+      // Now mark the Agent tool call itself as complete
+      if (agent.status === 'running') {
+        agent.status = 'complete';
+        agent.endTime = Date.now();
       }
     }
-    this.taskIdToToolUseId.delete(taskId);
+
     this.updateText(this.pendingText);
   }
 

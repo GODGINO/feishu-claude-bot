@@ -19,8 +19,8 @@ let mainWindow: BrowserWindow | null = null;
 
 function createWindow(): BrowserWindow {
   const win = new BrowserWindow({
-    width: 360,
-    height: 480,
+    width: 340,
+    height: 320,
     show: false,
     frame: false,
     resizable: false,
@@ -57,18 +57,12 @@ app.whenReady().then(async () => {
 
   createTray(mainWindow);
 
-  // First-launch: request all permissions immediately so the user grants
-  // everything once instead of being interrupted later.
-  if (!store.get('firstRunComplete')) {
-    const result = await requestAllPermissions();
-    store.set('firstRunComplete', true);
-
-    // If permissions are still missing after the OS prompts, show a follow-up dialog
-    setTimeout(() => {
-      if (!result.accessibility || !result.screenRecording) {
-        showPermissionDialog(result);
-      }
-    }, 2000);
+  // Request all permissions on every startup until all are granted.
+  // macOS requires the user to manually grant each one in System Settings.
+  const result = await requestAllPermissions();
+  if (!result.accessibility || !result.screenRecording) {
+    // Show dialog with link to System Settings after a short delay
+    setTimeout(() => showPermissionDialog(result), 2000);
   }
 
   // Forward state changes to renderer

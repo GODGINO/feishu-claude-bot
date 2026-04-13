@@ -454,6 +454,19 @@ export function createRoutes(sessionsDir: string, feishuClient?: lark.Client): R
     res.json({ content });
   });
 
+  // PUT /api/sessions/:key/knowledge — update CLAUDE.md
+  router.put('/api/sessions/:key/knowledge', (req: Request, res: Response) => {
+    const key = param(req, 'key');
+    const filePath = path.join(sessionsDir, key, 'CLAUDE.md');
+    const { content } = req.body;
+    if (typeof content !== 'string') {
+      res.status(400).json({ error: 'Missing content' });
+      return;
+    }
+    fs.writeFileSync(filePath, content, 'utf-8');
+    res.json({ ok: true });
+  });
+
   // GET /api/sessions/:key/skills — skills list
   router.get('/api/sessions/:key/skills', (req: Request, res: Response) => {
     const dir = path.join(sessionsDir, param(req, 'key'));

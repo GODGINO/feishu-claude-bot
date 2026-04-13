@@ -183,8 +183,9 @@ async function main() {
   );
   chromeChecker.start();
 
-  // Start admin dashboard + relay server
-  const { relayServer } = startAdminServer(config.sessionsDir, config.adminPort, logger, client, config.adminPassword, memberMgr);
+  // Start admin dashboard + relay server + admin chat
+  const { relayServer, adminChat } = startAdminServer(config.sessionsDir, config.adminPort, logger, client, config.adminPasswords, memberMgr);
+  bridge.setAdminChat(adminChat);
 
   // Start WebSocket connection
   await wsClient.start({ eventDispatcher: dispatcher });
@@ -194,6 +195,7 @@ async function main() {
   const shutdown = () => {
     logger.info('Shutting down...');
     relayServer.destroy();
+    adminChat.destroy();
     wechatBridge.stopAll();
     idleMonitor.stopAll();
     chromeChecker.stop();
