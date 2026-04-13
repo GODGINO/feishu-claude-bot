@@ -1,6 +1,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { execSync } from 'node:child_process';
+import { createHmac } from 'node:crypto';
 import type { Logger } from '../utils/logger.js';
 
 /**
@@ -628,6 +629,7 @@ exec node "${cliPath}" "$@"
       HOME: process.env.HOME || '',
       PROJECT_ROOT: path.dirname(this.sessionsDir),
       TUNNEL_BASE_URL: process.env.CF_TUNNEL_URL || '',
+      RELAY_TOKEN: createHmac('sha256', process.env.RELAY_SECRET || 'sigma-relay-default-secret').update(sessionKey).digest('hex'),
     };
 
     // Add Feishu app credentials from process env (for feishu-im shared MCP)

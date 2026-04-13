@@ -11,6 +11,7 @@ import BlogList from './pages/BlogList'
 
 function LoginPage({ onLogin }: { onLogin: () => void }) {
   const [password, setPassword] = useState('')
+  const [password2, setPassword2] = useState('')
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
 
@@ -18,7 +19,7 @@ function LoginPage({ onLogin }: { onLogin: () => void }) {
     e.preventDefault()
     setLoading(true)
     setError('')
-    const ok = await api.login(password)
+    const ok = await api.login(password, password2)
     setLoading(false)
     if (ok) {
       onLogin()
@@ -36,14 +37,21 @@ function LoginPage({ onLogin }: { onLogin: () => void }) {
           type="password"
           value={password}
           onChange={e => setPassword(e.target.value)}
-          placeholder="Password"
+          placeholder="Password 1"
           autoFocus
+          className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm mb-3 outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
+        />
+        <input
+          type="password"
+          value={password2}
+          onChange={e => setPassword2(e.target.value)}
+          placeholder="Password 2"
           className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm mb-3 outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
         />
         {error && <p className="text-red-500 text-xs mb-3">{error}</p>}
         <button
           type="submit"
-          disabled={loading || !password}
+          disabled={loading || !password || !password2}
           className="w-full py-2 bg-blue-500 text-white rounded-lg text-sm font-medium hover:bg-blue-600 disabled:opacity-50 transition-colors"
         >
           {loading ? '...' : '登录'}
@@ -152,13 +160,13 @@ export default function App() {
   return (
     <div className="flex h-screen overflow-hidden">
       <Sidebar onLogout={() => setAuthed(false)} />
-      <main className="flex-1 p-6 overflow-y-auto">
+      <main className="flex-1 overflow-y-auto">
         <Routes>
-          <Route path="/" element={<Dashboard />} />
           <Route path="/session/:key" element={<SessionDetail />} />
-          <Route path="/members" element={<MemberList />} />
-          <Route path="/members/:openId" element={<MemberDetail />} />
-          <Route path="/blog" element={<BlogList />} />
+          <Route path="/" element={<div className="p-6"><Dashboard /></div>} />
+          <Route path="/members" element={<div className="p-6"><MemberList /></div>} />
+          <Route path="/members/:openId" element={<div className="p-6"><MemberDetail /></div>} />
+          <Route path="/blog" element={<div className="p-6"><BlogList /></div>} />
         </Routes>
       </main>
     </div>

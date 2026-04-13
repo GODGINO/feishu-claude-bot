@@ -37,6 +37,7 @@ export function getState(): ConnectionState {
   return { ...state };
 }
 
+
 export function connect(relayUrl: string, sessionKeys: string[], exec: CommandExecutor): void {
   disconnectInternal(true);
   manualDisconnect = false;

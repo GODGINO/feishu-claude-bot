@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useCallback } from 'react'
 import { useParams } from 'react-router-dom'
 import { api, type SessionDetail as SessionDetailType } from '../lib/api'
 import OverviewTab from '../components/OverviewTab'
@@ -37,32 +37,52 @@ export default function SessionDetail() {
     setMutedLoading(false)
   }
 
+  // Chat input state (lifted here so it lives inside the sticky header)
+  const [chatInput, setChatInput] = useState('')
+  const [chatEcho, setChatEcho] = useState(true)
+  const [chatShowSource, setChatShowSource] = useState(true) // show [ECHO] prefix
+  const [chatSending, setChatSending] = useState(false)
+  const [chatRefreshKey, setChatRefreshKey] = useState(0)
+
+  const sendChat = useCallback(async () => {
+    const text = chatInput.trim()
+    if (!text || chatSending || !key) return
+    setChatSending(true)
+    setChatInput('')
+    try {
+      await api.sendAdminChat(key, text, chatEcho, chatShowSource)
+    } catch { /* ignore */ }
+    setChatSending(false)
+    setChatRefreshKey(k => k + 1)
+  }, [chatInput, chatSending, chatEcho, chatShowSource, key])
+
   if (!key) return null
   if (!session) return <p className="text-slate-400">Loading...</p>
 
   return (
     <div>
-      <div className="flex items-center gap-3 mb-6">
-        <span className={`w-3 h-3 rounded-full ${session.type === 'group' ? 'bg-blue-500' : 'bg-green-500'}`} />
-        <h2 className="text-2xl font-bold">{session.name}</h2>
-        <span className={`px-2 py-0.5 rounded text-xs font-medium ${
-          session.type === 'group' ? 'bg-blue-50 text-blue-700' : 'bg-green-50 text-green-700'
-        }`}>
-          {session.type === 'group' ? 'Group' : 'DM'}
-        </span>
-        <div className="ml-auto flex items-center gap-2">
-          <span className="text-xs text-slate-500">{muted ? 'Muted' : 'Active'}</span>
-          <button
-            onClick={toggleMuted}
-            disabled={mutedLoading}
-            className={`relative w-10 h-5 rounded-full transition-colors ${muted ? 'bg-slate-300' : 'bg-green-500'}`}
-          >
-            <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform ${muted ? 'left-0.5' : 'left-[22px]'}`} />
-          </button>
+      <div className="sticky top-0 z-30 bg-slate-50 px-6 pt-6 pb-0">
+        <div className="flex items-center gap-3 mb-4">
+          <span className={`w-3 h-3 rounded-full ${session.type === 'group' ? 'bg-blue-500' : 'bg-green-500'}`} />
+          <h2 className="text-2xl font-bold">{session.name}</h2>
+          <span className={`px-2 py-0.5 rounded text-xs font-medium ${
+            session.type === 'group' ? 'bg-blue-50 text-blue-700' : 'bg-green-50 text-green-700'
+          }`}>
+            {session.type === 'group' ? 'Group' : 'DM'}
+          </span>
+          <div className="ml-auto flex items-center gap-2">
+            <span className="text-xs text-slate-500">{muted ? 'Muted' : 'Active'}</span>
+            <button
+              onClick={toggleMuted}
+              disabled={mutedLoading}
+              className={`relative w-10 h-5 rounded-full transition-colors ${muted ? 'bg-slate-300' : 'bg-green-500'}`}
+            >
+              <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform ${muted ? 'left-0.5' : 'left-[22px]'}`} />
+            </button>
+          </div>
         </div>
-      </div>
 
-      <div className="flex gap-1 border-b border-slate-200 mb-6">
+        <div className="flex gap-1 border-b border-slate-200">
         {tabs.map(t => (
           <button
             key={t}
@@ -76,15 +96,52 @@ export default function SessionDetail() {
             {t}
           </button>
         ))}
+        </div>
+
+        {tab === 'Chat' && (
+          <div className="border-b border-slate-200 pb-3 pt-3">
+            <div className="flex items-center gap-3 mb-2">
+              <label className="flex items-center gap-1.5 text-xs text-slate-500 cursor-pointer select-none">
+                <input type="checkbox" checked={chatEcho} onChange={e => setChatEcho(e.target.checked)} className="rounded border-slate-300" />
+                Echo to Feishu / WeChat
+              </label>
+              {chatEcho && (
+                <label className="flex items-center gap-1.5 text-xs text-slate-500 cursor-pointer select-none">
+                  <input type="checkbox" checked={chatShowSource} onChange={e => setChatShowSource(e.target.checked)} className="rounded border-slate-300" />
+                  Show [ECHO] source
+                </label>
+              )}
+            </div>
+            <div className="flex gap-2">
+              <input
+                value={chatInput}
+                onChange={e => setChatInput(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat() } }}
+                placeholder="Send a message to Claude..."
+                disabled={chatSending}
+                className="flex-1 border border-slate-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-200 focus:border-blue-400 disabled:opacity-50 disabled:bg-slate-50"
+              />
+              <button
+                onClick={sendChat}
+                disabled={!chatInput.trim() || chatSending}
+                className="px-4 py-2 bg-blue-500 text-white text-sm font-medium rounded-lg hover:bg-blue-600 disabled:opacity-40 transition-colors"
+              >
+                {chatSending ? '...' : 'Send'}
+              </button>
+            </div>
+          </div>
+        )}
       </div>
 
+      <div className="px-6 mt-4">
       {tab === 'Overview' && <OverviewTab session={session} sessionKey={key} onRefresh={() => api.session(key).then(setSession)} />}
       {tab === 'Skills' && <SkillsView sessionKey={key} />}
       {tab === 'Knowledge' && <KnowledgeView sessionKey={key} />}
       {tab === 'Cron Jobs' && <CronJobTable sessionKey={key} />}
-      {tab === 'Chat' && <ChatHistory sessionKey={key} />}
+      {tab === 'Chat' && <ChatHistory sessionKey={key} refreshKey={chatRefreshKey} />}
       {tab === 'Email' && <EmailView sessionKey={key} />}
       {tab === 'Memory' && <MemoryView sessionKey={key} />}
+      </div>
     </div>
   )
 }

@@ -55,10 +55,13 @@ export class MessageBridge {
   private recentMessageIds = new Set<string>();
   private memberMgr?: MemberManager;
   private wechatBridge?: WechatBridge;
-  // Track WeChat original text per session for combined Feishu echo+reply
+  private adminChat?: import('../admin/admin-chat.js').AdminChatServer;
+  // Track original text per session for cross-channel echo
   private wechatPendingEcho = new Map<string, string>();
-  // Track Feishu original text per session for combined WeChat echo+reply
   private feishuPendingEcho = new Map<string, string>();
+  // Track active card streamers per session — used to finalize stale agent cards on new turn
+  private activeStreamers = new Map<string, import('../feishu/card-streamer.js').CardStreamer>();
+  private adminChatPendingEcho = new Map<string, { text: string; echo: boolean; showSource: boolean }>();
 
 
   constructor(
@@ -146,6 +149,53 @@ export class MessageBridge {
     });
   }
 
+  /** Set the Admin Chat server for three-way echo and message routing. */
+  setAdminChat(adminChat: import('../admin/admin-chat.js').AdminChatServer): void {
+    this.adminChat = adminChat;
+    adminChat.onMessage = async (sessionKey: string, text: string, echo: boolean, showSource: boolean) => {
+      await this.handleAdminChatMessage(sessionKey, text, echo, showSource);
+    };
+  }
+
+  /** Handle a message from Admin Chat — route to Claude, optionally echo to Feishu/WeChat. */
+  private async handleAdminChatMessage(sessionKey: string, text: string, echo: boolean, showSource: boolean): Promise<void> {
+    const session = this.sessionMgr.getOrCreate(sessionKey);
+    const chatIdFile = path.join(session.sessionDir, 'chat-id');
+    let chatId = '';
+    try { chatId = fs.readFileSync(chatIdFile, 'utf-8').trim(); } catch { /* ignore */ }
+    if (!chatId) {
+      this.logger.warn({ sessionKey }, 'No chat-id for admin chat routing');
+      this.adminChat?.sendError(sessionKey, 'No chat-id found for this session');
+      return;
+    }
+
+    this.logger.info({ sessionKey, textLen: text.length, echo }, 'Admin chat → Claude');
+
+    // Store for echo
+    this.adminChatPendingEcho.set(sessionKey, { text, echo, showSource });
+
+    // Record admin message to group context (for chat history persistence)
+    if (!this.groupContext['buffers'].has(chatId)) {
+      this.groupContext.load(session.sessionDir, chatId);
+    }
+    this.groupContext.add(chatId, {
+      timestamp: Date.now(),
+      senderName: 'Admin',
+      senderId: 'admin',
+      text,
+    });
+    this.groupContext.save(session.sessionDir, chatId);
+
+    await this.executeAndReply({
+      sessionKey,
+      chatId,
+      prompt: `<admin>${text}</admin>`,
+      sessionDir: session.sessionDir,
+      replyToMessageId: undefined,
+      isNonMentionGroup: false,
+    });
+  }
+
   /** Handle a message from WeChat — route directly to Claude, then send combined reply to Feishu. */
   private async handleWechatMessage(sessionKey: string, text: string, wechatUserId: string, attachments?: import('../wechat/wechat-bridge.js').WechatAttachment[]): Promise<void> {
     const session = this.sessionMgr.getOrCreate(sessionKey);
@@ -161,7 +211,9 @@ export class MessageBridge {
     const userId = sessionKey.replace('dm_', '');
     const senderName = this.resolveSenderName(undefined, userId);
     const mcpHint = getFeishuMcpHint(session.sessionDir, userId);
-    const prompt = `[发送者: ${senderName} | id: ${userId}]${mcpHint}\n${text}`;
+    const safeName = senderName.replace(/[\n\r\]]/g, ' ');
+    const safeId = userId.replace(/[\n\r\]]/g, '');
+    const prompt = `[发送者: ${safeName} | id: ${safeId}]${mcpHint}\n${text}`;
 
     this.logger.info({ sessionKey, textLen: text.length }, 'WeChat message → Claude');
 
@@ -416,7 +468,9 @@ export class MessageBridge {
       // Add user identity prefix (for group chats or general context)
       if (userName) {
         const mcpHint = getFeishuMcpHint(session.sessionDir, msg.userId);
-        prompt = `[发送者: ${userName} | id: ${msg.userId}]${mcpHint ? ' ' + mcpHint : ''} ${prompt}`;
+        const safeUserName = userName.replace(/[\n\r\]]/g, ' ');
+        const safeMsgUserId = msg.userId.replace(/[\n\r\]]/g, '');
+        prompt = `[发送者: ${safeUserName} | id: ${safeMsgUserId}]${mcpHint ? ' ' + mcpHint : ''} ${prompt}`;
       }
 
       // Inject MEMBER.md (per-user profile, via symlinked members/ dir)
@@ -772,12 +826,20 @@ export class MessageBridge {
 
     this.logger.info({ sessionKey, isNonMentionGroup, isCronJob }, 'Entering reply pipeline');
 
+    // If previous turn's card is still waiting for agents, finalize it now.
+    const prevStreamer = this.activeStreamers.get(sessionKey);
+    if (prevStreamer?.isWaitingForAgents()) {
+      this.logger.info({ sessionKey }, 'New turn started — finalizing stale agent card from previous turn');
+      prevStreamer.finalizeAfterAgents();
+    }
+
     // Start WeChat typing indicator if bound
     if (this.wechatBridge?.isActive(sessionKey)) {
       this.wechatBridge.startTyping(sessionKey).catch(() => {});
     }
 
     const streamer = new CardStreamer(this.sender.larkClient, this.logger);
+    this.activeStreamers.set(sessionKey, streamer);
 
     // Pass session info to streamer for button rendering + card cache
     streamer.sessionKey = sessionKey;
@@ -821,10 +883,13 @@ export class MessageBridge {
     this.runner.onTextStream(sessionKey, onText);
     this.runner.onToolStream(sessionKey, onTool);
 
-    // Track running subagents
+    // Track running subagents — only real background agents (local_agent), not background bash tasks
     const runningAgents = new Map<string, { toolUseId?: string; description?: string }>();
     this.runner.onSubagentStream(sessionKey, (_key, event) => {
       if (event.type === 'started') {
+        // Only track local_agent as a real background agent that should block card completion.
+        // local_bash and other task types complete within the same turn and don't need waiting.
+        if (event.taskType && event.taskType !== 'local_agent') return;
         runningAgents.set(event.taskId, { toolUseId: event.toolUseId, description: event.description });
         if (event.toolUseId) streamer.registerSubagent(event.taskId, event.toolUseId);
       } else if (event.type === 'progress') {
@@ -852,13 +917,14 @@ export class MessageBridge {
       });
 
       const isFromWechat = this.wechatPendingEcho.has(sessionKey);
+      const isFromAdmin = this.adminChatPendingEcho.has(sessionKey);
 
       let rawText = result.fullText || '';
       // Process <<REACT:emoji>> — send reactions only if there's a real message to react to
-      // For WeChat messages: keep REACT tags, apply them after the Feishu echo is sent
+      // For WeChat/Admin messages: keep REACT tags, apply them after the echo is sent
       if (replyToMessageId) {
         rawText = await this.processReactions(rawText, replyToMessageId);
-      } else if (!isFromWechat) {
+      } else if (!isFromWechat && !isFromAdmin) {
         // Cron job or other no-reply context: strip REACT tags
         rawText = rawText.replace(/<<REACT:\w+>>/g, '').trim();
       }
@@ -885,6 +951,11 @@ export class MessageBridge {
       } else if (isFromWechat) {
         // WeChat message without tools → no card, dual-send handles combined Feishu message.
         this.logger.info({ sessionKey, textLen: cleanText.length }, 'WeChat message — Feishu reply deferred to dual-send');
+        await this.sendMentionedFiles(chatId, cleanText, sessionDir, undefined, undefined, sessionKey);
+        this.runner.onSubagentStream(sessionKey, undefined);
+      } else if (isFromAdmin) {
+        // Admin chat message → Feishu reply deferred to echo in finally block (if echo enabled)
+        this.logger.info({ sessionKey, textLen: cleanText.length }, 'Admin chat — Feishu reply deferred to echo');
         await this.sendMentionedFiles(chatId, cleanText, sessionDir, undefined, undefined, sessionKey);
         this.runner.onSubagentStream(sessionKey, undefined);
       } else if (runningAgents.size > 0) {
@@ -956,8 +1027,12 @@ export class MessageBridge {
       this.runner.onTextStream(sessionKey, undefined);
       this.runner.onToolStream(sessionKey, undefined);
 
-      // WeChat dual-send
-      if (this.wechatBridge?.isActive(sessionKey) && bufferedText && bufferedText !== 'NO_REPLY') {
+      // Admin echo info — read early so WeChat dual-send can check it
+      const adminEchoInfo = this.adminChatPendingEcho.get(sessionKey);
+      this.adminChatPendingEcho.delete(sessionKey);
+
+      // WeChat dual-send (skip if message is from admin — admin echo handles WeChat separately)
+      if (this.wechatBridge?.isActive(sessionKey) && bufferedText && bufferedText !== 'NO_REPLY' && !adminEchoInfo) {
         const wechatEcho = this.wechatPendingEcho.get(sessionKey);
         const feishuEcho = this.feishuPendingEcho.get(sessionKey);
         this.wechatPendingEcho.delete(sessionKey);
@@ -993,6 +1068,55 @@ export class MessageBridge {
           } else {
             this.wechatBridge.sendToWechat(sessionKey, bufferedText).catch(err => {
               this.logger.warn({ err, sessionKey }, 'Failed to send reply to WeChat');
+            });
+          }
+        }
+      }
+
+      // Admin Chat echo
+
+      if (bufferedText && bufferedText !== 'NO_REPLY') {
+        // Echo TO admin (when message is from Feishu/WeChat)
+        if (this.adminChat?.isConnected(sessionKey) && !adminEchoInfo) {
+          const wEcho = this.wechatPendingEcho.get(sessionKey);
+          const fEcho = this.feishuPendingEcho.get(sessionKey);
+          const source = wEcho ? '微信' : '飞书';
+          const originalText = wEcho || fEcho || '';
+          if (originalText) {
+            this.adminChat.sendEcho(sessionKey, source, originalText, bufferedText);
+          } else {
+            this.adminChat.sendToAdmin(sessionKey, bufferedText);
+          }
+        }
+
+        // Echo FROM admin to Feishu + WeChat (when echo checkbox was on)
+        if (adminEchoInfo?.echo) {
+          // Extract REACT tags before building display text
+          const reactPattern = /<<REACT:(\w+)>>/g;
+          const reactEmojis: string[] = [];
+          const cleanReply = bufferedText.replace(reactPattern, (_, emoji) => { reactEmojis.push(emoji); return ''; }).trim();
+
+          // showSource: true → "[ECHO] 原文\n\n回复", false → 仅回复
+          const feishuText = adminEchoInfo.showSource
+            ? `> [ECHO] ${adminEchoInfo.text}\n\n${cleanReply}`
+            : cleanReply;
+          const wechatText = adminEchoInfo.showSource
+            ? `\`[ECHO] ${adminEchoInfo.text}\`\n\n${cleanReply}`
+            : cleanReply;
+
+          this.sender.sendReply(chatId, feishuText, undefined, sessionDir).then(msgId => {
+            // Apply REACT emojis to the sent Feishu echo message
+            if (msgId && reactEmojis.length > 0) {
+              for (const emoji of reactEmojis) {
+                this.processReactions(`<<REACT:${emoji}>>`, msgId).catch(() => {});
+              }
+            }
+          }).catch(err => {
+            this.logger.warn({ err, sessionKey }, 'Failed to send admin echo to Feishu');
+          });
+          if (this.wechatBridge?.isActive(sessionKey)) {
+            this.wechatBridge.sendToWechat(sessionKey, wechatText).catch(err => {
+              this.logger.warn({ err, sessionKey }, 'Failed to send admin echo to WeChat');
             });
           }
         }

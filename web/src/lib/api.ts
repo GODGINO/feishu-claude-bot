@@ -178,6 +178,8 @@ export const api = {
   sessions: () => fetchJson<SessionSummary[]>('/sessions'),
   session: (key: string) => fetchJson<SessionDetail>(`/sessions/${key}`),
   knowledge: (key: string) => fetchJson<{ content: string }>(`/sessions/${key}/knowledge`),
+  updateKnowledge: (key: string, content: string) =>
+    mutate('PUT', `/sessions/${key}/knowledge`, { content }),
   cron: (key: string) => fetchJson<CronJob[]>(`/sessions/${key}/cron`),
   chat: (key: string, page = 1, limit = 50) =>
     fetchJson<ChatResponse>(`/sessions/${key}/chat?page=${page}&limit=${limit}`),
@@ -199,11 +201,11 @@ export const api = {
     const res = await fetch(`${BASE}/auth/check`);
     return res.ok;
   },
-  login: async (password: string) => {
+  login: async (password: string, password2: string) => {
     const res = await fetch(`${BASE}/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ password }),
+      body: JSON.stringify({ password, password2 }),
     });
     return res.ok;
   },
@@ -257,4 +259,8 @@ export const api = {
     mutate('PUT', `/members/${openId}/member-md`, { content }),
   deleteMember: (openId: string) =>
     mutate('DELETE', `/members/${openId}`),
+
+  // Admin chat — send message via REST
+  sendAdminChat: (sessionKey: string, text: string, echo: boolean, showSource = true) =>
+    mutate('POST', `/sessions/${sessionKey}/chat/send`, { text, echo, showSource }),
 };

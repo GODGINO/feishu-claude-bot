@@ -14,7 +14,7 @@ export interface ParseResult {
   error?: string;
   toolUse?: { name: string; input?: string; toolUseId?: string };
   toolResult?: { toolUseId: string; isError?: boolean };
-  subagentStart?: { taskId: string; description: string; toolUseId?: string };
+  subagentStart?: { taskId: string; description: string; toolUseId?: string; taskType?: string };
   subagentProgress?: { taskId: string; toolName: string; description: string; toolUseId?: string };
   subagentEnd?: { taskId: string; status: 'completed' | 'stopped'; summary?: string; toolUseId?: string };
 }
@@ -60,6 +60,7 @@ export class StreamParser {
             taskId: msg.task_id,
             description: msg.description || '',
             toolUseId: msg.tool_use_id,
+            taskType: msg.task_type || '',
           };
         }
         // task_progress = subagent tool call step

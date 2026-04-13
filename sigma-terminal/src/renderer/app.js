@@ -103,11 +103,21 @@ $('addBtn').addEventListener('click', async () => {
   $('addBtn').disabled = true;
   $('addBtn').textContent = '...';
 
-  const info = await window.electronAPI.resolveSessionName(RELAY_URL, key);
+  // Try to resolve name from server, fallback to short key
+  let name = key;
+  try {
+    const info = await window.electronAPI.resolveSessionName(RELAY_URL, key);
+    if (info?.name) name = info.name;
+  } catch { /* use raw key */ }
+  if (name === key) {
+    // Show short version: dm_ou_2927a2d... or group_oc_365089...
+    name = key.length > 20 ? key.slice(0, 18) + '...' : key;
+  }
+
   sessions.push({
     key,
-    name: info?.name || key,
-    type: info?.type || (key.startsWith('dm_') ? 'dm' : 'group'),
+    name,
+    type: key.startsWith('dm_') ? 'dm' : 'group',
   });
 
   await saveSessions();

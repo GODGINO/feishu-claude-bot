@@ -241,7 +241,6 @@ export class CardStreamer {
       tc.status = status;
       tc.endTime = Date.now();
       // Cascade: when an Agent finishes, also mark any still-running children as complete.
-      // Guards against races where completeSubagentSteps missed children.
       if (tc.children && tc.children.length > 0) {
         for (const child of tc.children) {
           if (child.status === 'running') {
@@ -434,21 +433,32 @@ export class CardStreamer {
     this.updateText(this.pendingText);
   }
 
-  /** Mark all running children of a subagent as complete. */
+  /** Mark all running children of a subagent as complete, and the Agent itself. */
   completeSubagentSteps(taskId: string): void {
     const agentToolUseId = this.taskIdToToolUseId.get(taskId);
     const agent = agentToolUseId
       ? this.toolCalls.find(t => t.toolUseId === agentToolUseId)
       : undefined;
-    if (!agent?.children) return;
 
-    for (const child of agent.children) {
-      if (child.status === 'running') {
-        child.status = 'complete';
-        child.endTime = Date.now();
+    this.taskIdToToolUseId.delete(taskId);
+
+    if (agent) {
+      // Mark children as complete
+      if (agent.children) {
+        for (const child of agent.children) {
+          if (child.status === 'running') {
+            child.status = 'complete';
+            child.endTime = Date.now();
+          }
+        }
+      }
+      // Now mark the Agent tool call itself as complete
+      if (agent.status === 'running') {
+        agent.status = 'complete';
+        agent.endTime = Date.now();
       }
     }
-    this.taskIdToToolUseId.delete(taskId);
+
     this.updateText(this.pendingText);
   }
 

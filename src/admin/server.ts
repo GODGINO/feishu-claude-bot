@@ -5,13 +5,15 @@ import * as fs from 'node:fs';
 import type * as lark from '@larksuiteoapi/node-sdk';
 import { createRoutes } from './routes.js';
 import { RelayServer } from '../relay/relay-server.js';
+import { AdminChatServer } from './admin-chat.js';
 import type { RelayCommand } from '../relay/protocol.js';
-import { randomUUID, createHmac } from 'node:crypto';
+import { randomUUID, createHmac, timingSafeEqual } from 'node:crypto';
 import httpProxy from 'http-proxy';
 
 export interface AdminServerResult {
   httpServer: http.Server;
   relayServer: RelayServer;
+  adminChat: AdminChatServer;
 }
 
 /** Generate a signed auth token */
@@ -21,12 +23,19 @@ function signToken(password: string): string {
   return `${payload}.${sig}`;
 }
 
-/** Verify a signed auth token */
+/** Verify a signed auth token (timing-safe) */
 function verifyToken(token: string, password: string): boolean {
   const [payload, sig] = token.split('.');
   if (!payload || !sig) return false;
+  // Check token age — reject tokens older than 7 days
+  const age = Date.now() - parseInt(payload);
+  if (isNaN(age) || age > 7 * 24 * 60 * 60 * 1000 || age < 0) return false;
   const expected = createHmac('sha256', password).update(payload).digest('hex').slice(0, 16);
-  return sig === expected;
+  try {
+    return timingSafeEqual(Buffer.from(sig, 'utf-8'), Buffer.from(expected, 'utf-8'));
+  } catch {
+    return false;
+  }
 }
 
 /** Parse cookie header and extract a value */
@@ -41,13 +50,32 @@ export function startAdminServer(
   port: number,
   logger: { info: (...args: any[]) => void; warn: (...args: any[]) => void; error: (...args: any[]) => void },
   feishuClient?: lark.Client,
-  adminPassword?: string,
+  adminPasswords?: string[],
   memberMgr?: any,
 ): AdminServerResult {
   const app = express();
   app.use(express.json());
 
-  const authEnabled = !!adminPassword;
+  const authEnabled = !!adminPasswords && adminPasswords.length >= 2;
+  // Dual-password: both must be correct simultaneously
+  const masterSecret = adminPasswords?.join(':') || '';
+
+  /** Check if both passwords match (dual-password mode) */
+  function isValidDualPassword(pw1: string, pw2: string): boolean {
+    if (!adminPasswords || adminPasswords.length < 2) return false;
+    return pw1 === adminPasswords[0] && pw2 === adminPasswords[1];
+  }
+
+  /** Check if a token is valid */
+  function isValidToken(token: string): boolean {
+    if (!masterSecret) return false;
+    return verifyToken(token, masterSecret);
+  }
+
+  // ── Rate limiting for login ──
+  const loginAttempts = new Map<string, { count: number; lockedUntil: number }>();
+  const MAX_LOGIN_ATTEMPTS = 5;
+  const LOCKOUT_DURATION = 5 * 60 * 1000; // 5 minutes
 
   // ── Auth endpoints (no middleware) ──
 
@@ -56,13 +84,31 @@ export function startAdminServer(
       res.json({ ok: true });
       return;
     }
-    const { password } = req.body;
-    if (password !== adminPassword) {
+    const ip = req.ip || 'unknown';
+    const attempts = loginAttempts.get(ip);
+    if (attempts && attempts.lockedUntil > Date.now()) {
+      const retryAfter = Math.ceil((attempts.lockedUntil - Date.now()) / 1000);
+      logger.warn({ ip, retryAfter }, 'Login rate limited');
+      res.status(429).json({ error: `Too many attempts. Retry after ${retryAfter}s` });
+      return;
+    }
+    const { password, password2 } = req.body;
+    if (!isValidDualPassword(password || '', password2 || '')) {
+      const current = loginAttempts.get(ip) || { count: 0, lockedUntil: 0 };
+      current.count++;
+      if (current.count >= MAX_LOGIN_ATTEMPTS) {
+        current.lockedUntil = Date.now() + LOCKOUT_DURATION;
+        current.count = 0;
+      }
+      loginAttempts.set(ip, current);
+      logger.warn({ ip, failCount: current.count }, 'Failed admin login attempt');
       res.status(401).json({ error: 'Wrong password' });
       return;
     }
-    const token = signToken(adminPassword);
-    res.setHeader('Set-Cookie', `sigma_token=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=604800`);
+    loginAttempts.delete(ip);
+    const token = signToken(masterSecret); // Sign with combined secret
+    const secure = process.env.NODE_ENV === 'production' ? '; Secure' : '';
+    res.setHeader('Set-Cookie', `sigma_token=${token}; Path=/; HttpOnly; SameSite=Strict${secure}; Max-Age=604800`);
     res.json({ ok: true });
   });
 
@@ -72,7 +118,7 @@ export function startAdminServer(
       return;
     }
     const token = getCookie(req.headers.cookie, 'sigma_token');
-    if (token && verifyToken(token, adminPassword!)) {
+    if (token && isValidToken(token)) {
       res.json({ authenticated: true });
     } else {
       res.status(401).json({ authenticated: false });
@@ -88,13 +134,13 @@ export function startAdminServer(
 
   if (authEnabled) {
     app.use('/api', (req, res, next) => {
-      // Skip auth for: login/check/logout, relay endpoints, session-names (extension)
-      if (req.path.startsWith('/auth/') || req.path.startsWith('/relay/') || req.path === '/session-names') {
+      // Skip auth for: login/check/logout, relay command (token-authed)
+      if (req.path.startsWith('/auth/') || req.path === '/relay/command') {
         next();
         return;
       }
       const token = getCookie(req.headers.cookie, 'sigma_token');
-      if (token && verifyToken(token, adminPassword!)) {
+      if (token && isValidToken(token)) {
         next();
       } else {
         res.status(401).json({ error: 'Unauthorized' });
@@ -110,16 +156,21 @@ export function startAdminServer(
   // API routes
   app.use(createRoutes(sessionsDir, feishuClient));
 
-  // Serve downloadable files (DMG, zip) — no auth required
-  const downloadsDir = path.join(process.cwd());
+  // Serve downloadable files (DMG, zip) — no auth required, strict whitelist
+  const downloadsDir = path.resolve(process.cwd());
   app.get('/download/:filename', (req, res) => {
     const filename = req.params.filename;
-    // Only allow specific file extensions
-    if (!/\.(dmg|zip)$/.test(filename)) {
+    // Strict: only allow simple filenames with allowed extensions, no path separators
+    if (!/^[a-zA-Z0-9._-]+\.(dmg|zip|exe)$/.test(filename) || filename.includes('..')) {
       res.status(403).send('Forbidden');
       return;
     }
-    const filePath = path.join(downloadsDir, filename);
+    const filePath = path.resolve(downloadsDir, filename);
+    // Ensure resolved path is still inside downloads dir (prevents traversal)
+    if (!filePath.startsWith(downloadsDir + path.sep) && filePath !== path.join(downloadsDir, filename)) {
+      res.status(403).send('Forbidden');
+      return;
+    }
     if (!fs.existsSync(filePath)) {
       res.status(404).send('File not found');
       return;
@@ -128,7 +179,7 @@ export function startAdminServer(
   });
 
   // Relay command API — MCP server sends commands here
-  const relayServer = new RelayServer(logger);
+  const relayServer = new RelayServer(logger, sessionsDir);
 
   app.post('/api/relay/command', async (req, res) => {
     const { sessionKey, tool, params } = req.body;
@@ -149,6 +200,26 @@ export function startAdminServer(
     }
   });
 
+  // Admin chat — send message to Claude session (auth-protected, fire-and-forget)
+  app.post('/api/sessions/:key/chat/send', (req, res) => {
+    const sessionKey = req.params.key.startsWith('group_') || req.params.key.startsWith('dm_')
+      ? req.params.key : `group_${req.params.key}`;
+    const { text, echo, showSource } = req.body;
+    if (!text) {
+      res.status(400).json({ error: 'Missing text' });
+      return;
+    }
+    if (adminChat.onMessage) {
+      adminChat.onMessage(sessionKey, text, echo ?? true, showSource ?? true).catch((err: any) => {
+        logger.error({ err, sessionKey }, 'Admin chat send failed');
+      });
+      res.json({ ok: true });
+    } else {
+      res.status(503).json({ error: 'Admin chat not initialized' });
+    }
+  });
+
+  // Status endpoint — require admin auth (no longer public)
   app.get('/api/relay/status', (_req, res) => {
     res.json({ connections: relayServer.getStatus() });
   });
@@ -174,14 +245,20 @@ export function startAdminServer(
     return null;
   }
 
-  // Match /tunnel/:sessionKey and /tunnel/:sessionKey/anything
+  // Match /tunnel/:sessionKey — requires admin auth (prevents public SSRF)
   app.use('/tunnel/:sessionKey', (req, res) => {
+    if (authEnabled) {
+      const token = getCookie(req.headers.cookie, 'sigma_token');
+      if (!token || !isValidToken(token)) {
+        res.status(401).json({ error: 'Unauthorized' });
+        return;
+      }
+    }
     const target = getTunnelTarget(req.params.sessionKey);
     if (!target) {
       res.status(404).send('Tunnel not active for this session');
       return;
     }
-    // req.url is already stripped of the mount prefix by express
     tunnelProxy.web(req, res, { target, changeOrigin: true });
   });
 
@@ -197,25 +274,58 @@ export function startAdminServer(
 
   const httpServer = http.createServer(app);
 
-  // WebSocket upgrade for tunnel proxy
+  relayServer.attach(httpServer);
+
+  const adminChat = new AdminChatServer(logger);
+  adminChat.attach(httpServer);
+
+  // Centralized WebSocket upgrade routing (all WSS use noServer mode)
   httpServer.on('upgrade', (req, socket, head) => {
-    const match = req.url?.match(/^\/tunnel\/([^/]+)(\/.*)?$/);
-    if (match) {
-      const target = getTunnelTarget(match[1]);
+    const pathname = new URL(req.url || '', 'http://localhost').pathname;
+
+    // Helper: verify admin cookie from WebSocket upgrade request
+    const isAdminAuthed = (): boolean => {
+      if (!authEnabled) return true;
+      const cookie = getCookie(req.headers.cookie, 'sigma_token');
+      return !!cookie && isValidToken(cookie);
+    };
+
+    // Tunnel proxy — requires admin auth
+    const tunnelMatch = pathname.match(/^\/tunnel\/([^/]+)(\/.*)?$/);
+    if (tunnelMatch) {
+      if (!isAdminAuthed()) { socket.destroy(); return; }
+      const target = getTunnelTarget(tunnelMatch[1]);
       if (target) {
-        req.url = match[2] || '/';
+        req.url = tunnelMatch[2] || '/';
         tunnelProxy.ws(req, socket, head, { target, changeOrigin: true });
         return;
       }
     }
-    // Let relay server handle other WebSocket upgrades (handled by attach below)
-  });
 
-  relayServer.attach(httpServer);
+    // Relay server (browser extension / terminal app) — token-based auth in RelayServer
+    if (pathname === '/relay') {
+      relayServer.handleUpgrade(req, socket, head);
+      return;
+    }
+
+    // Admin chat — requires admin auth cookie
+    if (pathname === '/admin-chat') {
+      if (!isAdminAuthed()) {
+        logger.warn('Admin chat WebSocket rejected: no valid auth cookie');
+        socket.destroy();
+        return;
+      }
+      adminChat.handleUpgrade(req, socket, head);
+      return;
+    }
+
+    // Unknown path — destroy
+    socket.destroy();
+  });
 
   httpServer.listen(port, '127.0.0.1', () => {
     logger.info(`Admin dashboard running at http://127.0.0.1:${port} (localhost only, use CF tunnel for external access)`);
   });
 
-  return { httpServer, relayServer };
+  return { httpServer, relayServer, adminChat };
 }
