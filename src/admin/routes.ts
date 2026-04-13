@@ -559,8 +559,15 @@ export function createRoutes(sessionsDir: string, feishuClient?: lark.Client): R
     const key = param(req, 'key');
     if (!validSessionKey(key)) { res.status(400).json({ error: 'Invalid session key' }); return; }
     const dir = path.join(sessionsDir, key);
-    const variables = parseSessionEnv(dir);
-    const envKeys = new Set(variables.map(v => v.key));
+    const rawVariables = parseSessionEnv(dir);
+    // Mask sensitive values (password, secret, token, key)
+    const variables = rawVariables.map(v => {
+      if (/password|secret|token|key|credential/i.test(v.key) && v.value) {
+        return { key: v.key, value: v.value.slice(0, 3) + '***' };
+      }
+      return v;
+    });
+    const envKeys = new Set(rawVariables.map(v => v.key));
 
     // Build skill -> env var mapping
     const skillEnvMap: Record<string, string[]> = {};
@@ -597,8 +604,12 @@ export function createRoutes(sessionsDir: string, feishuClient?: lark.Client): R
     if (!fs.existsSync(dir)) { res.status(404).json({ error: 'Session not found' }); return; }
     const { variables } = req.body as { variables: { key: string; value: string }[] };
     if (!Array.isArray(variables)) { res.status(400).json({ error: 'Invalid variables' }); return; }
+    // Blocklist: prevent overriding dangerous environment variables
+    const BLOCKED_VARS = new Set(['PATH', 'LD_PRELOAD', 'LD_LIBRARY_PATH', 'DYLD_INSERT_LIBRARIES',
+      'NODE_OPTIONS', 'HOME', 'SHELL', 'USER', 'LOGNAME', 'PYTHONPATH', 'RUBYLIB', 'PERL5LIB']);
     const lines = variables
-      .filter(v => v.key && typeof v.key === 'string')
+      .filter(v => v.key && typeof v.key === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(v.key.trim()))
+      .filter(v => !BLOCKED_VARS.has(v.key.trim().toUpperCase()))
       .map(v => `${v.key.trim()}=${v.value ?? ''}`);
     fs.writeFileSync(path.join(dir, 'session.env'), lines.join('\n') + '\n');
     res.json({ ok: true });

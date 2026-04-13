@@ -3,9 +3,23 @@
  */
 
 import { adbExec } from './adb-runner';
+import * as path from 'path';
+import * as os from 'os';
+import * as fs from 'fs';
 
 export async function adbInstall(apkPath: string, serial?: string): Promise<{ installed: string }> {
-  const r = await adbExec(['install', '-r', apkPath], serial, 120_000);
+  // Validate: must be .apk file within home directory
+  const resolved = path.resolve(apkPath);
+  if (!resolved.startsWith(os.homedir())) {
+    throw new Error('APK path must be within home directory');
+  }
+  if (!resolved.endsWith('.apk')) {
+    throw new Error('Only .apk files can be installed');
+  }
+  if (!fs.existsSync(resolved)) {
+    throw new Error(`APK not found: ${resolved}`);
+  }
+  const r = await adbExec(['install', '-r', resolved], serial, 120_000);
   if (r.code !== 0) throw new Error(r.stderr || `install failed`);
   if (!r.stdout.includes('Success')) {
     throw new Error(`install reported failure: ${r.stdout}`);

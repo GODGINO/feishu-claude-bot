@@ -257,6 +257,12 @@ export function startAdminServer(
     tunnelProxy.web(req, res, { target, changeOrigin: true });
   });
 
+  // Global error handler — suppress stack traces in production
+  app.use((err: any, _req: any, res: any, _next: any) => {
+    logger.error({ err: err.message || err }, 'Unhandled API error');
+    res.status(500).json({ error: 'Internal server error' });
+  });
+
   // Serve frontend static files (production)
   const webDist = path.join(process.cwd(), 'web', 'dist');
   if (fs.existsSync(webDist)) {

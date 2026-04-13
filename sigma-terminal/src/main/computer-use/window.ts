@@ -6,6 +6,18 @@ import { spawn } from 'child_process';
 
 const IS_WIN = process.platform === 'win32';
 
+function sanitizeName(name: string): string {
+  const clean = name.replace(/[^a-zA-Z0-9\s.\-_\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/g, '');
+  if (!clean) throw new Error('Invalid name');
+  return clean;
+}
+
+function sanitizeNumber(n: number): number {
+  const num = Math.round(n);
+  if (!Number.isFinite(num) || num < -10000 || num > 100000) throw new Error('Invalid coordinate');
+  return num;
+}
+
 function runCmd(cmd: string, args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
     const proc = spawn(cmd, args);
@@ -33,6 +45,7 @@ export interface WindowInfo {
 }
 
 export async function windowList(appFilter?: string): Promise<{ windows: WindowInfo[] }> {
+  if (appFilter) appFilter = sanitizeName(appFilter);
   if (IS_WIN) {
     const filter = appFilter
       ? `Where-Object { $_.MainWindowHandle -ne 0 -and $_.ProcessName -eq '${appFilter}' }`
@@ -111,6 +124,9 @@ Get-Process | ${filter} | ForEach-Object {
 export async function windowResize(
   app: string, x: number, y: number, width: number, height: number,
 ): Promise<{ resized: { app: string; x: number; y: number; width: number; height: number } }> {
+  app = sanitizeName(app);
+  x = sanitizeNumber(x); y = sanitizeNumber(y);
+  width = sanitizeNumber(width); height = sanitizeNumber(height);
   if (IS_WIN) {
     const script = `
 Add-Type @"
