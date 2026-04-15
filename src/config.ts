@@ -73,7 +73,7 @@ export function loadConfig(): Config {
     },
     sessionsDir: optional('SESSIONS_DIR', path.join(process.cwd(), 'sessions')),
     maxConcurrent: parseInt(optional('MAX_CONCURRENT', '3'), 10),
-    maxQueuePerSession: parseInt(optional('MAX_QUEUE_PER_SESSION', '5'), 10),
+    maxQueuePerSession: parseInt(optional('MAX_QUEUE_PER_SESSION', '10'), 10),
     processTimeout: parseInt(optional('PROCESS_TIMEOUT', '120000'), 10),
     logLevel: optional('LOG_LEVEL', 'info'),
     adminPort: parseInt(optional('ADMIN_PORT', '3333'), 10),
