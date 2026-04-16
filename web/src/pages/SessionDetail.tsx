@@ -40,7 +40,9 @@ export default function SessionDetail() {
   // Chat input state (lifted here so it lives inside the sticky header)
   const [chatInput, setChatInput] = useState('')
   const [chatEcho, setChatEcho] = useState(true)
-  const [chatShowSource, setChatShowSource] = useState(true) // show [ECHO] prefix
+  const [chatShowSource, setChatShowSource] = useState(true)
+  const [chatSendAsSigma, setChatSendAsSigma] = useState(false)
+  const [chatAddToContext, setChatAddToContext] = useState(true)
   const [chatSending, setChatSending] = useState(false)
   const [chatRefreshKey, setChatRefreshKey] = useState(0)
 
@@ -50,11 +52,11 @@ export default function SessionDetail() {
     setChatSending(true)
     setChatInput('')
     try {
-      await api.sendAdminChat(key, text, chatEcho, chatShowSource)
+      await api.sendAdminChat(key, text, chatSendAsSigma ? false : chatEcho, chatShowSource, chatSendAsSigma, chatAddToContext)
     } catch { /* ignore */ }
     setChatSending(false)
     setChatRefreshKey(k => k + 1)
-  }, [chatInput, chatSending, chatEcho, chatShowSource, key])
+  }, [chatInput, chatSending, chatEcho, chatShowSource, chatSendAsSigma, chatAddToContext, key])
 
   if (!key) return null
   if (!session) return <p className="text-slate-400">Loading...</p>
@@ -100,15 +102,25 @@ export default function SessionDetail() {
 
         {tab === 'Chat' && (
           <div className="border-b border-slate-200 pb-3 pt-3">
-            <div className="flex items-center gap-3 mb-2">
+            <div className="flex items-center gap-3 mb-2 flex-wrap">
               <label className="flex items-center gap-1.5 text-xs text-slate-500 cursor-pointer select-none">
-                <input type="checkbox" checked={chatEcho} onChange={e => setChatEcho(e.target.checked)} className="rounded border-slate-300" />
+                <input type="checkbox" checked={chatEcho} onChange={e => { setChatEcho(e.target.checked); if (e.target.checked) setChatSendAsSigma(false); }} className="rounded border-slate-300" />
                 Echo to Feishu / WeChat
               </label>
-              {chatEcho && (
+              {chatEcho && !chatSendAsSigma && (
                 <label className="flex items-center gap-1.5 text-xs text-slate-500 cursor-pointer select-none">
                   <input type="checkbox" checked={chatShowSource} onChange={e => setChatShowSource(e.target.checked)} className="rounded border-slate-300" />
                   Show [ECHO] source
+                </label>
+              )}
+              <label className="flex items-center gap-1.5 text-xs text-slate-500 cursor-pointer select-none">
+                <input type="checkbox" checked={chatSendAsSigma} onChange={e => { setChatSendAsSigma(e.target.checked); if (e.target.checked) setChatEcho(false); }} className="rounded border-slate-300" />
+                Send as Sigma
+              </label>
+              {chatSendAsSigma && (
+                <label className="flex items-center gap-1.5 text-xs text-slate-500 cursor-pointer select-none">
+                  <input type="checkbox" checked={chatAddToContext} onChange={e => setChatAddToContext(e.target.checked)} className="rounded border-slate-300" />
+                  Add to context
                 </label>
               )}
             </div>

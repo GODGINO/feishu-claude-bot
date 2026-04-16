@@ -261,6 +261,6 @@ export const api = {
     mutate('DELETE', `/members/${openId}`),
 
   // Admin chat — send message via REST
-  sendAdminChat: (sessionKey: string, text: string, echo: boolean, showSource = true) =>
-    mutate('POST', `/sessions/${sessionKey}/chat/send`, { text, echo, showSource }),
+  sendAdminChat: (sessionKey: string, text: string, echo: boolean, showSource = true, sendAsSigma = false, addToContext = true) =>
+    mutate('POST', `/sessions/${sessionKey}/chat/send`, { text, echo, showSource, sendAsSigma, addToContext }),
 };

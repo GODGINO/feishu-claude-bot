@@ -155,6 +155,48 @@ export class MessageBridge {
     adminChat.onMessage = async (sessionKey: string, text: string, echo: boolean, showSource: boolean) => {
       await this.handleAdminChatMessage(sessionKey, text, echo, showSource);
     };
+    adminChat.onSendAsSigma = async (sessionKey: string, text: string, addToContext: boolean) => {
+      await this.handleSendAsSigma(sessionKey, text, addToContext);
+    };
+  }
+
+  /** Send a message directly as Sigma bot — no Claude processing. */
+  private async handleSendAsSigma(sessionKey: string, text: string, addToContext: boolean): Promise<void> {
+    const session = this.sessionMgr.getOrCreate(sessionKey);
+    const chatIdFile = path.join(session.sessionDir, 'chat-id');
+    let chatId = '';
+    try { chatId = fs.readFileSync(chatIdFile, 'utf-8').trim(); } catch { /* ignore */ }
+    if (!chatId) {
+      this.logger.warn({ sessionKey }, 'No chat-id for Send as Sigma');
+      return;
+    }
+
+    this.logger.info({ sessionKey, textLen: text.length, addToContext }, 'Send as Sigma');
+
+    // Send to Feishu as Sigma bot
+    await this.sender.sendReply(chatId, text, undefined, session.sessionDir);
+
+    // Send to WeChat if bound
+    if (this.wechatBridge?.isActive(sessionKey)) {
+      this.wechatBridge.sendToWechat(sessionKey, text).catch(err => {
+        this.logger.warn({ err, sessionKey }, 'Failed to send Sigma message to WeChat');
+      });
+    }
+
+    // Optionally add to context (as bot message, not user message)
+    if (addToContext) {
+      if (!this.groupContext['buffers'].has(chatId)) {
+        this.groupContext.load(session.sessionDir, chatId);
+      }
+      this.groupContext.add(chatId, {
+        timestamp: Date.now(),
+        senderName: 'Sigma',
+        senderId: 'bot',
+        text: '(Send as Sigma)',
+        botReply: text.length > 500 ? text.slice(0, 500) + '...' : text,
+      });
+      this.groupContext.save(session.sessionDir, chatId);
+    }
   }
 
   /** Handle a message from Admin Chat — route to Claude, optionally echo to Feishu/WeChat. */

@@ -204,12 +204,22 @@ export function startAdminServer(
   app.post('/api/sessions/:key/chat/send', (req, res) => {
     const sessionKey = req.params.key.startsWith('group_') || req.params.key.startsWith('dm_')
       ? req.params.key : `group_${req.params.key}`;
-    const { text, echo, showSource } = req.body;
+    const { text, echo, showSource, sendAsSigma, addToContext } = req.body;
     if (!text) {
       res.status(400).json({ error: 'Missing text' });
       return;
     }
-    if (adminChat.onMessage) {
+    if (sendAsSigma) {
+      // Send directly as Sigma bot — no Claude processing
+      if (adminChat.onSendAsSigma) {
+        adminChat.onSendAsSigma(sessionKey, text, addToContext ?? true).catch((err: any) => {
+          logger.error({ err, sessionKey }, 'Send as Sigma failed');
+        });
+        res.json({ ok: true });
+      } else {
+        res.status(503).json({ error: 'Send as Sigma not initialized' });
+      }
+    } else if (adminChat.onMessage) {
       adminChat.onMessage(sessionKey, text, echo ?? true, showSource ?? true).catch((err: any) => {
         logger.error({ err, sessionKey }, 'Admin chat send failed');
       });
