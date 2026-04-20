@@ -298,7 +298,7 @@ export class CronRunner {
       } else {
         // Fallback
         const result = await this.runner.run({ sessionKey, message: job.prompt, sessionDir: session.sessionDir });
-        await this.sender.sendReply(chatId, `⏰ **${job.name}**\n\n${result.fullText || '(空结果)'}`);
+        await this.sender.sendReply(chatId, `⏰ **${job.name}**\n\n${result.fullText || '(空结果)'}`, undefined, session.sessionDir, undefined, { sessionKey, chatId });
       }
 
       // Update job status

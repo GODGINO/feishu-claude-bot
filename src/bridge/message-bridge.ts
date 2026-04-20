@@ -8,6 +8,7 @@ import { ProcessPool } from '../claude/process-pool.js';
 import { SessionManager } from '../claude/session-manager.js';
 import type { Config } from '../config.js';
 import type { Logger } from '../utils/logger.js';
+import { isNoReply } from '../feishu/card-builder.js';
 import { CommandHandler } from './command-handler.js';
 import { MessageQueue } from './message-queue.js';
 import { GroupContextBuffer } from './group-context.js';
@@ -298,7 +299,7 @@ export class MessageBridge {
    * REACT is an annotation — can coexist with text and tool calls.
    */
   private async processReactions(text: string, messageId: string): Promise<string> {
-    const pattern = /<<REACT:(\w+)>>/g;
+    const pattern = /<{1,2}\s*REACT\s*[:：]\s*(\w+)\s*>{1,2}\s*/gi;
     const matches = [...text.matchAll(pattern)];
     if (matches.length === 0) return text;
     for (const match of matches) {
@@ -969,14 +970,14 @@ export class MessageBridge {
         rawText = await this.processReactions(rawText, replyToMessageId);
       } else if (!isFromWechat && !isFromAdmin) {
         // Cron job or other no-reply context: strip REACT tags
-        rawText = rawText.replace(/<<REACT:\w+>>/g, '').trim();
+        rawText = rawText.replace(/<{1,2}\s*REACT\s*[:：]\s*\w+\s*>{1,2}\s*/gi, '').trim();
       }
       // For isFromWechat: REACT tags stay in rawText, extracted later in dual-send
-      const replyText = rawText.replace(/<<THREAD>>\s*/g, '').trim();
+      const replyText = rawText.replace(/<{1,2}\s*THREAD\s*>{1,2}\s*/gi, '').trim();
       const streamRootId = existingRootId;
       const cleanText = replyText;
 
-      if (replyText === 'NO_REPLY' || (!cardCreated && !cardCreating && isNonMentionGroup && !replyText) || (!cardCreated && !cardCreating && !replyText)) {
+      if (isNoReply(replyText) || (!cardCreated && !cardCreating && isNonMentionGroup && !replyText) || (!cardCreated && !cardCreating && !replyText)) {
         // NO_REPLY or empty text without card — finalize card if it was already created
         if (cardCreated || cardCreating) {
           if (streamer.startPromise) await streamer.startPromise;
@@ -1041,8 +1042,8 @@ export class MessageBridge {
       }
 
       // Write bot reply to context buffer
-      const cleanReply = replyText.replace(/<<THREAD>>\s*/g, '');
-      if (cleanReply && cleanReply !== 'NO_REPLY') {
+      const cleanReply = replyText.replace(/<{1,2}\s*THREAD\s*>{1,2}\s*/gi, '');
+      if (cleanReply && !isNoReply(cleanReply)) {
         if (!this.groupContext['buffers'].has(chatId)) {
           this.groupContext.load(sessionDir, chatId);
         }
@@ -1079,7 +1080,7 @@ export class MessageBridge {
       this.adminChatPendingEcho.delete(sessionKey);
 
       // WeChat dual-send (skip if message is from admin — admin echo handles WeChat separately)
-      if (this.wechatBridge?.isActive(sessionKey) && bufferedText && bufferedText !== 'NO_REPLY' && !adminEchoInfo) {
+      if (this.wechatBridge?.isActive(sessionKey) && bufferedText && !isNoReply(bufferedText) && !adminEchoInfo) {
         const wechatEcho = this.wechatPendingEcho.get(sessionKey);
         const feishuEcho = this.feishuPendingEcho.get(sessionKey);
         this.wechatPendingEcho.delete(sessionKey);
@@ -1091,11 +1092,11 @@ export class MessageBridge {
             this.logger.warn({ err, sessionKey }, 'Failed to send reply to WeChat');
           });
           // Strip REACT tags from display text, collect them for the Feishu message
-          const reactPattern = /<<REACT:(\w+)>>/g;
+          const reactPattern = /<{1,2}\s*REACT\s*[:：]\s*(\w+)\s*>{1,2}\s*/gi;
           const reactEmojis: string[] = [];
           let displayText = bufferedText.replace(reactPattern, (_, emoji) => { reactEmojis.push(emoji); return ''; }).trim();
           const combined = `> [来自微信] ${wechatEcho}\n\n${displayText}`;
-          this.sender.sendReply(chatId, combined, undefined, sessionDir).then(msgId => {
+          this.sender.sendReply(chatId, combined, undefined, sessionDir, undefined, { sessionKey, chatId }).then(msgId => {
             // Apply REACT emojis to the sent Feishu echo message
             if (msgId && reactEmojis.length > 0) {
               for (const emoji of reactEmojis) {
@@ -1122,7 +1123,7 @@ export class MessageBridge {
 
       // Admin Chat echo
 
-      if (bufferedText && bufferedText !== 'NO_REPLY') {
+      if (bufferedText && !isNoReply(bufferedText)) {
         // Echo TO admin (when message is from Feishu/WeChat)
         if (this.adminChat?.isConnected(sessionKey) && !adminEchoInfo) {
           const wEcho = this.wechatPendingEcho.get(sessionKey);
@@ -1139,7 +1140,7 @@ export class MessageBridge {
         // Echo FROM admin to Feishu + WeChat (when echo checkbox was on)
         if (adminEchoInfo?.echo) {
           // Extract REACT tags before building display text
-          const reactPattern = /<<REACT:(\w+)>>/g;
+          const reactPattern = /<{1,2}\s*REACT\s*[:：]\s*(\w+)\s*>{1,2}\s*/gi;
           const reactEmojis: string[] = [];
           const cleanReply = bufferedText.replace(reactPattern, (_, emoji) => { reactEmojis.push(emoji); return ''; }).trim();
 
@@ -1151,7 +1152,7 @@ export class MessageBridge {
             ? `\`[ECHO] ${adminEchoInfo.text}\`\n\n${cleanReply}`
             : cleanReply;
 
-          this.sender.sendReply(chatId, feishuText, undefined, sessionDir).then(msgId => {
+          this.sender.sendReply(chatId, feishuText, undefined, sessionDir, undefined, { sessionKey, chatId }).then(msgId => {
             // Apply REACT emojis to the sent Feishu echo message
             if (msgId && reactEmojis.length > 0) {
               for (const emoji of reactEmojis) {

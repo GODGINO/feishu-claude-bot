@@ -319,8 +319,8 @@ export class CardStreamer {
     // Ensure IM message is sent before completing
     await this.ensureMessageSent(fullText);
 
-    // Strip <<THREAD>> and <<REACT:...>> tags from display text
-    fullText = fullText.replace(/<<THREAD>>\s*/g, '').replace(/<<REACT:\w+>>\s*/g, '');
+    // Strip <<THREAD>> and REACT tags from display text
+    fullText = fullText.replace(/<{1,2}\s*THREAD\s*>{1,2}\s*/gi, '').replace(/<{1,2}\s*REACT\s*[:：]\s*\w+\s*>{1,2}\s*/gi, '');
 
     // Fix Markdown for Feishu rendering
     fullText = fixMarkdownForFeishu(fullText);
@@ -498,7 +498,7 @@ export class CardStreamer {
    * Call this when the main turn is done but subagents are still running.
    */
   completeTextOnly(fullText: string): void {
-    fullText = fullText.replace(/<<THREAD>>\s*/g, '');
+    fullText = fullText.replace(/<{1,2}\s*THREAD\s*>{1,2}\s*/gi, '');
     this.pendingText = fullText;
     this.waitingForAgents = true;
     // Ensure IM message is sent
@@ -632,13 +632,15 @@ export class CardStreamer {
     this.lastUpdateTime = Date.now();
     this.sequence++;
 
-    // Strip <<THREAD>>, <<REACT:...>>, <<BUTTON:...>> and <<TITLE:...>> tags from display text
+    // Strip THREAD, REACT, BUTTON, TITLE tags from display text (tolerant to single/double
+    // brackets, HTML-mixed, garbled closes). TITLE uses the same patterns as extractTitleFromText —
+    // closing-shaped tags first so the opening strip doesn't eat the inner TITLE of a garbled close.
     const displayText = this.pendingText
-      .replace(/<<THREAD>>\s*/g, '')
-      .replace(/<<REACT:\w+>>\s*/g, '')
-      .replace(/<<BUTTON:[^>]+>>\s*/g, '')
-      .replace(/<?<<TITLE:.+?>>>?\s*\n?/g, '')
-      .replace(/<TITLE:.+?>\s*\n?/g, '');
+      .replace(/<{1,2}\s*THREAD\s*>{1,2}\s*/gi, '')
+      .replace(/<{1,2}\s*REACT\s*[:：]\s*\w+\s*>{1,2}\s*/gi, '')
+      .replace(/<{1,2}\s*BUTTON\s*:[^>]+>{1,2}\s*/gi, '')
+      .replace(/<[\/\s<]*\/[\/\s<]*TITLE[^>]*?>{0,2}\s*\n?/gi, '')
+      .replace(/<{1,2}\s*TITLE\s*[:：]?[^<>\n]*?>{1,2}\s*\n?/gi, '');
 
     // Truncate to avoid Feishu card size limit (card gets silently dropped if too long)
     const truncatedText = displayText.length > CARD_TEXT_LIMIT

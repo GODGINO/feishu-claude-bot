@@ -297,19 +297,34 @@ export class ProcessPool {
    * Get the model for a session (per-session override or global default).
    */
   private static MODEL_ALIASES: Record<string, string> = {
-    'opus 1m': 'claude-opus-4-6[1m]',
-    'sonnet 1m': 'claude-sonnet-4-6[1m]',
+    'opus': 'opus[1m]',
+    'opus 1m': 'opus[1m]',
+    'sonnet': 'sonnet[1m]',
+    'sonnet 1m': 'sonnet[1m]',
+    'haiku': 'haiku',
   };
 
   private getSessionModel(sessionKey: string, sessionDir: string): string {
+    let raw = this.config.claude.model;
     try {
       const modelFile = path.join(sessionDir, 'model');
       if (fs.existsSync(modelFile)) {
-        const model = fs.readFileSync(modelFile, 'utf-8').trim();
-        if (model) return ProcessPool.MODEL_ALIASES[model] || model;
+        const content = fs.readFileSync(modelFile, 'utf-8').trim();
+        if (content) raw = content;
       }
     } catch { /* ignore */ }
-    return this.config.claude.model;
+    return ProcessPool.MODEL_ALIASES[raw] || raw;
+  }
+
+  private getSessionEffort(sessionDir: string): string | null {
+    try {
+      const effortFile = path.join(sessionDir, 'effort');
+      if (fs.existsSync(effortFile)) {
+        const effort = fs.readFileSync(effortFile, 'utf-8').trim();
+        if (effort && effort !== 'auto') return effort;
+      }
+    } catch { /* ignore */ }
+    return null;
   }
 
   /**
@@ -338,6 +353,11 @@ export class ProcessPool {
       '--dangerously-skip-permissions',
     ];
 
+    const effort = this.getSessionEffort(sessionDir);
+    if (effort) {
+      args.push('--effort', effort);
+    }
+
     // Load per-session MCP config for stdio-only MCP servers.
     // NOTE: --strict-mcp-config is NOT used because it blocks settings.json MCP servers,
     // which is where Feishu Streamable HTTP MCP lives (url-type MCP is not supported in --mcp-config).
@@ -364,7 +384,7 @@ export class ProcessPool {
 
     const model = args[args.indexOf('--model') + 1];
     this.logger.info(
-      { sessionKey, sessionDir, hasResume: !!resumeId, model },
+      { sessionKey, sessionDir, hasResume: !!resumeId, model, effort: effort || 'auto' },
       'Spawning persistent Claude process',
     );
 

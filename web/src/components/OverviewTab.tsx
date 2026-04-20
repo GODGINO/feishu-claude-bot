@@ -457,15 +457,23 @@ function AutoReplyCard({ sessionKey, initial }: { sessionKey: string; initial: s
 }
 
 const MODEL_OPTIONS = [
-  { value: 'sonnet', label: 'Sonnet 200K', desc: '默认，快速均衡' },
-  { value: 'sonnet 1m', label: 'Sonnet 1M', desc: '长上下文' },
-  { value: 'opus', label: 'Opus 200K', desc: '强力' },
-  { value: 'opus 1m', label: 'Opus 1M', desc: '最强，复杂任务' },
-  { value: 'haiku', label: 'Haiku 200K', desc: '最快，简单任务' },
+  { value: 'sonnet', label: 'Sonnet 4.6 1M', desc: '默认，快速均衡' },
+  { value: 'opus', label: 'Opus 4.7 1M', desc: '最强，复杂任务' },
+  { value: 'haiku', label: 'Haiku 4.5 200K', desc: '最快，简单任务' },
 ] as const
 
+// Normalize legacy model file values (opus[1m], opus 1m, claude-opus-4-7[1m], ...) to the 3 canonical aliases.
+function normalizeModel(raw: string | null): string {
+  if (!raw) return 'sonnet'
+  const s = raw.toLowerCase()
+  if (s.includes('opus')) return 'opus'
+  if (s.includes('sonnet')) return 'sonnet'
+  if (s.includes('haiku')) return 'haiku'
+  return 'sonnet'
+}
+
 function ModelCard({ sessionKey, initial }: { sessionKey: string; initial: string | null }) {
-  const [value, setValue] = useState(initial || 'sonnet')
+  const [value, setValue] = useState(normalizeModel(initial))
   const [loading, setLoading] = useState(false)
 
   const handleChange = async (e: React.ChangeEvent<HTMLSelectElement>) => {

@@ -3,6 +3,7 @@ import * as path from 'node:path';
 import { Readable } from 'node:stream';
 import type * as lark from '@larksuiteoapi/node-sdk';
 import type { Logger } from '../utils/logger.js';
+import { extractButtons, extractReactions, extractTitleFromText, buildButtonElements, type ButtonContext } from './card-builder.js';
 
 const NAME_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
@@ -458,7 +459,7 @@ export class MessageSender {
    * Detect render mode and send reply accordingly.
    * If sessionDir is provided, @名字 mentions are resolved to Feishu <at> tags.
    */
-  async sendReply(chatId: string, text: string, replyToMessageId?: string, sessionDir?: string, rootId?: string): Promise<string | null> {
+  async sendReply(chatId: string, text: string, replyToMessageId?: string, sessionDir?: string, rootId?: string, buttonCtx?: ButtonContext): Promise<string | null> {
     // Resolve @mentions before sending
     if (sessionDir) {
       text = resolveAtMentions(text, sessionDir);
@@ -468,21 +469,29 @@ export class MessageSender {
     text = text.replace(/([^\n])```/g, '$1\n```');
     text = text.replace(/([^\n|])\n(\|[^\n]+\|)/g, '$1\n\n$2');
 
-    // Strip <<TITLE:...>> tag if present (only used for card headers)
-    const cleanText = text.replace(/^<<TITLE:.+?>>\s*\n?/, '');
-    const mode = detectRenderMode(text);
+    // Extract REACT tags — reactions applied to the sent message below
+    const { cleanText: textNoReact, emojis } = extractReactions(text);
 
-    this.logger.info({ mode, textLength: text.length, hasTitle: /<<TITLE:/.test(text), rootId }, 'sendReply render mode');
+    // Extract buttons — if any found we must render as card to show them
+    const { cleanText: textNoButtons, buttons } = extractButtons(textNoReact);
+    const hasRenderableButtons = buttons.some(b => b.url || buttonCtx?.sessionKey || chatId);
+    // Build final button context (chatId is always known here)
+    const finalCtx: ButtonContext = { ...(buttonCtx || {}), chatId: buttonCtx?.chatId || chatId };
 
-    if (mode === 'card') {
-      const card = buildMarkdownCard(text); // pass original text so title can be extracted
-      return this.sendCard(chatId, card, replyToMessageId, rootId);
-    }
+    // Strip TITLE tag if present (tolerant: single/double brackets, HTML-mixed, fullwidth colon)
+    const cleanText = extractTitleFromText(textNoButtons).body;
+    const mode = detectRenderMode(textNoButtons);
+    const forceCard = hasRenderableButtons;
 
-    // For long text, split into chunks
-    if (cleanText.length > 4000) {
+    this.logger.info({ mode, textLength: text.length, hasTitle: /<{1,2}\s*TITLE\s*[:：]?/i.test(text), buttonCount: buttons.length, reactCount: emojis.length, rootId }, 'sendReply render mode');
+
+    let sentMsgId: string | null = null;
+    if (mode === 'card' || forceCard) {
+      const card = buildMarkdownCard(textNoButtons, buttons, finalCtx);
+      sentMsgId = await this.sendCard(chatId, card, replyToMessageId, rootId);
+    } else if (cleanText.length > 4000) {
+      // For long text, split into chunks
       const chunks = splitMarkdown(cleanText, 4000);
-      let firstMsgId: string | null = null;
       for (let i = 0; i < chunks.length; i++) {
         const msgId = await this.sendText(
           chatId,
@@ -490,12 +499,33 @@ export class MessageSender {
           i === 0 ? replyToMessageId : undefined,
           rootId,
         );
-        if (i === 0) firstMsgId = msgId;
+        if (i === 0) sentMsgId = msgId;
       }
-      return firstMsgId;
+    } else {
+      sentMsgId = await this.sendText(chatId, cleanText, replyToMessageId, rootId);
     }
 
-    return this.sendText(chatId, cleanText, replyToMessageId, rootId);
+    // Apply reactions to the sent message (non-blocking, ignore failures)
+    if (sentMsgId && emojis.length > 0) {
+      for (const emoji of emojis) {
+        this.addReaction(sentMsgId, emoji).catch(() => {});
+      }
+    }
+    return sentMsgId;
+  }
+
+  /**
+   * Add an emoji reaction to a message. Silently fails on error.
+   */
+  async addReaction(messageId: string, emoji: string): Promise<void> {
+    try {
+      await this._client.im.messageReaction.create({
+        path: { message_id: messageId },
+        data: { reaction_type: { emoji_type: emoji } },
+      });
+    } catch (err) {
+      this.logger.debug({ err, messageId, emoji }, 'Failed to add reaction');
+    }
   }
 
   /**
@@ -680,46 +710,38 @@ function detectRenderMode(text: string): 'card' | 'text' {
     /^[-*]\s/m.test(text) ||             // Unordered lists
     /^\d+\.\s/m.test(text) ||            // Ordered lists
     /\*\*.+?\*\*/.test(text) ||          // Bold text
-    /<{1,2}TITLE:.+?>{1,2}/.test(text) ||// Has explicit title (robust to single brackets)
+    /<{1,2}\s*TITLE\s*[:：]/i.test(text) || // Has TITLE tag (tolerant to brackets/fullwidth colon)
     /<at\s+id=/.test(text) ||            // @mentions (only work in card markdown)
     text.length > 300;                    // Moderate length text
 
   return needsCard ? 'card' : 'text';
 }
 
-/**
- * Extract <<TITLE:...>> tag from text. Robust to single/double brackets and stray spaces.
- * Returns { title, body } where body has the tag removed. title is empty when not present.
- */
-function extractTitle(text: string): { title: string; body: string } {
-  // Match TITLE tag anywhere in text — accept 1-2 angle brackets on each side
-  const match = text.match(/<{1,2}\s*TITLE\s*:\s*(.+?)\s*>{1,2}\s*\n?/);
-  if (match) {
-    const body = text.slice(0, match.index).concat(text.slice((match.index || 0) + match[0].length))
-      .replace(/^\n+/, '');
-    return {
-      title: match[1].trim().slice(0, 40),
-      body,
-    };
-  }
-  return { title: '', body: text };
-}
 
 /**
- * Build a schema 2.0 interactive card with markdown content
+ * Build a schema 2.0 interactive card with markdown content.
+ * Buttons (if any) are rendered 2 per row, 50% width each, after the text.
+ * Callback buttons require ctx.sessionKey; link buttons render unconditionally.
  */
-function buildMarkdownCard(text: string): object {
-  const { title, body } = extractTitle(text);
+function buildMarkdownCard(text: string, buttons: import('./card-builder.js').ButtonInfo[] = [], ctx: ButtonContext = {}): object {
+  const { title, body } = extractTitleFromText(text);
 
   // Truncate if too long for card (Feishu limit ~28000 chars)
   const truncated = body.length > 28000 ? body.slice(0, 28000) + '\n\n...(内容已截断)' : body;
 
+  const elements: object[] = [{ tag: 'markdown', content: truncated }];
+  if (buttons.length > 0) {
+    const btnElements = buildButtonElements(buttons, ctx);
+    if (btnElements.length > 0) {
+      elements.push({ tag: 'hr' });
+      elements.push(...btnElements);
+    }
+  }
+
   const card: any = {
     schema: '2.0',
     config: { wide_screen_mode: true },
-    body: {
-      elements: [{ tag: 'markdown', content: truncated }],
-    },
+    body: { elements },
   };
   // Only render header when bot emitted a TITLE tag
   if (title) {

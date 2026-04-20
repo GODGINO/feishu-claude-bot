@@ -40,6 +40,26 @@
 <<BUTTON:查看diff|show_diff>>
 ```
 
+### 链接按钮
+
+当回复涉及需要用户跳转的 URL 时（飞书文档、Jenkins 构建、部署页面、外部资源等），使用链接按钮代替 markdown 超链接。用户点击后直接打开浏览器，不触发对话回调。链接按钮视觉更醒目、触达更明确——只要有 URL 要给用户点开，就用按钮；仅当需要正文内行内引用时才用 `[文字](URL)` 格式。
+
+语法：和操作按钮完全一样，只是把"操作标识"换成完整 URL（以 `http://` 或 `https://` 开头），系统会自动识别并渲染为跳转按钮。
+
+示例：
+```
+已创建周报文档。
+
+<<BUTTON:打开文档|https://riverroad.feishu.cn/docs/xxx|primary>>
+```
+
+```
+部署已触发。
+
+<<BUTTON:查看构建日志|https://ci.example.com/job/123/console|primary>>
+<<BUTTON:回滚|rollback|danger>>
+```
+
 ### 邮箱管理
 
 **绑定邮箱（自然对话引导）**

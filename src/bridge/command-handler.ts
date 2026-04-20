@@ -74,6 +74,9 @@ export class CommandHandler {
     if (cmd === '/model' || cmd.startsWith('/model ')) {
       return this.handleModel(text.trim(), ctx);
     }
+    if (cmd === '/effort' || cmd.startsWith('/effort ')) {
+      return this.handleEffort(text.trim(), ctx);
+    }
     if (cmd === '/wechat' || cmd.startsWith('/wechat ')) {
       return this.handleWechat(text.trim(), ctx);
     }
@@ -325,19 +328,22 @@ export class CommandHandler {
     const sub = parts[1]?.toLowerCase();
 
     const ALIASES: Record<string, string> = {
-      'opus': 'opus',
-      'opus 1m': 'claude-opus-4-6[1m]',
-      'sonnet': 'sonnet',
-      'sonnet 1m': 'claude-sonnet-4-6[1m]',
+      'opus': 'opus[1m]',
+      'opus 1m': 'opus[1m]',
+      'sonnet': 'sonnet[1m]',
+      'sonnet 1m': 'sonnet[1m]',
       'haiku': 'haiku',
     };
 
     const DISPLAY: Record<string, string> = {
-      'opus': 'Opus 200K',
-      'claude-opus-4-6[1m]': 'Opus 1M',
-      'sonnet': 'Sonnet 200K',
-      'claude-sonnet-4-6[1m]': 'Sonnet 1M',
-      'haiku': 'Haiku 200K',
+      'opus[1m]': 'Opus 4.7 1M',
+      'sonnet[1m]': 'Sonnet 4.6 1M',
+      'haiku': 'Haiku 4.5 200K',
+      'opus': 'Opus 4.7 (alias)',
+      'sonnet': 'Sonnet 4.6 (alias)',
+      'claude-opus-4-7[1m]': 'Opus 4.7 1M',
+      'claude-sonnet-4-6[1m]': 'Sonnet 4.6 1M',
+      'claude-opus-4-6[1m]': 'Opus 4.6 1M (legacy)',
     };
 
     const modelArg = parts.slice(1).join(' ').toLowerCase();
@@ -353,15 +359,76 @@ export class CommandHandler {
       await this.sender.sendReply(ctx.chatId, [
         `**当前模型: ${DISPLAY[current] || current}**`,
         '',
-        '`/model sonnet` — Sonnet 200K（默认，快速均衡）',
-        '`/model sonnet 1m` — Sonnet 1M（长上下文）',
-        '`/model opus` — Opus 200K（强力）',
-        '`/model opus 1m` — Opus 1M（最强，复杂任务）',
-        '`/model haiku` — Haiku 200K（最快，简单任务）',
+        '`/model sonnet` — Sonnet 4.6 1M（默认，快速均衡）',
+        '`/model opus` — Opus 4.7 1M（最强，复杂任务）',
+        '`/model haiku` — Haiku 4.5 200K（最快，简单任务，不支持 1M）',
       ].join('\n'), ctx.messageId);
     } else {
       await this.sender.sendText(ctx.chatId, `⚠️ 未知模型: ${modelArg}`, ctx.messageId);
     }
+    return true;
+  }
+
+
+  private async handleEffort(text: string, ctx: CommandContext): Promise<boolean> {
+    const session = this.sessionMgr.get(ctx.sessionKey) || this.sessionMgr.getOrCreate(ctx.sessionKey);
+    const effortFile = `${session.sessionDir}/effort`;
+    const modelFile = `${session.sessionDir}/model`;
+    const parts = text.split(/\s+/);
+    const sub = parts[1]?.toLowerCase();
+
+    const VALID_LEVELS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
+
+    let currentModel = 'sonnet';
+    try { currentModel = fs.readFileSync(modelFile, 'utf-8').trim(); } catch {}
+    const isOpus47 = currentModel.includes('opus-4-7') || currentModel === 'opus' || currentModel === 'opus 1m';
+
+    if (sub === 'auto') {
+      try { fs.unlinkSync(effortFile); } catch {}
+      this.runner.respawn(ctx.sessionKey);
+      await this.sender.sendText(ctx.chatId, '✅ Effort 已重置为模型默认值（Opus 4.7 默认 xhigh，Sonnet 4.6 默认 high/medium）', ctx.messageId);
+      this.logger.info({ sessionKey: ctx.sessionKey }, '/effort: reset to auto');
+      return true;
+    }
+
+    if (sub && VALID_LEVELS.has(sub)) {
+      fs.writeFileSync(effortFile, sub);
+      this.runner.respawn(ctx.sessionKey);
+      let msg = `✅ Effort 已切换为 **${sub}**`;
+      if (sub === 'xhigh' && !isOpus47) {
+        msg += '\n⚠️ xhigh 仅 Opus 4.7 支持，当前模型将自动降级为 high';
+      }
+      await this.sender.sendText(ctx.chatId, msg, ctx.messageId);
+      this.logger.info({ sessionKey: ctx.sessionKey, effort: sub }, '/effort: switched');
+      return true;
+    }
+
+    if (!sub) {
+      let current = 'auto (模型默认)';
+      try {
+        const saved = fs.readFileSync(effortFile, 'utf-8').trim();
+        if (saved) current = saved;
+      } catch {}
+      const defaultHint = isOpus47 ? 'Opus 4.7 默认 xhigh' : 'Sonnet/Opus 4.6 默认 high 或 medium';
+      await this.sender.sendReply(ctx.chatId, [
+        `**当前 effort: ${current}**`,
+        `当前模型: ${currentModel}（${defaultHint}）`,
+        '',
+        'Effort 控制 adaptive reasoning 思考深度，Speed ↔ Intelligence 权衡：',
+        '',
+        '`/effort low` — 最快，几乎不思考（仅简单任务）',
+        '`/effort medium` — 中等推理（成本敏感）',
+        '`/effort high` — 平衡（智能任务最低门槛）',
+        '`/effort xhigh` — 深度推理（Opus 4.7 专属，编码/agentic 推荐）',
+        '`/effort max` — 全预算无上限（单 session 有效，可能过度思考）',
+        '`/effort auto` — 恢复模型默认',
+        '',
+        '注: Haiku 不支持 effort。xhigh 在非 Opus 4.7 模型上自动降级为 high。',
+      ].join('\n'), ctx.messageId);
+      return true;
+    }
+
+    await this.sender.sendText(ctx.chatId, `⚠️ 未知 effort 等级: ${sub}（有效: low/medium/high/xhigh/max/auto）`, ctx.messageId);
     return true;
   }
 
@@ -414,6 +481,7 @@ export class CommandHandler {
       '`/register` — 注册开发者身份（Git + 飞书 MCP）',
       '`/auto [on|off|always]` — 群聊自动回复（on=AI判断, off=仅@回复, always=全部回复）',
       '`/model [sonnet|opus|haiku]` — 切换 AI 模型',
+      '`/effort [low|medium|high|xhigh|max|auto]` — 切换思考深度（Speed ↔ Intelligence）',
       '`/wechat` — 绑定微信（扫码后微信消息同步，共享 Claude 会话，仅私聊）',
       '`/help` — 显示此帮助信息',
       '',

@@ -66,15 +66,10 @@ export function buildThinkingCard(): object {
 export function buildStreamingCard(text: string, toolCalls?: ToolCallInfo[], startTime?: number): object {
   const elements: object[] = [];
 
-  // Detect <<TITLE:xxx>> in streamed text — strip it and use as header title.
-  // Robust to single/double brackets, stray spaces.
-  let displayText = text || '';
-  let headerTitle = '';
-  const titleMatch = displayText.match(/<{1,2}\s*TITLE\s*:\s*(.+?)\s*>{1,2}\s*\n?/);
-  if (titleMatch) {
-    headerTitle = titleMatch[1].trim().slice(0, 30);
-    displayText = displayText.replace(titleMatch[0], '').replace(/^\n/, '');
-  }
+  // Detect TITLE tag in streamed text via the shared tolerant parser.
+  const { title: extracted, body } = extractTitleFromText(text || '', 30);
+  let displayText = body;
+  let headerTitle = extracted;
 
   // Tool calls section — collapsible panel at the top, default collapsed
   if (toolCalls && toolCalls.length > 0) {
@@ -150,11 +145,79 @@ export interface UsageInfo {
 }
 
 /**
+ * Check if a response is the NO_REPLY sentinel (Claude's signal to skip replying).
+ * Tolerant to case, whitespace, separator (_ / space / -), trailing punctuation, surrounding quotes.
+ * Only matches when the ENTIRE text is a NO_REPLY variant — partial matches don't count.
+ */
+export function isNoReply(text: string | null | undefined): boolean {
+  if (!text) return false;
+  return /^\s*["'`]?\s*NO[\s_-]?REPLY\s*["'`]?\s*[.。!！]*\s*$/i.test(text);
+}
+
+/**
+ * Custom tag regex patterns — always inline new literals at call sites (global flag carries state).
+ * Canonical forms (documented in system-prompt.txt, accepted by all parsers):
+ *   TITLE:   <{1,2}\s*TITLE\s*[:：]\s*([^<>\n]+?)\s*>{1,2}           canonical extract
+ *            <{1,2}\s*TITLE\s*[:：]?[^<>\n]*?>{1,2}\s*\n?            strip (tolerant)
+ *            <\/\s*TITLE\s*>{0,2}\s*\n?                               strip orphan closing
+ *   BUTTON:  <{1,2}\s*BUTTON\s*:\s*([^|>]+?)\s*\|...>{1,2}            canonical extract
+ *            <{1,2}\s*BUTTON\s*:[^>]+>{1,2}\s*                        strip (tolerant)
+ *   REACT:   <{1,2}\s*REACT\s*[:：]\s*(\w+)\s*>{1,2}\s*               extract + strip
+ *   THREAD:  <{1,2}\s*THREAD\s*>{1,2}\s*                              strip
+ * All tolerant to 1-2 angle brackets, case-insensitive (add /i flag), optional spaces, fullwidth colon.
+ */
+
+/**
+ * Extract <<REACT:emoji>> tags and return the list of emojis and the cleaned text.
+ */
+export function extractReactions(text: string): { cleanText: string; emojis: string[] } {
+  const emojis: string[] = [];
+  const cleanText = text.replace(/<{1,2}\s*REACT\s*[:：]\s*(\w+)\s*>{1,2}\s*/gi, (_, emoji) => { emojis.push(emoji); return ''; });
+  return { cleanText, emojis };
+}
+
+/**
+ * Extract a TITLE tag from text. Tolerant to many malformed variants Claude emits:
+ *   <<TITLE:xxx>>, <TITLE:xxx>, <<TITLE：xxx>> (fullwidth colon),
+ *   <TITLE:xxx</TITLE>, <<TITLE:xxx></TITLE>> (HTML-mixed, missing middle >),
+ *   <TITLE>xxx</TITLE> (pure HTML),
+ *   <<TITLE>xxx</<TITLE>> (garbled close with stray </< prefix).
+ * Returns { title, body } — title is empty string when no TITLE tag found.
+ *
+ * Closing-tag pattern accepts any combination of `/`, `<`, whitespace as garbage between `<` and `TITLE`,
+ * which tolerates common Claude mistakes like `</<TITLE>`, `< / TITLE>`, `</TITLE`.
+ */
+export function extractTitleFromText(text: string, maxLen = 40): { title: string; body: string } {
+  // Priority 1: canonical <<TITLE:xxx>> — title body must not contain < > or newline
+  let match = text.match(/<{1,2}\s*TITLE\s*[:：]\s*([^<>\n]+?)\s*>{1,2}\s*\n?/i);
+  // Priority 2: HTML-mixed <TITLE:xxx</TITLE> — colon form with (possibly garbled) close.
+  // Closing regex requires `/` so it can't accidentally match a nested opening `<TITLE>`.
+  if (!match) {
+    match = text.match(/<{1,2}\s*TITLE\s*[:：]\s*([^<\n]+?)\s*<[\/\s<]*\/[\/\s<]*TITLE[^>]*?>{0,2}\s*\n?/i);
+  }
+  // Priority 3: pure HTML <TITLE>xxx</TITLE> — no-colon form with (possibly garbled) close
+  if (!match) {
+    match = text.match(/<{1,2}\s*TITLE\s*>\s*([^<\n]+?)\s*<[\/\s<]*\/[\/\s<]*TITLE[^>]*?>{0,2}\s*\n?/i);
+  }
+  if (!match) return { title: '', body: text };
+  let body = text.slice(0, match.index).concat(text.slice((match.index || 0) + match[0].length));
+  // Strip any stray TITLE fragments left behind (duplicates, orphan closes — including garbled `</<TITLE>`).
+  // Order matters: closing-shaped tags first so the opening-tag strip doesn't eat the inner `<TITLE>`
+  // from a garbled close (e.g. `</<TITLE>`), leaving a trailing `</` artifact.
+  // The closing regex REQUIRES `/` (via `\/`) so it doesn't accidentally match bare opening tags like `<<TITLE`.
+  body = body
+    .replace(/<[\/\s<]*\/[\/\s<]*TITLE[^>]*?>{0,2}\s*\n?/gi, '')
+    .replace(/<{1,2}\s*TITLE\s*[:：]?[^<>\n]*?>{1,2}\s*\n?/gi, '')
+    .replace(/^\n+/, '');
+  return { title: match[1].trim().slice(0, maxLen), body };
+}
+
+/**
  * Extract <<BUTTON:label|actionId|type?>> tags from text.
  */
 export function extractButtons(text: string): { cleanText: string; buttons: ButtonInfo[] } {
   const buttons: ButtonInfo[] = [];
-  const cleanText = text.replace(/<<BUTTON:([^|>]+)\|([^|>]+)(?:\|([^>]+))?>>[\s]*/g, (_, label, actionId, type) => {
+  const cleanText = text.replace(/<{1,2}\s*BUTTON\s*:\s*([^|>]+?)\s*\|\s*([^|>]+?)\s*(?:\|\s*([^>]+?)\s*)?>{1,2}[\s]*/gi, (_, label, actionId, type) => {
     const trimmedAction = actionId.trim();
     const isLink = /^https?:\/\//.test(trimmedAction);
     buttons.push({
@@ -168,20 +231,71 @@ export function extractButtons(text: string): { cleanText: string; buttons: Butt
   return { cleanText, buttons };
 }
 
-export function buildCompleteCard(text: string, toolCalls?: ToolCallInfo[], elapsed?: number, title?: string, buttons?: ButtonInfo[], sessionKey?: string, chatId?: string, cardId?: string, messageId?: string, usage?: UsageInfo): object {
-  // Extract <<TITLE:...>> from text if present and no explicit title.
-  // Robust regex: accept 1-2 angle brackets, optional spaces.
-  let displayText = text || '(空回复)';
-  let headerTitle = title || '';
-  const titleMatch = displayText.match(/<{1,2}\s*TITLE\s*:\s*(.+?)\s*>{1,2}\s*\n?/);
-  if (titleMatch) {
-    if (!title) {
-      headerTitle = `✅ ${titleMatch[1].trim().slice(0, 30)}`;
+export interface ButtonContext {
+  sessionKey?: string;
+  chatId?: string;
+  cardId?: string;
+  messageId?: string;
+}
+
+/**
+ * Build Feishu card elements for a list of buttons (2 per row, 50% width each).
+ * Link buttons (url set) always render. Callback buttons render only when sessionKey is provided.
+ */
+export function buildButtonElements(buttons: ButtonInfo[], ctx: ButtonContext = {}): object[] {
+  const renderable = buttons.filter(btn => btn.url || ctx.sessionKey);
+  if (renderable.length === 0) return [];
+  const buildColumn = (btn: ButtonInfo) => {
+    const behaviors = btn.url
+      ? [{ type: 'open_url', default_url: btn.url }]
+      : [{
+          type: 'callback',
+          value: {
+            action: btn.actionId,
+            label: btn.label,
+            sessionKey: ctx.sessionKey || '',
+            chatId: ctx.chatId || '',
+            cardId: ctx.cardId || '',
+            messageId: ctx.messageId || '',
+          },
+        }];
+    return {
+      tag: 'column',
+      width: 'weighted',
+      weight: 1,
+      elements: [{
+        tag: 'button',
+        type: btn.type || 'default',
+        width: 'fill',
+        text: { tag: 'plain_text', content: btn.label },
+        disabled: btn.disabled || false,
+        behaviors,
+      }],
+    };
+  };
+  const out: object[] = [];
+  for (let i = 0; i < renderable.length; i += 2) {
+    const row = renderable.slice(i, i + 2);
+    const columns = row.map(buildColumn);
+    if (columns.length === 1) {
+      columns.push({ tag: 'column', width: 'weighted', weight: 1, elements: [] } as any);
     }
-    displayText = displayText.replace(titleMatch[0], '').replace(/^\n/, '');
+    out.push({
+      tag: 'column_set',
+      columns,
+      flex_mode: 'none',
+      horizontal_spacing: '8px',
+      margin: i > 0 ? '8px 0 0 0' : undefined,
+    });
   }
-  // Strip any remaining TITLE tag variants from display text
-  displayText = displayText.replace(/<{1,2}\s*TITLE\s*:.+?>{1,2}\s*\n?/g, '');
+  return out;
+}
+
+export function buildCompleteCard(text: string, toolCalls?: ToolCallInfo[], elapsed?: number, title?: string, buttons?: ButtonInfo[], sessionKey?: string, chatId?: string, cardId?: string, messageId?: string, usage?: UsageInfo): object {
+  // Extract TITLE tag via shared tolerant parser (handles <<TITLE:xxx>>, HTML-mixed, etc.)
+  const { title: extracted, body } = extractTitleFromText(text || '(空回复)', 30);
+  let displayText = body;
+  let headerTitle = title || (extracted ? `✅ ${extracted}` : '');
 
   const elements: object[] = [];
 
@@ -214,41 +328,10 @@ export function buildCompleteCard(text: string, toolCalls?: ToolCallInfo[], elap
     element_id: STREAMING_ELEMENT_ID,
   });
 
-  // Buttons (if any) — v2 schema: horizontal layout via column_set
+  // Buttons (if any) — 2 per row, each column 50% via weighted width
   if (buttons && buttons.length > 0) {
     elements.push({ tag: 'hr' });
-    const columns = buttons.map(btn => {
-      const behaviors = btn.url
-        ? [{ type: 'open_url', default_url: btn.url }]
-        : [{
-            type: 'callback',
-            value: {
-              action: btn.actionId,
-              label: btn.label,
-              sessionKey: sessionKey || '',
-              chatId: chatId || '',
-              cardId: cardId || '',
-              messageId: messageId || '',
-            },
-          }];
-      return {
-        tag: 'column',
-        width: 'auto',
-        elements: [{
-          tag: 'button',
-          type: btn.type || 'default',
-          text: { tag: 'plain_text', content: btn.label },
-          disabled: btn.disabled || false,
-          behaviors,
-        }],
-      };
-    });
-    elements.push({
-      tag: 'column_set',
-      columns,
-      flex_mode: 'none',
-      horizontal_spacing: '8px',
-    });
+    elements.push(...buildButtonElements(buttons, { sessionKey, chatId, cardId, messageId }));
   }
 
   // Footer — status + metrics

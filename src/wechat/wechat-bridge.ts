@@ -597,15 +597,15 @@ export class WechatBridge {
   private stripFeishuMarkers(text: string): string {
     // Convert <<BUTTON:label|action|type?>> tags to numbered list
     const buttons: string[] = [];
-    let cleaned = text.replace(/<<BUTTON:([^|>]+)\|[^>]*>>\s*/g, (_, label) => {
+    let cleaned = text.replace(/<{1,2}\s*BUTTON\s*:\s*([^|>]+?)\s*\|[^>]*>{1,2}\s*/gi, (_, label) => {
       buttons.push(label.trim());
       return '';
     });
 
     cleaned = cleaned
-      .replace(/<<TITLE:.*?>>/g, '')
-      .replace(/<<REACT:\w+>>/g, '')
-      .replace(/<<THREAD>>/g, '')
+      .replace(/<{1,2}\s*TITLE\s*[:：]?[^<>\n]*?>{1,2}\s*\n?|<\/\s*TITLE\s*>{0,2}\s*\n?/gi, '')
+      .replace(/<{1,2}\s*REACT\s*[:：]\s*\w+\s*>{1,2}/gi, '')
+      .replace(/<{1,2}\s*THREAD\s*>{1,2}/gi, '')
       .replace(/^\n+/, '')
       .trim();
 
