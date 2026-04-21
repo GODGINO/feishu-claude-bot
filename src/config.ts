@@ -43,11 +43,32 @@ function findClaudePath(): string {
 }
 
 function loadSystemPrompt(): string {
-  // Priority: SYSTEM_PROMPT env var > system-prompt.txt file > default
+  // Priority: SYSTEM_PROMPT env var > system-prompt/ dir (new) > system-prompt.txt (legacy) > default
   const envPrompt = process.env.SYSTEM_PROMPT;
   if (envPrompt) return envPrompt;
 
-  // Try to load from file (relative to project root)
+  // New structure: system-prompt/common.md + env.{mode}.md composed at load time.
+  // Mode selected via SIGMA_PROMPT_MODE env var (default 'local').
+  // When env.{mode}.md is empty, output is byte-identical to common.md.trim() —
+  // this is the invariant that preserves Mac-mini behavior after the split.
+  const mode = process.env.SIGMA_PROMPT_MODE || 'local';
+  const promptDir = path.join(process.cwd(), 'system-prompt');
+  try {
+    const commonPath = path.join(promptDir, 'common.md');
+    if (fs.existsSync(commonPath)) {
+      const common = fs.readFileSync(commonPath, 'utf-8').trim();
+      const envPath = path.join(promptDir, `env.${mode}.md`);
+      let envSpecific = '';
+      if (fs.existsSync(envPath)) {
+        envSpecific = fs.readFileSync(envPath, 'utf-8').trim();
+      }
+      return envSpecific ? `${common}\n\n${envSpecific}` : common;
+    }
+  } catch {
+    // Fall through to legacy
+  }
+
+  // Legacy fallback: system-prompt.txt at project root
   const promptFile = path.join(process.cwd(), 'system-prompt.txt');
   try {
     if (fs.existsSync(promptFile)) {

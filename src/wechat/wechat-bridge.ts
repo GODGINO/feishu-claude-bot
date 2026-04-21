@@ -603,7 +603,7 @@ export class WechatBridge {
     });
 
     cleaned = cleaned
-      .replace(/<{1,2}\s*TITLE\s*[:：]?[^<>\n]*?>{1,2}\s*\n?|<\/\s*TITLE\s*>{0,2}\s*\n?/gi, '')
+      .replace(/<{1,2}\s*TITLE\s*[:：]?[^<>\n]*?[<\/\s]*>{1,2}\s*\n?|<\/\s*TITLE\s*>{0,2}\s*\n?/gi, '')
       .replace(/<{1,2}\s*REACT\s*[:：]\s*\w+\s*>{1,2}/gi, '')
       .replace(/<{1,2}\s*THREAD\s*>{1,2}/gi, '')
       .replace(/^\n+/, '')

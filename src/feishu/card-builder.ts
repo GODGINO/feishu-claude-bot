@@ -156,15 +156,17 @@ export function isNoReply(text: string | null | undefined): boolean {
 
 /**
  * Custom tag regex patterns — always inline new literals at call sites (global flag carries state).
- * Canonical forms (documented in system-prompt.txt, accepted by all parsers):
- *   TITLE:   <{1,2}\s*TITLE\s*[:：]\s*([^<>\n]+?)\s*>{1,2}           canonical extract
- *            <{1,2}\s*TITLE\s*[:：]?[^<>\n]*?>{1,2}\s*\n?            strip (tolerant)
+ * Canonical forms (documented in system-prompt/common.md, accepted by all parsers):
+ *   TITLE:   <{1,2}\s*TITLE\s*[:：]\s*([^<>\n]+?)[<\/\s]*>{1,2}       canonical extract
+ *            <{1,2}\s*TITLE\s*[:：]?[^<>\n]*?[<\/\s]*>{1,2}\s*\n?     strip (tolerant)
  *            <\/\s*TITLE\s*>{0,2}\s*\n?                               strip orphan closing
  *   BUTTON:  <{1,2}\s*BUTTON\s*:\s*([^|>]+?)\s*\|...>{1,2}            canonical extract
  *            <{1,2}\s*BUTTON\s*:[^>]+>{1,2}\s*                        strip (tolerant)
  *   REACT:   <{1,2}\s*REACT\s*[:：]\s*(\w+)\s*>{1,2}\s*               extract + strip
  *   THREAD:  <{1,2}\s*THREAD\s*>{1,2}\s*                              strip
  * All tolerant to 1-2 angle brackets, case-insensitive (add /i flag), optional spaces, fullwidth colon.
+ * TITLE also tolerates trailing `[<\/\s]*` garbage before `>>` (e.g. `<<TITLE:xxx</>>` — Claude sometimes
+ * inserts `</` right before the closing double-bracket).
  */
 
 /**
@@ -188,8 +190,10 @@ export function extractReactions(text: string): { cleanText: string; emojis: str
  * which tolerates common Claude mistakes like `</<TITLE>`, `< / TITLE>`, `</TITLE`.
  */
 export function extractTitleFromText(text: string, maxLen = 40): { title: string; body: string } {
-  // Priority 1: canonical <<TITLE:xxx>> — title body must not contain < > or newline
-  let match = text.match(/<{1,2}\s*TITLE\s*[:：]\s*([^<>\n]+?)\s*>{1,2}\s*\n?/i);
+  // Priority 1: canonical <<TITLE:xxx>> — title body must not contain < > or newline.
+  // `[<\/\s]*` before the closing `>>` tolerates trailing garbage like `<<TITLE:xxx</>>`
+  // (Claude sometimes inserts a stray `</` right before the closing double-bracket).
+  let match = text.match(/<{1,2}\s*TITLE\s*[:：]\s*([^<>\n]+?)[<\/\s]*>{1,2}\s*\n?/i);
   // Priority 2: HTML-mixed <TITLE:xxx</TITLE> — colon form with (possibly garbled) close.
   // Closing regex requires `/` so it can't accidentally match a nested opening `<TITLE>`.
   if (!match) {
@@ -207,7 +211,7 @@ export function extractTitleFromText(text: string, maxLen = 40): { title: string
   // The closing regex REQUIRES `/` (via `\/`) so it doesn't accidentally match bare opening tags like `<<TITLE`.
   body = body
     .replace(/<[\/\s<]*\/[\/\s<]*TITLE[^>]*?>{0,2}\s*\n?/gi, '')
-    .replace(/<{1,2}\s*TITLE\s*[:：]?[^<>\n]*?>{1,2}\s*\n?/gi, '')
+    .replace(/<{1,2}\s*TITLE\s*[:：]?[^<>\n]*?[<\/\s]*>{1,2}\s*\n?/gi, '')
     .replace(/^\n+/, '');
   return { title: match[1].trim().slice(0, maxLen), body };
 }

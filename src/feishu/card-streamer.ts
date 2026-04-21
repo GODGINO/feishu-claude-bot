@@ -640,7 +640,7 @@ export class CardStreamer {
       .replace(/<{1,2}\s*REACT\s*[:：]\s*\w+\s*>{1,2}\s*/gi, '')
       .replace(/<{1,2}\s*BUTTON\s*:[^>]+>{1,2}\s*/gi, '')
       .replace(/<[\/\s<]*\/[\/\s<]*TITLE[^>]*?>{0,2}\s*\n?/gi, '')
-      .replace(/<{1,2}\s*TITLE\s*[:：]?[^<>\n]*?>{1,2}\s*\n?/gi, '');
+      .replace(/<{1,2}\s*TITLE\s*[:：]?[^<>\n]*?[<\/\s]*>{1,2}\s*\n?/gi, '');
 
     // Truncate to avoid Feishu card size limit (card gets silently dropped if too long)
     const truncatedText = displayText.length > CARD_TEXT_LIMIT
