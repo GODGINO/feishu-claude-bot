@@ -303,7 +303,7 @@
 {
   "fields": {
     "负责人": [
-      {"id": "ou_8240099442cf5da49f04f4bf8f8abcef"}
+      {"id": "ou_EXAMPLE00000000000000000000000"}
     ],
     "协作人": [
       {"id": "ou_user1"},
@@ -319,7 +319,7 @@
 {
   "负责人": [
     {
-      "id": "ou_8240099442cf5da49f04f4bf8f8abcef",
+      "id": "ou_EXAMPLE00000000000000000000000",
       "name": "黄泡泡",
       "en_name": "Amanda Huang",
       "email": "amandahuang@bytedance.com",
@@ -547,7 +547,7 @@
 {
   "fields": {
     "协作群": [
-      {"id": "oc_d2a947abb78bbbbb12d4cad55fbabcef"}
+      {"id": "oc_EXAMPLE00000000000000000000000"}
     ]
   }
 }
@@ -559,7 +559,7 @@
 {
   "协作群": [
     {
-      "id": "oc_d2a947abb78bbbbb12d4cad55fbabcef",
+      "id": "oc_EXAMPLE00000000000000000000000",
       "name": "测试部门",
       "avatar_url": "https://..."
     }
@@ -664,7 +664,7 @@
 {
   "创建人": [
     {
-      "id": "ou_8240099442cf5da49f04f4bf8f8abcef",
+      "id": "ou_EXAMPLE00000000000000000000000",
       "name": "黄泡泡",
       "en_name": "Amanda Huang",
       "email": "amandahuang@bytedance.com",

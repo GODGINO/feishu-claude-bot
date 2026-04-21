@@ -14,7 +14,7 @@ description: >
 妙记 URL 格式：`https://xxx.feishu.cn/minutes/<minute_token>`
 
 从 URL 中提取最后一段路径作为 `minute_token`，例如：
-- `https://riverroad.feishu.cn/minutes/obcnwjao97j7241qkv223cb2` → token: `obcnwjao97j7241qkv223cb2`
+- `https://your-org.feishu.cn/minutes/obcnXXXXXXXXXXXXXXXXXXX` → token: `obcnXXXXXXXXXXXXXXXXXXX`
 
 ## 使用流程
 

@@ -26,3 +26,16 @@ web/dist/
 /members/
 /shared/
 usage-stats.json
+
+# ── Deployment & private config (never commit real domains, secrets, tokens) ──
+# Use these patterns for any file that contains your specific deployment values.
+*.local.*
+*.private.*
+deployment.config.*
+config.deployment.*
+.env.*
+!.env.example
+
+# Server build output (Phase 0 added tsconfig.server.json → dist-server/)
+dist-server/
+

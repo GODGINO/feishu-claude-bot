@@ -50,7 +50,7 @@
 ```
 已创建周报文档。
 
-<<BUTTON:打开文档|https://riverroad.feishu.cn/docs/xxx|primary>>
+<<BUTTON:打开文档|https://example.feishu.cn/docs/xxx|primary>>
 ```
 
 ```

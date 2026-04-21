@@ -10,7 +10,7 @@
 
 - **部署位置**：Mac mini，单实例，由 PM2 管理（app name: `feishu-bot`）
 - **入口文件**：`dist/index.js`（来源 `src/index.ts`）
-- **公网域名**：`https://sigma.tixool.com` ← Cloudflare Tunnel → Mac mini `localhost:3333`
+- **公网域名**：由 Cloudflare Tunnel → Mac mini `localhost:3333`，实际域名见部署配置（不写入仓库）
 - **Bot 守护**：`scripts/bot.sh start|stop|restart|status|log`（PID 文件 `.bot.pid` + 启动时 pgrep 清理 orphan）
 
 **重要**：bot 是长期运行进程，改源码不影响已运行的实例；必须 `npm run bot:restart` 才生效（会先 `npx tsc` 编译再 PM2 restart）。
@@ -69,7 +69,7 @@ src/feishu/event-handler.ts::createEventHandler   ← 飞书 WebSocket 事件入
 
 ```
 飞书用户 ─── 飞书 WebSocket ───┐
-微信用户 ─── iLink 长轮询 ─────┼── Bot 服务器 :3333 ─── Cloudflare Tunnel ─── sigma.tixool.com
+微信用户 ─── iLink 长轮询 ─────┼── Bot 服务器 :3333 ─── Cloudflare Tunnel ─── <your-domain>.com
 Admin    ─── REST + WS ────────┘        │
                                          ├── Feishu SDK Client
                                          ├── MessageBridge (三渠道路由)
@@ -193,7 +193,7 @@ Claude 可以在回复里输出这些标签，bot 解析后做相应处理：
 ### 8. Cloudflare Tunnel 是本地版专属
 
 - `scripts/bot.sh::start_tunnel` 启动 `cloudflared tunnel run --token $CF_TUNNEL_TOKEN`
-- 把公网 `sigma.tixool.com` 反向代理到 Mac mini `localhost:3333`
+- 把公网域名反向代理到 Mac mini `localhost:3333`
 - 云端版本部署后会**直接 DNS A 记录**指向云服务器 IP，Tunnel 退役
 
 ---
@@ -219,7 +219,7 @@ Claude → remote-terminal-mcp.ts (stdio MCP)
 
 ### 鉴权（当前，待升级）
 
-- URL 包含 sessionKey：`wss://sigma.tixool.com/relay?session={sessionKey}`
+- URL 包含 sessionKey：`wss://<your-domain>/relay?session={sessionKey}`
 - HMAC 密钥 = sessionKey 本身（**已知安全隐患**，云迁移时会换成 per-connection 随机密钥）
 - 任何知道 sessionKey 的人都能连 relay（无身份认证）
 
