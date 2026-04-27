@@ -69,6 +69,52 @@ bili rank -n 10
 > **412 风控**: 海外 IP 必须提供 Cookie（`--cookies-from-browser chrome` 或 `--cookies /path/to/cookies.txt`），国内 IP 一般不受影响。
 > **安装 bili-cli**: `pipx install bilibili-cli`，然后 `bili login` 扫码登录。
 
+### 视频转写（自动字幕优先 / 无字幕走 ASR）
+
+B 站绝大多数视频没有官方字幕，需要走音频转写路径。一键脚本会先查官方字幕，没有再下音频用 Groq Whisper 转写。两条路径输出**完全相同**的格式，下游总结时无需区分。
+
+```bash
+bash .claude/skills/agent-reach/scripts/bili-transcribe.sh "https://www.bilibili.com/video/BVxxx"
+# stdout: /tmp/{BV}.md 路径，含 [hh:mm:ss] 文本 + 元数据头
+```
+
+#### 前置（每个 session 一次）
+
+```bash
+# 1. 系统依赖（机器级，一次）
+brew install ffmpeg
+pip3 install --user bilix
+
+# 2. 注册并拿到自己的 Groq Key（免费）
+#    https://console.groq.com/keys
+
+# 3. 写入本 session 的 .env（key 不入库，每个 session 独立）
+SCRIPT_DIR=$(pwd)/.claude/skills/agent-reach/scripts
+mkdir -p "$SCRIPT_DIR"
+echo "GROQ_API_KEY=gsk_xxx" > "$SCRIPT_DIR/.env"
+chmod 600 "$SCRIPT_DIR/.env"
+```
+
+> **重要**：`.env` 文件**永远不要提交到 git**（项目根 `.gitignore` 已覆盖 `.env`）。每个 session 的 key 各自管理，不共享。
+
+#### 退出码
+
+| code | 含义 |
+|------|------|
+| 0 | 成功 |
+| 1 | URL 不是合法 B 站链接 |
+| 2 | GROQ_API_KEY 未设 |
+| 3 | Groq 转写失败 |
+| 4 | 视频时长 > 3600s |
+| 5 | ffmpeg / bilix 未安装 |
+| 6 | 网络 / B 站 API 错误 |
+
+#### 限制
+
+- **时长上限 3600s**：>1 小时直接拒绝（避免 Groq 25MB 单文件上限和成本失控）
+- **中文 CER**：Whisper-large-v3 约 8-12%，专有名词偏低
+- **B 站 412 风控**：bilix 已封装 WBI 签名，**不要**用 yt-dlp 下流
+
 ## 小宇宙播客 / Xiaoyuzhou Podcast
 
 ### 转录单集播客
