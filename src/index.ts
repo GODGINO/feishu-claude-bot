@@ -136,11 +136,12 @@ async function main() {
     await bridge.handleMessage(msg);
   });
 
-  // Handle card button clicks — send as natural language to Claude
+  // Handle card button clicks — actionId prefixed with '/' routes to command handler,
+  // otherwise the click is sent as natural language to Claude.
   onCardAction(async ({ sessionKey, chatId, actionId, label, operatorId, cardId, messageId }) => {
     const userName = await sender.resolveUserName(operatorId) || operatorId;
     logger.info({ sessionKey, chatId, actionId, label, operatorId, userName, cardId, messageId }, 'Processing card button click');
-    await bridge.executeButtonAction(sessionKey, chatId, label, userName, cardId, messageId);
+    await bridge.executeButtonAction(sessionKey, chatId, actionId, label, userName, operatorId, cardId, messageId);
   });
 
   // Start cron scheduler for skills

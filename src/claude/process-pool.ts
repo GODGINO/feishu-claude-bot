@@ -4,7 +4,7 @@ import * as path from 'node:path';
 import * as readline from 'node:readline';
 import type { Logger } from '../utils/logger.js';
 import type { Config } from '../config.js';
-import { StreamParser, type ParseResult } from './stream-parser.js';
+import { StreamParser, type ParseResult, type LiveUsage } from './stream-parser.js';
 import type { RunResult, ImageAttachment } from './runner.js';
 
 export interface SendOptions {
@@ -29,6 +29,7 @@ interface PersistentProcess {
   mcpConfigMtime?: number; // mtime of mcp-servers.json when process was spawned
   lastActivity: number; // timestamp of last stdout event
   intentionalAbort?: boolean; // true when killed via /stop (preserve sessionId for resume)
+  model?: string; // resolved model string passed to --model (e.g. "sonnet[1m]")
 }
 
 const KILL_GRACE_MS = 5000;
@@ -36,7 +37,7 @@ const STATE_FILE = 'process-pool-state.json';
 
 export type UnsolicitedResultCallback = (sessionKey: string, result: RunResult) => void;
 export type ProgressCallback = (sessionKey: string, toolName: string, toolInput?: string) => void;
-export type TextStreamCallback = (sessionKey: string, fullText: string) => void;
+export type TextStreamCallback = (sessionKey: string, fullText: string, liveUsage?: LiveUsage & { model?: string }) => void;
 export type ToolStreamCallback = (sessionKey: string, event: {
   type: 'start' | 'end';
   toolName: string;
@@ -44,6 +45,7 @@ export type ToolStreamCallback = (sessionKey: string, event: {
   toolUseId?: string;
   isError?: boolean;
 }) => void;
+export type ThinkingStreamCallback = (sessionKey: string, thinking: string) => void;
 
 /** Persistent callback for subagent lifecycle events — survives across turns. */
 export type SubagentStreamCallback = (sessionKey: string, event: {
@@ -64,6 +66,7 @@ export class ProcessPool {
   private progressCallback?: ProgressCallback;
   private textStreamCallbacks = new Map<string, TextStreamCallback>();
   private toolStreamCallbacks = new Map<string, ToolStreamCallback>();
+  private thinkingStreamCallbacks = new Map<string, ThinkingStreamCallback>();
   private subagentStreamCallbacks = new Map<string, SubagentStreamCallback>();
 
   constructor(
@@ -113,6 +116,11 @@ export class ProcessPool {
     } else {
       this.toolStreamCallbacks.delete(sessionKey);
     }
+  }
+
+  onThinkingStream(sessionKey: string, callback: ThinkingStreamCallback | undefined): void {
+    if (callback) this.thinkingStreamCallbacks.set(sessionKey, callback);
+    else this.thinkingStreamCallbacks.delete(sessionKey);
   }
 
   /**
@@ -297,11 +305,20 @@ export class ProcessPool {
    * Get the model for a session (per-session override or global default).
    */
   private static MODEL_ALIASES: Record<string, string> = {
-    'opus': 'opus[1m]',
-    'opus 1m': 'opus[1m]',
-    'sonnet': 'sonnet[1m]',
-    'sonnet 1m': 'sonnet[1m]',
-    'haiku': 'haiku',
+    // Haiku
+    'haiku':           'haiku',
+    // Sonnet (current)
+    'sonnet':          'claude-sonnet-4-6[1m]',
+    'sonnet 1m':       'claude-sonnet-4-6[1m]',
+    'sonnet 200k':     'claude-sonnet-4-6',
+    // Opus 4.6 (previous flagship — kept for tokenizer compatibility)
+    'opus 4.6':        'claude-opus-4-6[1m]',
+    'opus 4.6 1m':     'claude-opus-4-6[1m]',
+    'opus 4.6 200k':   'claude-opus-4-6',
+    // Opus 4.7 (current flagship)
+    'opus':            'claude-opus-4-7[1m]',
+    'opus 1m':         'claude-opus-4-7[1m]',
+    'opus 200k':       'claude-opus-4-7',
   };
 
   private getSessionModel(sessionKey: string, sessionDir: string): string {
@@ -468,6 +485,7 @@ export class ProcessPool {
       readyResolve,
       mcpConfigMtime,
       lastActivity: Date.now(),
+      model,
     };
 
     this.processes.set(sessionKey, pp);
@@ -627,8 +645,17 @@ export class ProcessPool {
         hasToolResult: !!result.toolResult,
       }, missingCb ? 'Stream callback missing' : 'Stream event check');
     }
-    if (result.text && pp.currentResolve && textCb) {
-      textCb(pp.sessionKey, pp.parser.fullText);
+    // Fire textCb on any assistant event (text OR tool_use) so the live footer's
+    // usage numbers refresh even on tool-only turns. onText is idempotent — it just
+    // stores pendingText and the streamer throttles flushes.
+    if ((result.text || result.toolUse) && pp.currentResolve && textCb) {
+      textCb(pp.sessionKey, pp.parser.fullText, { ...pp.parser.liveUsage, model: pp.model });
+    }
+
+    // Thinking stream: fires once per assistant message that contains a thinking block
+    if (result.thinking && pp.currentResolve) {
+      const thinkingCb = this.thinkingStreamCallbacks.get(pp.sessionKey);
+      if (thinkingCb) thinkingCb(pp.sessionKey, result.thinking);
     }
 
     // Tool stream callbacks: start and end events
@@ -709,8 +736,31 @@ export class ProcessPool {
         durationMs: result.durationMs,
         inputTokens: result.inputTokens,
         outputTokens: result.outputTokens,
+        cacheReadTokens: result.cacheReadTokens,
+        cacheCreationTokens: result.cacheCreationTokens,
+        peakCallInputTokens: result.peakCallInputTokens,
+        peakCallCacheReadTokens: result.peakCallCacheReadTokens,
+        peakCallCacheCreationTokens: result.peakCallCacheCreationTokens,
+        model: pp.model,
         error: result.error,
       };
+
+      // Prompt caching diagnostic: log usage breakdown so we can tell whether
+      // the v2.1.69+ --print/--resume cache regression (github #34629) is biting us.
+      const totalPrompt = (result.inputTokens || 0) + (result.cacheReadTokens || 0) + (result.cacheCreationTokens || 0);
+      const hitPct = totalPrompt > 0 ? Math.round((result.cacheReadTokens || 0) * 100 / totalPrompt) : 0;
+      const peakPrompt = (result.peakCallInputTokens || 0) + (result.peakCallCacheReadTokens || 0) + (result.peakCallCacheCreationTokens || 0);
+      this.logger.info({
+        sessionKey: pp.sessionKey,
+        input: result.inputTokens || 0,
+        cacheRead: result.cacheReadTokens || 0,
+        cacheCreation: result.cacheCreationTokens || 0,
+        output: result.outputTokens || 0,
+        totalPrompt,
+        peakCallPrompt: peakPrompt,
+        cacheHitPct: hitPct,
+        costUsd: result.costUsd,
+      }, 'Turn usage');
 
       // Update saved sessionId — but NOT if this turn had an error
       // (error_during_execution with a corrupted --resume session must not be re-saved)

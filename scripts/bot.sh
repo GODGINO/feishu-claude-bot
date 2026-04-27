@@ -18,6 +18,15 @@ CLOUDFLARED="$(which cloudflared 2>/dev/null || echo "$HOME/.local/bin/cloudflar
 CF_TUNNEL_TOKEN="${CF_TUNNEL_TOKEN:-}"
 CF_TUNNEL_URL="${CF_TUNNEL_URL:-}"
 APP_NAME="feishu-bot"
+
+# Sigma Claude Switcher (auto account rotation) — installed copy lives at ~/.sigma-switcher
+# via sigma-switcher/daemon/install.sh. bot.sh just launches it as a subprocess here,
+# paralleling the Cloudflare Tunnel pattern. Skipped silently if not installed/configured.
+SWITCHER_DIR="$HOME/.sigma-switcher"
+SWITCHER_PYTHON="$SWITCHER_DIR/venv/bin/python3"
+SWITCHER_SCRIPT="$SWITCHER_DIR/switcher.py"
+SWITCHER_CONFIG="$SWITCHER_DIR/config.yaml"
+SWITCHER_PID_FILE="$PROJECT_DIR/.switcher.pid"
 export PATH="$(dirname "$(which node)"):$HOME/.local/bin:$HOME/.bun/bin:$PATH"
 
 pm2_cmd() {
@@ -41,6 +50,7 @@ start() {
   if is_running; then
     echo "Bot 已启动"
     start_tunnel
+    start_switcher
   else
     echo "Bot 启动失败，查看日志: pm2 logs $APP_NAME"
     return 1
@@ -48,6 +58,7 @@ start() {
 }
 
 stop() {
+  stop_switcher
   stop_tunnel
   if ! is_running; then
     echo "Bot 未在运行"
@@ -64,6 +75,7 @@ restart() {
     pm2_cmd restart "$APP_NAME" --update-env
     echo "Bot 已重启"
     start_tunnel
+    start_switcher
   else
     start
   fi
@@ -80,6 +92,11 @@ status() {
     echo "CF 隧道运行中: $(cat "$CF_URL_FILE" 2>/dev/null || echo '未知')"
   else
     echo "CF 隧道未运行"
+  fi
+  if [ -f "$SWITCHER_PID_FILE" ] && kill -0 "$(cat "$SWITCHER_PID_FILE")" 2>/dev/null; then
+    echo "Switcher 运行中 (PID $(cat "$SWITCHER_PID_FILE"))"
+  else
+    echo "Switcher 未运行"
   fi
 }
 
@@ -112,6 +129,37 @@ stop_tunnel() {
     rm -f "$CF_PID_FILE"
   fi
   pkill -f "cloudflared tunnel run" 2>/dev/null
+}
+
+start_switcher() {
+  # Silently skip if not installed — run `bash sigma-switcher/daemon/install.sh` once to set up.
+  if [ ! -x "$SWITCHER_PYTHON" ] || [ ! -f "$SWITCHER_SCRIPT" ]; then
+    echo "Switcher 未安装，跳过（运行 bash sigma-switcher/daemon/install.sh 安装）"
+    return 0
+  fi
+  if [ ! -f "$SWITCHER_CONFIG" ]; then
+    echo "Switcher 未配置，跳过（编辑 $SWITCHER_CONFIG）"
+    return 0
+  fi
+  stop_switcher
+  mkdir -p "$SWITCHER_DIR/logs"
+  nohup "$SWITCHER_PYTHON" "$SWITCHER_SCRIPT" >> "$SWITCHER_DIR/logs/switcher.log" 2>&1 &
+  echo $! > "$SWITCHER_PID_FILE"
+  sleep 1
+  if kill -0 "$(cat "$SWITCHER_PID_FILE")" 2>/dev/null; then
+    echo "Switcher 已启动 (PID $(cat "$SWITCHER_PID_FILE"))"
+  else
+    echo "Switcher 启动失败，查看日志: $SWITCHER_DIR/logs/switcher.log"
+  fi
+}
+
+stop_switcher() {
+  if [ -f "$SWITCHER_PID_FILE" ]; then
+    local pid=$(cat "$SWITCHER_PID_FILE")
+    kill "$pid" 2>/dev/null
+    rm -f "$SWITCHER_PID_FILE"
+  fi
+  pkill -f "\.sigma-switcher/switcher.py" 2>/dev/null
 }
 
 case "${1:-status}" in

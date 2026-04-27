@@ -5,6 +5,7 @@ import type { MessageSender } from '../feishu/message-sender.js';
 import type { TypingIndicator } from '../feishu/typing.js';
 import type { ClaudeRunner, ImageAttachment } from '../claude/runner.js';
 import { ProcessPool } from '../claude/process-pool.js';
+import type { LiveUsage } from '../claude/stream-parser.js';
 import { SessionManager } from '../claude/session-manager.js';
 import type { Config } from '../config.js';
 import type { Logger } from '../utils/logger.js';
@@ -718,10 +719,26 @@ export class MessageBridge {
    * Execute a card button action — sends the click as natural language to Claude.
    * Respects the same runningTasks queue as normal messages.
    */
-  async executeButtonAction(sessionKey: string, chatId: string, label: string, userName: string, cardId?: string, messageId?: string): Promise<void> {
+  async executeButtonAction(sessionKey: string, chatId: string, actionId: string, label: string, userName: string, operatorId: string, cardId?: string, messageId?: string): Promise<void> {
     // Update original card immediately (disable buttons + show who clicked) — don't wait for queue
     if (cardId) {
       await this.updateCardButtonState(cardId, label, userName);
+    }
+
+    // If actionId is a slash command, route it through the command handler
+    // (same path as if the user had typed it). This lets buttons trigger /model, /effort, etc.
+    if (actionId?.startsWith('/')) {
+      const handled = await this.commandHandler.handle(actionId, {
+        chatId,
+        messageId: messageId || '',
+        sessionKey,
+        userId: operatorId,
+        senderName: userName,
+      });
+      if (handled) {
+        this.logger.info({ sessionKey, actionId, userName }, 'Button routed to command handler');
+        return;
+      }
     }
 
     // Check if session is muted
@@ -906,9 +923,10 @@ export class MessageBridge {
       streamer.startPromise = p;
     };
 
-    const onText = (key: string, text: string) => {
+    const onText = (key: string, text: string, liveUsage?: LiveUsage & { model?: string }) => {
       if (key !== sessionKey) return;
       bufferedText = text;
+      if (liveUsage) streamer.updateLiveUsage(liveUsage);
       if (cardCreated && !cardCreating) {
         streamer.updateText(text);
       }
@@ -924,8 +942,14 @@ export class MessageBridge {
         streamer.updateToolCall(event.toolUseId, event.isError ? 'failed' : 'complete');
       }
     };
+    const onThinking = (key: string, thinking: string) => {
+      if (key !== sessionKey) return;
+      if (!cardCreated && !cardCreating) ensureCard();
+      streamer.addThinking(thinking);
+    };
     this.runner.onTextStream(sessionKey, onText);
     this.runner.onToolStream(sessionKey, onTool);
+    this.runner.onThinkingStream(sessionKey, onThinking);
 
     // Track running subagents — only real background agents (local_agent), not background bash tasks
     const runningAgents = new Map<string, { toolUseId?: string; description?: string }>();
@@ -991,6 +1015,12 @@ export class MessageBridge {
         await streamer.complete(echoPrefix + rawText || '(空回复)', {
           inputTokens: result.inputTokens,
           outputTokens: result.outputTokens,
+          cacheReadTokens: result.cacheReadTokens,
+          cacheCreationTokens: result.cacheCreationTokens,
+          peakCallInputTokens: result.peakCallInputTokens,
+          peakCallCacheReadTokens: result.peakCallCacheReadTokens,
+          peakCallCacheCreationTokens: result.peakCallCacheCreationTokens,
+          model: result.model,
           costUsd: result.costUsd,
         });
         await this.sendMentionedFiles(chatId, cleanText, sessionDir, undefined, undefined, sessionKey);
@@ -1035,6 +1065,12 @@ export class MessageBridge {
         await streamer.complete(rawText || '(空回复)', {
           inputTokens: result.inputTokens,
           outputTokens: result.outputTokens,
+          cacheReadTokens: result.cacheReadTokens,
+          cacheCreationTokens: result.cacheCreationTokens,
+          peakCallInputTokens: result.peakCallInputTokens,
+          peakCallCacheReadTokens: result.peakCallCacheReadTokens,
+          peakCallCacheCreationTokens: result.peakCallCacheCreationTokens,
+          model: result.model,
           costUsd: result.costUsd,
         });
         await this.sendMentionedFiles(chatId, cleanText, sessionDir, undefined, streamRootId, sessionKey);
@@ -1074,6 +1110,7 @@ export class MessageBridge {
     } finally {
       this.runner.onTextStream(sessionKey, undefined);
       this.runner.onToolStream(sessionKey, undefined);
+      this.runner.onThinkingStream(sessionKey, undefined);
 
       // Admin echo info — read early so WeChat dual-send can check it
       const adminEchoInfo = this.adminChatPendingEcho.get(sessionKey);

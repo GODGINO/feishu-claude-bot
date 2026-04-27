@@ -16,6 +16,12 @@ export interface ToolCallInfo {
   children?: ToolCallInfo[];
 }
 
+/** Extended-thinking entry (no status — thinking is a plain text observation). */
+export interface ThinkingEntry {
+  text: string;
+  at: number;
+}
+
 /**
  * Get tool-specific emoji based on tool name.
  */
@@ -62,8 +68,15 @@ export function buildThinkingCard(): object {
 
 /**
  * Build a streaming card — updated periodically with new text and tool calls.
+ * Thinking entries (if any) are interleaved into the panel body as markdown lines.
  */
-export function buildStreamingCard(text: string, toolCalls?: ToolCallInfo[], startTime?: number): object {
+export function buildStreamingCard(
+  text: string,
+  toolCalls?: ToolCallInfo[],
+  startTime?: number,
+  thinkingEntries?: ThinkingEntry[],
+  usage?: UsageInfo,
+): object {
   const elements: object[] = [];
 
   // Detect TITLE tag in streamed text via the shared tolerant parser.
@@ -71,12 +84,14 @@ export function buildStreamingCard(text: string, toolCalls?: ToolCallInfo[], sta
   let displayText = body;
   let headerTitle = extracted;
 
-  // Tool calls section — collapsible panel at the top, default collapsed
-  if (toolCalls && toolCalls.length > 0) {
-    let panelTitle = `🔄 ${toolCalls.length} 次工具调用`;
-    if (startTime) {
-      panelTitle += ` · ${formatDuration(Date.now() - startTime)}`;
-    }
+  const toolCount = toolCalls?.length || 0;
+  const thinkingCount = thinkingEntries?.length || 0;
+
+  // Tool + thinking panel — collapsible, default collapsed
+  if (toolCount > 0 || thinkingCount > 0) {
+    let panelTitle = toolCount > 0 ? `🔄 ${toolCount} 次工具调用` : `🔄 ${thinkingCount} 次思考`;
+    if (toolCount > 0 && thinkingCount > 0) panelTitle += ` · ${thinkingCount} 次思考`;
+    if (startTime) panelTitle += ` · ${formatDuration(Date.now() - startTime)}`;
     elements.push({
       tag: 'collapsible_panel',
       expanded: false,
@@ -89,7 +104,7 @@ export function buildStreamingCard(text: string, toolCalls?: ToolCallInfo[], sta
       border: { color: 'grey' },
       vertical_spacing: '8px',
       padding: '4px 8px 4px 8px',
-      elements: buildToolPanelElements(toolCalls, false),
+      elements: buildToolPanelElements(toolCalls || [], thinkingEntries || [], false),
     });
   }
 
@@ -107,6 +122,45 @@ export function buildStreamingCard(text: string, toolCalls?: ToolCallInfo[], sta
       element_id: STREAMING_ELEMENT_ID,
     });
   }
+
+  // Live footer — 🕙 elapsed · N 工具调用 · tokens · ctx% · cache hit%
+  // Each part is only emitted once it has a meaningful non-zero value, so the
+  // footer grows naturally as data arrives instead of flashing "0 tokens".
+  const footerParts: string[] = [];
+  if (startTime) {
+    footerParts.push(`🕙 ${formatDuration(Date.now() - startTime)}`);
+  } else {
+    footerParts.push('🕙');
+  }
+  if (toolCount > 0) {
+    footerParts.push(`${toolCount} 工具调用`);
+  }
+  if (usage) {
+    const totalTokens = (usage.inputTokens || 0) + (usage.outputTokens || 0);
+    if (totalTokens > 0) {
+      footerParts.push(`${formatTokenCount(totalTokens)} tokens (in: ${formatTokenCount(usage.inputTokens || 0)} / out: ${formatTokenCount(usage.outputTokens || 0)})`);
+    }
+    const peakPrompt = (usage.peakCallInputTokens || 0) + (usage.peakCallCacheReadTokens || 0) + (usage.peakCallCacheCreationTokens || 0);
+    const aggregatePrompt = (usage.inputTokens || 0) + (usage.cacheReadTokens || 0) + (usage.cacheCreationTokens || 0);
+    const promptForCtx = peakPrompt > 0 ? peakPrompt : aggregatePrompt;
+    if (promptForCtx > 0) {
+      const window = contextWindowOf(usage.model);
+      const windowLabel = window >= 1_000_000 ? '1M' : `${window / 1000}K`;
+      const ctxPct = Math.min(100, Math.round((promptForCtx / window) * 100));
+      footerParts.push(`ctx ${ctxPct}% of ${windowLabel}${ctxHint(ctxPct)}`);
+    }
+    const cacheReadForHit = peakPrompt > 0 ? (usage.peakCallCacheReadTokens || 0) : (usage.cacheReadTokens || 0);
+    if (cacheReadForHit > 0 && promptForCtx > 0) {
+      const hitPct = Math.round((cacheReadForHit / promptForCtx) * 100);
+      footerParts.push(`cache hit ${hitPct}%`);
+    }
+  }
+  elements.push({ tag: 'hr' });
+  elements.push({
+    tag: 'markdown',
+    content: footerParts.join(' · '),
+    text_size: 'notation',
+  });
 
   const card: any = {
     schema: '2.0',
@@ -141,7 +195,35 @@ export interface ButtonInfo {
 export interface UsageInfo {
   inputTokens?: number;
   outputTokens?: number;
+  cacheReadTokens?: number;
+  cacheCreationTokens?: number;
+  // Single-call peak — use these (not the turn-aggregate) for ctx% so agent loops
+  // don't inflate the indicator past 100%.
+  peakCallInputTokens?: number;
+  peakCallCacheReadTokens?: number;
+  peakCallCacheCreationTokens?: number;
   costUsd?: number;
+  model?: string; // resolved model, e.g. "sonnet[1m]" / "opus[1m]" / "haiku"
+}
+
+/**
+ * Context window size (in tokens) for the given resolved model string.
+ * Anything with a `[1m]` suffix gets 1M; otherwise default 200K.
+ */
+function contextWindowOf(model?: string): number {
+  if (model && /\[1m\]/i.test(model)) return 1_000_000;
+  return 200_000;
+}
+
+/**
+ * Turn the context-fill percentage into an actionable hint for the user.
+ * Thresholds picked so a hint only appears once the session is genuinely heavy.
+ */
+function ctxHint(pct: number): string {
+  if (pct >= 95) return ' · 🚨 请立即 /compact 或 /new';
+  if (pct >= 80) return ' · ⚠️ 建议 /compact';
+  if (pct >= 60) return ' · 💡 建议 /compact';
+  return '';
 }
 
 /**
@@ -295,7 +377,19 @@ export function buildButtonElements(buttons: ButtonInfo[], ctx: ButtonContext = 
   return out;
 }
 
-export function buildCompleteCard(text: string, toolCalls?: ToolCallInfo[], elapsed?: number, title?: string, buttons?: ButtonInfo[], sessionKey?: string, chatId?: string, cardId?: string, messageId?: string, usage?: UsageInfo): object {
+export function buildCompleteCard(
+  text: string,
+  toolCalls?: ToolCallInfo[],
+  elapsed?: number,
+  title?: string,
+  buttons?: ButtonInfo[],
+  sessionKey?: string,
+  chatId?: string,
+  cardId?: string,
+  messageId?: string,
+  usage?: UsageInfo,
+  thinkingEntries?: ThinkingEntry[],
+): object {
   // Extract TITLE tag via shared tolerant parser (handles <<TITLE:xxx>>, HTML-mixed, etc.)
   const { title: extracted, body } = extractTitleFromText(text || '(空回复)', 30);
   let displayText = body;
@@ -303,12 +397,14 @@ export function buildCompleteCard(text: string, toolCalls?: ToolCallInfo[], elap
 
   const elements: object[] = [];
 
-  // Tool calls — collapsible panel at the top, default collapsed
-  if (toolCalls && toolCalls.length > 0) {
-    let toolPanelTitle = `✅ ${toolCalls.length} 次工具调用`;
-    if (elapsed) {
-      toolPanelTitle += ` · ${formatDuration(elapsed)}`;
-    }
+  const toolCount = toolCalls?.length || 0;
+  const thinkingCount = thinkingEntries?.length || 0;
+
+  // Tool + thinking panel — collapsible panel at the top, default collapsed
+  if (toolCount > 0 || thinkingCount > 0) {
+    let toolPanelTitle = toolCount > 0 ? `✅ ${toolCount} 次工具调用` : `✅ ${thinkingCount} 次思考`;
+    if (toolCount > 0 && thinkingCount > 0) toolPanelTitle += ` · ${thinkingCount} 次思考`;
+    if (elapsed) toolPanelTitle += ` · ${formatDuration(elapsed)}`;
     elements.push({
       tag: 'collapsible_panel',
       expanded: false,
@@ -321,7 +417,7 @@ export function buildCompleteCard(text: string, toolCalls?: ToolCallInfo[], elap
       border: { color: 'grey' },
       vertical_spacing: '8px',
       padding: '4px 8px 4px 8px',
-      elements: buildToolPanelElements(toolCalls, false),
+      elements: buildToolPanelElements(toolCalls || [], thinkingEntries || [], false),
     });
   }
 
@@ -340,17 +436,32 @@ export function buildCompleteCard(text: string, toolCalls?: ToolCallInfo[], elap
 
   // Footer — status + metrics
   elements.push({ tag: 'hr' });
-  const footerParts = ['✅ 完成'];
-  if (elapsed) {
-    footerParts.push(`耗时 ${formatDuration(elapsed)}`);
-  }
+  const footerParts: string[] = [];
+  footerParts.push(elapsed ? `✅ ${formatDuration(elapsed)}` : '✅');
   if (toolCalls && toolCalls.length > 0) {
-    footerParts.push(`${toolCalls.length} 次工具调用`);
+    footerParts.push(`${toolCalls.length} 工具调用`);
   }
   if (usage) {
     const totalTokens = (usage.inputTokens || 0) + (usage.outputTokens || 0);
     if (totalTokens > 0) {
       footerParts.push(`${formatTokenCount(totalTokens)} tokens (in: ${formatTokenCount(usage.inputTokens || 0)} / out: ${formatTokenCount(usage.outputTokens || 0)})`);
+    }
+    // Use peak single-call prompt for ctx% — falls back to turn-aggregate only if
+    // peak isn't available (e.g. older log entries). Peak never exceeds the window.
+    const peakPrompt = (usage.peakCallInputTokens || 0) + (usage.peakCallCacheReadTokens || 0) + (usage.peakCallCacheCreationTokens || 0);
+    const aggregatePrompt = (usage.inputTokens || 0) + (usage.cacheReadTokens || 0) + (usage.cacheCreationTokens || 0);
+    const promptForCtx = peakPrompt > 0 ? peakPrompt : aggregatePrompt;
+    if (promptForCtx > 0) {
+      const window = contextWindowOf(usage.model);
+      const windowLabel = window >= 1_000_000 ? '1M' : `${window / 1000}K`;
+      const ctxPct = Math.min(100, Math.round((promptForCtx / window) * 100));
+      footerParts.push(`ctx ${ctxPct}% of ${windowLabel}${ctxHint(ctxPct)}`);
+    }
+    // Cache hit% uses the same call's numbers as ctx% for consistency.
+    const cacheReadForHit = peakPrompt > 0 ? (usage.peakCallCacheReadTokens || 0) : (usage.cacheReadTokens || 0);
+    if (cacheReadForHit > 0 && promptForCtx > 0) {
+      const hitPct = Math.round((cacheReadForHit / promptForCtx) * 100);
+      footerParts.push(`cache hit ${hitPct}%`);
     }
   }
   elements.push({
@@ -527,6 +638,17 @@ function formatSingleTool(tc: ToolCallInfo): string {
 }
 
 /**
+ * Format a single thinking entry as a markdown line for the "X 次工具调用已完成" panel.
+ * No status prefix — thinking is a plain observation, not a tool call.
+ * Truncates long thinking text to keep the panel compact.
+ */
+function formatThinkingLine(text: string, maxLen = 160): string {
+  const oneLine = text.replace(/\s+/g, ' ').trim();
+  const truncated = oneLine.length > maxLen ? oneLine.slice(0, maxLen) + '…' : oneLine;
+  return `💭 ${truncated}`;
+}
+
+/**
  * Plain-text version (no markdown formatting) for use in collapsible_panel headers,
  * which use plain_text and won't render markdown.
  */
@@ -553,7 +675,7 @@ function formatToolCallsSummary(toolCalls: ToolCallInfo[]): string {
  * Agent tools with children get nested collapsible_panel; others are markdown lines.
  * @param expanded Whether agent sub-panels should be expanded (true for streaming, false for complete).
  */
-function buildToolPanelElements(toolCalls: ToolCallInfo[], expanded: boolean): object[] {
+function buildToolPanelElements(toolCalls: ToolCallInfo[], thinkingEntries: ThinkingEntry[], expanded: boolean): object[] {
   const elements: object[] = [];
 
   // Separate agents-with-children from flat tools
@@ -567,37 +689,46 @@ function buildToolPanelElements(toolCalls: ToolCallInfo[], expanded: boolean): o
     }
   }
 
-  // Flat tools: separate completed from running
-  if (flatTools.length > 0) {
-    const completed = flatTools.filter(tc => tc.status !== 'running');
-    const running = flatTools.filter(tc => tc.status === 'running');
+  const completed = flatTools.filter(tc => tc.status !== 'running');
+  const running = flatTools.filter(tc => tc.status === 'running');
 
-    // Completed tools → nested collapsible panel (collapsed)
-    if (completed.length > 0) {
-      const completedLines = completed.map(tc => formatSingleTool(tc));
-      elements.push({
-        tag: 'collapsible_panel',
-        expanded: false,
-        header: {
-          title: {
-            tag: 'plain_text',
-            content: `✅ ${completed.length} 次工具调用已完成`,
-          },
-        },
-        border: { color: 'grey' },
-        vertical_spacing: '4px',
-        padding: '4px 8px 4px 8px',
-        elements: [
-          { tag: 'markdown', content: completedLines.join('\n') },
-        ],
-      });
-    }
+  // Nested "已完成" panel: completed tools + thinking entries, interleaved by timestamp.
+  // All rows are markdown lines (thinking has no status — just 💭 + text).
+  if (completed.length > 0 || thinkingEntries.length > 0) {
+    type TimelineItem =
+      | { kind: 'tool'; at: number; tool: ToolCallInfo }
+      | { kind: 'thinking'; at: number; text: string };
+    const timeline: TimelineItem[] = [
+      ...completed.map(tc => ({ kind: 'tool' as const, at: tc.startTime, tool: tc })),
+      ...thinkingEntries.map(t => ({ kind: 'thinking' as const, at: t.at, text: t.text })),
+    ];
+    timeline.sort((a, b) => a.at - b.at);
 
-    // Running tools → show expanded
-    if (running.length > 0) {
-      const runningLines = running.map(tc => formatSingleTool(tc));
-      elements.push({ tag: 'markdown', content: runningLines.join('\n') });
-    }
+    const lines = timeline.map(item =>
+      item.kind === 'tool' ? formatSingleTool(item.tool) : formatThinkingLine(item.text),
+    );
+
+    const headerText = completed.length > 0
+      ? `✅ ${completed.length} 次工具调用已完成`
+      : `💭 ${thinkingEntries.length} 次思考`;
+
+    elements.push({
+      tag: 'collapsible_panel',
+      expanded: false,
+      header: {
+        title: { tag: 'plain_text', content: headerText },
+      },
+      border: { color: 'grey' },
+      vertical_spacing: '4px',
+      padding: '4px 8px 4px 8px',
+      elements: [{ tag: 'markdown', content: lines.join('\n') }],
+    });
+  }
+
+  // Running tools → show as markdown (outside the "已完成" panel)
+  if (running.length > 0) {
+    const runningLines = running.map(tc => formatSingleTool(tc));
+    elements.push({ tag: 'markdown', content: runningLines.join('\n') });
   }
 
   // Each agent with children gets its own nested collapsible_panel

@@ -41,6 +41,9 @@ export class CardStreamer {
   private lastUpdateTime = 0;
   private pendingText = '';
   private toolCalls: ToolCallInfo[] = [];
+  // Thinking entries captured during the turn; rendered as markdown lines interleaved
+  // with tool lines in the "X 次工具调用已完成" inner panel by timestamp.
+  private thinkingEntries: Array<{ text: string; at: number }> = [];
   private taskIdToToolUseId = new Map<string, string>(); // taskId → toolUseId (for subagent step routing)
   private updateTimer: ReturnType<typeof setTimeout> | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -62,6 +65,8 @@ export class CardStreamer {
   // Shared cache for button card state (set by caller)
   buttonCardCache?: Map<string, { cardJson: object; sequence: number; expiresAt: number }>;
   private completed = false;
+  // Latest usage snapshot pushed from the stream parser — surfaced in the live footer.
+  private liveUsage?: UsageInfo;
 
   constructor(
     private client: lark.Client,
@@ -71,6 +76,15 @@ export class CardStreamer {
   /** Return the current accumulated text (for graceful stop). */
   getCurrentText(): string {
     return this.pendingText;
+  }
+
+  /**
+   * Push the latest usage snapshot. Stored for the next flush — doesn't trigger
+   * a card update on its own, since every usage change arrives alongside a text
+   * or tool event that already schedules a flush.
+   */
+  updateLiveUsage(usage: UsageInfo | undefined): void {
+    if (usage) this.liveUsage = usage;
   }
 
   /**
@@ -216,6 +230,14 @@ export class CardStreamer {
         p.finally(() => { if (this.inflightFlush === p) this.inflightFlush = null; });
       }, delay);
     }
+  }
+
+  /** Append a thinking block (no status — thinking is just a text entry). */
+  addThinking(text: string): void {
+    if (!text?.trim()) return;
+    this.thinkingEntries.push({ text: text.trim(), at: Date.now() });
+    this.startHeartbeatIfNeeded();
+    this.updateText(this.pendingText);
   }
 
   addToolCall(name: string, input?: string, toolUseId?: string): void {
@@ -373,6 +395,7 @@ export class CardStreamer {
         this.cardId || undefined,
         this.messageId || undefined,
         usage,
+        this.thinkingEntries.length > 0 ? this.thinkingEntries : undefined,
       );
 
       // Cache card state for button click updates
@@ -544,6 +567,8 @@ export class CardStreamer {
         this.toolCalls.length > 0 ? this.toolCalls : undefined,
         Date.now() - this.startTime,
         '⏹ 已中止',
+        undefined, undefined, undefined, undefined, undefined, undefined,
+        this.thinkingEntries.length > 0 ? this.thinkingEntries : undefined,
       );
 
       this.sequence++;
@@ -648,7 +673,13 @@ export class CardStreamer {
       : displayText;
 
     try {
-      const streamingCard = buildStreamingCard(truncatedText, this.toolCalls, this.startTime);
+      const streamingCard = buildStreamingCard(
+        truncatedText,
+        this.toolCalls,
+        this.startTime,
+        this.thinkingEntries,
+        this.liveUsage,
+      );
 
       await (this.client.cardkit as any).v1.card.update({
         path: { card_id: this.cardId },

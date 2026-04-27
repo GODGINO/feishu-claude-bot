@@ -39,3 +39,14 @@ config.deployment.*
 # Server build output (Phase 0 added tsconfig.server.json → dist-server/)
 dist-server/
 
+# ── Sigma Claude Switcher (account auto-rotation) ──
+# The installed copy lives at ~/.sigma-switcher (outside the repo) and is never tracked.
+# Inside the repo: never commit real config.yaml (IMAP password, real emails) — only
+# config.example.yaml ships. Also skip the local venv and runtime artifacts.
+sigma-switcher/daemon/config.yaml
+sigma-switcher/daemon/venv/
+sigma-switcher/daemon/state.json
+sigma-switcher/daemon/logs/
+.switcher.pid
+.switcher.log
+
