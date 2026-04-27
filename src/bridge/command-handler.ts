@@ -53,8 +53,8 @@ export class CommandHandler {
     if (cmd === '/new') {
       return this.handleNew(ctx);
     }
-    if (cmd === '/compact') {
-      return this.handleCompact(ctx);
+    if (cmd === '/compact' || cmd.startsWith('/compact ')) {
+      return this.handleCompact(text.trim(), ctx);
     }
     if (cmd === '/stop') {
       return this.handleStop(ctx);
@@ -538,22 +538,25 @@ export class CommandHandler {
     return true;
   }
 
-  private async handleCompact(ctx: CommandContext): Promise<boolean> {
+  private async handleCompact(text: string, ctx: CommandContext): Promise<boolean> {
     const session = this.sessionMgr.get(ctx.sessionKey) || this.sessionMgr.getOrCreate(ctx.sessionKey);
-    // Forward /compact directly to Claude Code — it's a built-in slash command.
+    // Optional focus instructions: `/compact <instructions>` tells Claude what to
+    // prioritize in the summary. Bare `/compact` keeps the original behavior.
+    const focus = text.replace(/^\/compact\b\s*/i, '').trim();
+    const message = focus ? `/compact ${focus}` : '/compact';
     await this.sender.sendText(ctx.chatId, '⏳ 正在压缩上下文…', ctx.messageId);
     try {
       const result = await this.runner.pool.send({
         sessionKey: ctx.sessionKey,
         sessionDir: session.sessionDir,
-        message: '/compact',
+        message,
       });
       if (result.error) {
         await this.sender.sendText(ctx.chatId, `❌ 压缩失败：${result.error}`, ctx.messageId);
       } else {
         await this.sender.sendText(ctx.chatId, '✅ 上下文已压缩。下一条消息开始使用更轻量的历史。', ctx.messageId);
       }
-      this.logger.info({ sessionKey: ctx.sessionKey, hasError: !!result.error }, '/compact: user-invoked');
+      this.logger.info({ sessionKey: ctx.sessionKey, hasError: !!result.error, hasFocus: !!focus }, '/compact: user-invoked');
     } catch (err: any) {
       await this.sender.sendText(ctx.chatId, `❌ 压缩失败：${err?.message || err}`, ctx.messageId);
       this.logger.error({ err, sessionKey: ctx.sessionKey }, '/compact threw');
@@ -566,7 +569,7 @@ export class CommandHandler {
       '**可用命令**',
       '',
       '`/new` — 重置会话，开始新对话（保留记忆和文件）',
-      '`/compact` — 压缩当前会话历史（降低 ctx 占用、避免「Prompt is too long」）',
+      '`/compact [可选: 聚焦提示]` — 压缩当前会话历史（降低 ctx 占用、避免「Prompt is too long」）',
       '`/stop` — 中止当前正在运行的任务',
       '`/status` — 查看当前会话状态',
       '`/email` — 邮箱管理（添加、查看、测试）',

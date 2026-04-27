@@ -817,8 +817,9 @@ export class MessageBridge {
   }
 
   /**
-   * Update original card to disable buttons and show who clicked.
-   * Modifies the clicked button label to "label@userName" and disables all buttons.
+   * Update original card to disable callback buttons and show who clicked.
+   * Link buttons (behaviors[0].type === 'open_url') stay enabled — they're stateless.
+   * Modifies the clicked button label to "label@userName".
    */
   private async updateCardButtonState(cardId: string, clickedLabel: string, userName: string): Promise<void> {
     const cached = this.buttonCardCache.get(cardId);
@@ -839,7 +840,10 @@ export class MessageBridge {
             if (!Array.isArray(col.elements)) continue;
             for (const btn of col.elements) {
               if (btn.tag !== 'button') continue;
-              btn.disabled = true;
+              const isLinkButton = btn.behaviors?.[0]?.type === 'open_url';
+              if (!isLinkButton) {
+                btn.disabled = true;
+              }
               // Mark the clicked button with "label@userName"
               const btnLabel = btn.behaviors?.[0]?.value?.label || btn.text?.content;
               if (btnLabel === clickedLabel) {

@@ -31,7 +31,9 @@ import {
   type UsageInfo,
 } from './card-builder.js';
 
-const THROTTLE_MS = 500; // Minimum interval between card updates
+const THROTTLE_MS = 1000; // Minimum interval between card updates — paired with
+                          // print_frequency_ms below; faster than 1s buys nothing
+                          // for human readability and just burns API calls.
 const CARD_TEXT_LIMIT = 28000; // Feishu card markdown content limit
 
 export class CardStreamer {
@@ -122,11 +124,17 @@ export class CardStreamer {
       this.logger.info({ cardId: this.cardId }, 'CardKit card created');
 
       // Step 2: Enable streaming mode on the card
+      // print_frequency_ms = 1000 → Feishu client repaints at most once per second.
+      // Without this field, Feishu uses platform-specific defaults that visibly stutter
+      // (~5s observed). Matches THROTTLE_MS = 1000 so there's no waste in either direction.
       this.sequence++;
       await (this.client.cardkit as any).v1.card.settings({
         path: { card_id: this.cardId },
         data: {
-          settings: JSON.stringify({ streaming_mode: true }),
+          settings: JSON.stringify({
+            streaming_mode: true,
+            print_frequency_ms: { default: 1000, android: 1000, ios: 1000 },
+          }),
           sequence: this.sequence,
         },
       });
@@ -621,10 +629,9 @@ export class CardStreamer {
     }
   }
 
-  /** Start a 1s heartbeat to keep "总用时" ticking when tool calls are folded. */
+  /** Start a 1s heartbeat to keep the footer's elapsed time ticking. */
   private startHeartbeatIfNeeded(): void {
     if (this.heartbeatTimer || this.completed) return;
-    if (this.toolCalls.length === 0) return;
 
     this.heartbeatTimer = setInterval(() => {
       if (this.completed || !this.cardId) {
