@@ -5,9 +5,11 @@ import type { MessageSender } from '../feishu/message-sender.js';
 import type { TypingIndicator } from '../feishu/typing.js';
 import type { ClaudeRunner, ImageAttachment } from '../claude/runner.js';
 import { ProcessPool } from '../claude/process-pool.js';
+import type { LiveUsage } from '../claude/stream-parser.js';
 import { SessionManager } from '../claude/session-manager.js';
 import type { Config } from '../config.js';
 import type { Logger } from '../utils/logger.js';
+import { isNoReply } from '../feishu/card-builder.js';
 import { CommandHandler } from './command-handler.js';
 import { MessageQueue } from './message-queue.js';
 import { GroupContextBuffer } from './group-context.js';
@@ -155,6 +157,48 @@ export class MessageBridge {
     adminChat.onMessage = async (sessionKey: string, text: string, echo: boolean, showSource: boolean) => {
       await this.handleAdminChatMessage(sessionKey, text, echo, showSource);
     };
+    adminChat.onSendAsSigma = async (sessionKey: string, text: string, addToContext: boolean) => {
+      await this.handleSendAsSigma(sessionKey, text, addToContext);
+    };
+  }
+
+  /** Send a message directly as Sigma bot — no Claude processing. */
+  private async handleSendAsSigma(sessionKey: string, text: string, addToContext: boolean): Promise<void> {
+    const session = this.sessionMgr.getOrCreate(sessionKey);
+    const chatIdFile = path.join(session.sessionDir, 'chat-id');
+    let chatId = '';
+    try { chatId = fs.readFileSync(chatIdFile, 'utf-8').trim(); } catch { /* ignore */ }
+    if (!chatId) {
+      this.logger.warn({ sessionKey }, 'No chat-id for Send as Sigma');
+      return;
+    }
+
+    this.logger.info({ sessionKey, textLen: text.length, addToContext }, 'Send as Sigma');
+
+    // Send to Feishu as Sigma bot
+    await this.sender.sendReply(chatId, text, undefined, session.sessionDir);
+
+    // Send to WeChat if bound
+    if (this.wechatBridge?.isActive(sessionKey)) {
+      this.wechatBridge.sendToWechat(sessionKey, text).catch(err => {
+        this.logger.warn({ err, sessionKey }, 'Failed to send Sigma message to WeChat');
+      });
+    }
+
+    // Optionally add to context (as bot message, not user message)
+    if (addToContext) {
+      if (!this.groupContext['buffers'].has(chatId)) {
+        this.groupContext.load(session.sessionDir, chatId);
+      }
+      this.groupContext.add(chatId, {
+        timestamp: Date.now(),
+        senderName: 'Sigma',
+        senderId: 'bot',
+        text: '(Send as Sigma)',
+        botReply: text.length > 500 ? text.slice(0, 500) + '...' : text,
+      });
+      this.groupContext.save(session.sessionDir, chatId);
+    }
   }
 
   /** Handle a message from Admin Chat — route to Claude, optionally echo to Feishu/WeChat. */
@@ -256,7 +300,7 @@ export class MessageBridge {
    * REACT is an annotation — can coexist with text and tool calls.
    */
   private async processReactions(text: string, messageId: string): Promise<string> {
-    const pattern = /<<REACT:(\w+)>>/g;
+    const pattern = /<{1,2}\s*REACT\s*[:：]\s*(\w+)\s*>{1,2}\s*/gi;
     const matches = [...text.matchAll(pattern)];
     if (matches.length === 0) return text;
     for (const match of matches) {
@@ -675,10 +719,26 @@ export class MessageBridge {
    * Execute a card button action — sends the click as natural language to Claude.
    * Respects the same runningTasks queue as normal messages.
    */
-  async executeButtonAction(sessionKey: string, chatId: string, label: string, userName: string, cardId?: string, messageId?: string): Promise<void> {
+  async executeButtonAction(sessionKey: string, chatId: string, actionId: string, label: string, userName: string, operatorId: string, cardId?: string, messageId?: string): Promise<void> {
     // Update original card immediately (disable buttons + show who clicked) — don't wait for queue
     if (cardId) {
       await this.updateCardButtonState(cardId, label, userName);
+    }
+
+    // If actionId is a slash command, route it through the command handler
+    // (same path as if the user had typed it). This lets buttons trigger /model, /effort, etc.
+    if (actionId?.startsWith('/')) {
+      const handled = await this.commandHandler.handle(actionId, {
+        chatId,
+        messageId: messageId || '',
+        sessionKey,
+        userId: operatorId,
+        senderName: userName,
+      });
+      if (handled) {
+        this.logger.info({ sessionKey, actionId, userName }, 'Button routed to command handler');
+        return;
+      }
     }
 
     // Check if session is muted
@@ -757,8 +817,9 @@ export class MessageBridge {
   }
 
   /**
-   * Update original card to disable buttons and show who clicked.
-   * Modifies the clicked button label to "label@userName" and disables all buttons.
+   * Update original card to disable callback buttons and show who clicked.
+   * Link buttons (behaviors[0].type === 'open_url') stay enabled — they're stateless.
+   * Modifies the clicked button label to "label@userName".
    */
   private async updateCardButtonState(cardId: string, clickedLabel: string, userName: string): Promise<void> {
     const cached = this.buttonCardCache.get(cardId);
@@ -779,7 +840,10 @@ export class MessageBridge {
             if (!Array.isArray(col.elements)) continue;
             for (const btn of col.elements) {
               if (btn.tag !== 'button') continue;
-              btn.disabled = true;
+              const isLinkButton = btn.behaviors?.[0]?.type === 'open_url';
+              if (!isLinkButton) {
+                btn.disabled = true;
+              }
               // Mark the clicked button with "label@userName"
               const btnLabel = btn.behaviors?.[0]?.value?.label || btn.text?.content;
               if (btnLabel === clickedLabel) {
@@ -843,6 +907,7 @@ export class MessageBridge {
 
     // Pass session info to streamer for button rendering + card cache
     streamer.sessionKey = sessionKey;
+    streamer.sessionDir = sessionDir;
     streamer.chatId = chatId;
     streamer.buttonCardCache = this.buttonCardCache;
 
@@ -862,9 +927,10 @@ export class MessageBridge {
       streamer.startPromise = p;
     };
 
-    const onText = (key: string, text: string) => {
+    const onText = (key: string, text: string, liveUsage?: LiveUsage & { model?: string }) => {
       if (key !== sessionKey) return;
       bufferedText = text;
+      if (liveUsage) streamer.updateLiveUsage(liveUsage);
       if (cardCreated && !cardCreating) {
         streamer.updateText(text);
       }
@@ -880,8 +946,14 @@ export class MessageBridge {
         streamer.updateToolCall(event.toolUseId, event.isError ? 'failed' : 'complete');
       }
     };
+    const onThinking = (key: string, thinking: string) => {
+      if (key !== sessionKey) return;
+      if (!cardCreated && !cardCreating) ensureCard();
+      streamer.addThinking(thinking);
+    };
     this.runner.onTextStream(sessionKey, onText);
     this.runner.onToolStream(sessionKey, onTool);
+    this.runner.onThinkingStream(sessionKey, onThinking);
 
     // Track running subagents — only real background agents (local_agent), not background bash tasks
     const runningAgents = new Map<string, { toolUseId?: string; description?: string }>();
@@ -926,14 +998,14 @@ export class MessageBridge {
         rawText = await this.processReactions(rawText, replyToMessageId);
       } else if (!isFromWechat && !isFromAdmin) {
         // Cron job or other no-reply context: strip REACT tags
-        rawText = rawText.replace(/<<REACT:\w+>>/g, '').trim();
+        rawText = rawText.replace(/<{1,2}\s*REACT\s*[:：]\s*\w+\s*>{1,2}\s*/gi, '').trim();
       }
       // For isFromWechat: REACT tags stay in rawText, extracted later in dual-send
-      const replyText = rawText.replace(/<<THREAD>>\s*/g, '').trim();
+      const replyText = rawText.replace(/<{1,2}\s*THREAD\s*>{1,2}\s*/gi, '').trim();
       const streamRootId = existingRootId;
       const cleanText = replyText;
 
-      if (replyText === 'NO_REPLY' || (!cardCreated && !cardCreating && isNonMentionGroup && !replyText) || (!cardCreated && !cardCreating && !replyText)) {
+      if (isNoReply(replyText) || (!cardCreated && !cardCreating && isNonMentionGroup && !replyText) || (!cardCreated && !cardCreating && !replyText)) {
         // NO_REPLY or empty text without card — finalize card if it was already created
         if (cardCreated || cardCreating) {
           if (streamer.startPromise) await streamer.startPromise;
@@ -947,6 +1019,12 @@ export class MessageBridge {
         await streamer.complete(echoPrefix + rawText || '(空回复)', {
           inputTokens: result.inputTokens,
           outputTokens: result.outputTokens,
+          cacheReadTokens: result.cacheReadTokens,
+          cacheCreationTokens: result.cacheCreationTokens,
+          peakCallInputTokens: result.peakCallInputTokens,
+          peakCallCacheReadTokens: result.peakCallCacheReadTokens,
+          peakCallCacheCreationTokens: result.peakCallCacheCreationTokens,
+          model: result.model,
           costUsd: result.costUsd,
         });
         await this.sendMentionedFiles(chatId, cleanText, sessionDir, undefined, undefined, sessionKey);
@@ -991,6 +1069,12 @@ export class MessageBridge {
         await streamer.complete(rawText || '(空回复)', {
           inputTokens: result.inputTokens,
           outputTokens: result.outputTokens,
+          cacheReadTokens: result.cacheReadTokens,
+          cacheCreationTokens: result.cacheCreationTokens,
+          peakCallInputTokens: result.peakCallInputTokens,
+          peakCallCacheReadTokens: result.peakCallCacheReadTokens,
+          peakCallCacheCreationTokens: result.peakCallCacheCreationTokens,
+          model: result.model,
           costUsd: result.costUsd,
         });
         await this.sendMentionedFiles(chatId, cleanText, sessionDir, undefined, streamRootId, sessionKey);
@@ -998,8 +1082,8 @@ export class MessageBridge {
       }
 
       // Write bot reply to context buffer
-      const cleanReply = replyText.replace(/<<THREAD>>\s*/g, '');
-      if (cleanReply && cleanReply !== 'NO_REPLY') {
+      const cleanReply = replyText.replace(/<{1,2}\s*THREAD\s*>{1,2}\s*/gi, '');
+      if (cleanReply && !isNoReply(cleanReply)) {
         if (!this.groupContext['buffers'].has(chatId)) {
           this.groupContext.load(sessionDir, chatId);
         }
@@ -1030,13 +1114,14 @@ export class MessageBridge {
     } finally {
       this.runner.onTextStream(sessionKey, undefined);
       this.runner.onToolStream(sessionKey, undefined);
+      this.runner.onThinkingStream(sessionKey, undefined);
 
       // Admin echo info — read early so WeChat dual-send can check it
       const adminEchoInfo = this.adminChatPendingEcho.get(sessionKey);
       this.adminChatPendingEcho.delete(sessionKey);
 
       // WeChat dual-send (skip if message is from admin — admin echo handles WeChat separately)
-      if (this.wechatBridge?.isActive(sessionKey) && bufferedText && bufferedText !== 'NO_REPLY' && !adminEchoInfo) {
+      if (this.wechatBridge?.isActive(sessionKey) && bufferedText && !isNoReply(bufferedText) && !adminEchoInfo) {
         const wechatEcho = this.wechatPendingEcho.get(sessionKey);
         const feishuEcho = this.feishuPendingEcho.get(sessionKey);
         this.wechatPendingEcho.delete(sessionKey);
@@ -1048,11 +1133,11 @@ export class MessageBridge {
             this.logger.warn({ err, sessionKey }, 'Failed to send reply to WeChat');
           });
           // Strip REACT tags from display text, collect them for the Feishu message
-          const reactPattern = /<<REACT:(\w+)>>/g;
+          const reactPattern = /<{1,2}\s*REACT\s*[:：]\s*(\w+)\s*>{1,2}\s*/gi;
           const reactEmojis: string[] = [];
           let displayText = bufferedText.replace(reactPattern, (_, emoji) => { reactEmojis.push(emoji); return ''; }).trim();
           const combined = `> [来自微信] ${wechatEcho}\n\n${displayText}`;
-          this.sender.sendReply(chatId, combined, undefined, sessionDir).then(msgId => {
+          this.sender.sendReply(chatId, combined, undefined, sessionDir, undefined, { sessionKey, chatId }).then(msgId => {
             // Apply REACT emojis to the sent Feishu echo message
             if (msgId && reactEmojis.length > 0) {
               for (const emoji of reactEmojis) {
@@ -1079,7 +1164,7 @@ export class MessageBridge {
 
       // Admin Chat echo
 
-      if (bufferedText && bufferedText !== 'NO_REPLY') {
+      if (bufferedText && !isNoReply(bufferedText)) {
         // Echo TO admin (when message is from Feishu/WeChat)
         if (this.adminChat?.isConnected(sessionKey) && !adminEchoInfo) {
           const wEcho = this.wechatPendingEcho.get(sessionKey);
@@ -1096,7 +1181,7 @@ export class MessageBridge {
         // Echo FROM admin to Feishu + WeChat (when echo checkbox was on)
         if (adminEchoInfo?.echo) {
           // Extract REACT tags before building display text
-          const reactPattern = /<<REACT:(\w+)>>/g;
+          const reactPattern = /<{1,2}\s*REACT\s*[:：]\s*(\w+)\s*>{1,2}\s*/gi;
           const reactEmojis: string[] = [];
           const cleanReply = bufferedText.replace(reactPattern, (_, emoji) => { reactEmojis.push(emoji); return ''; }).trim();
 
@@ -1108,7 +1193,7 @@ export class MessageBridge {
             ? `\`[ECHO] ${adminEchoInfo.text}\`\n\n${cleanReply}`
             : cleanReply;
 
-          this.sender.sendReply(chatId, feishuText, undefined, sessionDir).then(msgId => {
+          this.sender.sendReply(chatId, feishuText, undefined, sessionDir, undefined, { sessionKey, chatId }).then(msgId => {
             // Apply REACT emojis to the sent Feishu echo message
             if (msgId && reactEmojis.length > 0) {
               for (const emoji of reactEmojis) {

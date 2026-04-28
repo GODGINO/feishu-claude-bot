@@ -9,7 +9,8 @@ import { ClaudeRunner } from './claude/runner.js';
 import { SessionManager } from './claude/session-manager.js';
 import { MessageBridge } from './bridge/message-bridge.js';
 import { CronRunner } from './scheduler/cron-runner.js';
-import { ChromeIdleChecker } from './chrome/idle-checker.js';
+import { AlertRunner } from './scheduler/alert-runner.js';
+import { ChromeIdleChecker } from './local-only/chrome/idle-checker.js';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { execSync } from 'node:child_process';
@@ -136,17 +137,23 @@ async function main() {
     await bridge.handleMessage(msg);
   });
 
-  // Handle card button clicks — send as natural language to Claude
+  // Handle card button clicks — actionId prefixed with '/' routes to command handler,
+  // otherwise the click is sent as natural language to Claude.
   onCardAction(async ({ sessionKey, chatId, actionId, label, operatorId, cardId, messageId }) => {
     const userName = await sender.resolveUserName(operatorId) || operatorId;
     logger.info({ sessionKey, chatId, actionId, label, operatorId, userName, cardId, messageId }, 'Processing card button click');
-    await bridge.executeButtonAction(sessionKey, chatId, label, userName, cardId, messageId);
+    await bridge.executeButtonAction(sessionKey, chatId, actionId, label, userName, operatorId, cardId, messageId);
   });
 
   // Start cron scheduler for skills
   const scheduler = new CronRunner(runner, sessionMgr, sender, logger);
   scheduler.setMessageBridge(bridge);
   scheduler.start();
+
+  // Start alert scheduler (condition-triggered jobs, sister to cron)
+  const alertRunner = new AlertRunner(runner, sessionMgr, sender, logger);
+  alertRunner.setMessageBridge(bridge);
+  alertRunner.start();
 
   // Start email IDLE monitor (push notifications for new emails)
   const emailProcessor = new EmailProcessor(runner, config.sessionsDir, logger);

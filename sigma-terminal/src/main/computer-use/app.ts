@@ -6,6 +6,14 @@ import { spawn } from 'child_process';
 
 const IS_WIN = process.platform === 'win32';
 
+/** Sanitize app/window name — only allow safe characters to prevent injection */
+function sanitizeName(name: string): string {
+  // Strip anything that could break out of quotes in osascript/powershell
+  const clean = name.replace(/[^a-zA-Z0-9\s.\-_\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/g, '');
+  if (!clean) throw new Error('Invalid app name');
+  return clean;
+}
+
 function runCmd(cmd: string, args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
     const proc = spawn(cmd, args);
@@ -24,6 +32,7 @@ const osascript = (script: string) => runCmd('osascript', ['-e', script]);
 const powershell = (script: string) => runCmd('powershell.exe', ['-NoProfile', '-Command', script]);
 
 export async function appLaunch(name: string): Promise<{ launched: string }> {
+  name = sanitizeName(name);
   if (IS_WIN) {
     await runCmd('cmd', ['/c', 'start', '', name]);
   } else {
@@ -70,6 +79,7 @@ export async function appListRunning(): Promise<{ apps: Array<{ name: string; fr
 }
 
 export async function appFocus(name: string): Promise<{ focused: string }> {
+  name = sanitizeName(name);
   if (IS_WIN) {
     await powershell(`(New-Object -ComObject WScript.Shell).AppActivate("${name}")`);
   } else {
@@ -79,6 +89,7 @@ export async function appFocus(name: string): Promise<{ focused: string }> {
 }
 
 export async function appQuit(name: string): Promise<{ quit: string }> {
+  name = sanitizeName(name);
   if (IS_WIN) {
     await powershell(`Stop-Process -Name "${name}" -ErrorAction SilentlyContinue`);
   } else {

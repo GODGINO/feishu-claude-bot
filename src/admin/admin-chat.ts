@@ -25,6 +25,9 @@ export class AdminChatServer {
   /** Set by MessageBridge.setAdminChat() to route messages into Claude */
   onMessage: MessageHandler | null = null;
 
+  /** Set by MessageBridge.setAdminChat() to send messages directly as Sigma bot */
+  onSendAsSigma: ((sessionKey: string, text: string, addToContext: boolean) => Promise<void>) | null = null;
+
   constructor(logger: { info: (...a: any[]) => void; warn: (...a: any[]) => void; error: (...a: any[]) => void }) {
     this.logger = logger;
   }

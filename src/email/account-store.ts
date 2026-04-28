@@ -100,7 +100,7 @@ export class AccountStore {
     const filePath = this.getFilePath(sessionDir);
     const encrypted = encrypt(JSON.stringify(accounts));
     const stored: StoredFile = { encrypted };
-    fs.writeFileSync(filePath, JSON.stringify(stored, null, 2));
+    fs.writeFileSync(filePath, JSON.stringify(stored, null, 2), { mode: 0o600 });
   }
 
   static add(sessionDir: string, account: EmailAccount): void {

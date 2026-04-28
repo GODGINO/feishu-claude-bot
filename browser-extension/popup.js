@@ -1,6 +1,8 @@
 // Popup UI controller — manages multiple session keys
 
-const RELAY_URL = 'https://sigma.tixool.com';
+// DEPLOYMENT CONFIG: set to your Sigma server URL before packaging.
+// For local dev use 'http://localhost:3333'. Keep out of public repos.
+const RELAY_URL = 'https://your-sigma-server.example.com';
 const $ = (id) => document.getElementById(id);
 
 let sessions = []; // [{ key, name, type }]

@@ -6,15 +6,19 @@
 
 import type * as lark from '@larksuiteoapi/node-sdk';
 import type { Logger } from '../utils/logger.js';
+import { resolveAtMentions } from './message-sender.js';
 
 /**
- * Fix Markdown code fences for Feishu rendering.
- * Feishu requires ``` to be on its own line (standard Markdown spec).
- * Ensures \n before ``` when preceded by non-whitespace.
+ * Fix Markdown for Feishu rendering:
+ * 1. Code fences: ``` must be on its own line
+ * 2. Tables: | rows must have a blank line before the first row
  */
-function fixCodeFences(text: string): string {
-  // Add \n before ``` if preceded by non-newline character
-  return text.replace(/([^\n])```/g, '$1\n```');
+function fixMarkdownForFeishu(text: string): string {
+  // Fix code fences: ensure \n before ```
+  text = text.replace(/([^\n])```/g, '$1\n```');
+  // Fix tables: ensure \n before first | row when preceded by non-empty line
+  text = text.replace(/([^\n|])\n(\|[^\n]+\|)/g, '$1\n\n$2');
+  return text;
 }
 import {
   buildThinkingCard,
@@ -27,7 +31,9 @@ import {
   type UsageInfo,
 } from './card-builder.js';
 
-const THROTTLE_MS = 500; // Minimum interval between card updates
+const THROTTLE_MS = 1000; // Minimum interval between card updates — paired with
+                          // print_frequency_ms below; faster than 1s buys nothing
+                          // for human readability and just burns API calls.
 const CARD_TEXT_LIMIT = 28000; // Feishu card markdown content limit
 
 export class CardStreamer {
@@ -37,6 +43,9 @@ export class CardStreamer {
   private lastUpdateTime = 0;
   private pendingText = '';
   private toolCalls: ToolCallInfo[] = [];
+  // Thinking entries captured during the turn; rendered as markdown lines interleaved
+  // with tool lines in the "X 次工具调用已完成" inner panel by timestamp.
+  private thinkingEntries: Array<{ text: string; at: number }> = [];
   private taskIdToToolUseId = new Map<string, string>(); // taskId → toolUseId (for subagent step routing)
   private updateTimer: ReturnType<typeof setTimeout> | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -53,10 +62,13 @@ export class CardStreamer {
   private inflightFlush: Promise<void> | null = null;
   // For button rendering — set by caller before complete()
   sessionKey?: string;
+  sessionDir?: string;
   chatId?: string;
   // Shared cache for button card state (set by caller)
   buttonCardCache?: Map<string, { cardJson: object; sequence: number; expiresAt: number }>;
   private completed = false;
+  // Latest usage snapshot pushed from the stream parser — surfaced in the live footer.
+  private liveUsage?: UsageInfo;
 
   constructor(
     private client: lark.Client,
@@ -66,6 +78,15 @@ export class CardStreamer {
   /** Return the current accumulated text (for graceful stop). */
   getCurrentText(): string {
     return this.pendingText;
+  }
+
+  /**
+   * Push the latest usage snapshot. Stored for the next flush — doesn't trigger
+   * a card update on its own, since every usage change arrives alongside a text
+   * or tool event that already schedules a flush.
+   */
+  updateLiveUsage(usage: UsageInfo | undefined): void {
+    if (usage) this.liveUsage = usage;
   }
 
   /**
@@ -103,11 +124,17 @@ export class CardStreamer {
       this.logger.info({ cardId: this.cardId }, 'CardKit card created');
 
       // Step 2: Enable streaming mode on the card
+      // print_frequency_ms = 1000 → Feishu client repaints at most once per second.
+      // Without this field, Feishu uses platform-specific defaults that visibly stutter
+      // (~5s observed). Matches THROTTLE_MS = 1000 so there's no waste in either direction.
       this.sequence++;
       await (this.client.cardkit as any).v1.card.settings({
         path: { card_id: this.cardId },
         data: {
-          settings: JSON.stringify({ streaming_mode: true }),
+          settings: JSON.stringify({
+            streaming_mode: true,
+            print_frequency_ms: { default: 1000, android: 1000, ios: 1000 },
+          }),
           sequence: this.sequence,
         },
       });
@@ -213,6 +240,14 @@ export class CardStreamer {
     }
   }
 
+  /** Append a thinking block (no status — thinking is just a text entry). */
+  addThinking(text: string): void {
+    if (!text?.trim()) return;
+    this.thinkingEntries.push({ text: text.trim(), at: Date.now() });
+    this.startHeartbeatIfNeeded();
+    this.updateText(this.pendingText);
+  }
+
   addToolCall(name: string, input?: string, toolUseId?: string): void {
     let displayName = name;
     if (name === 'Agent') {
@@ -248,6 +283,12 @@ export class CardStreamer {
   updateToolCall(toolUseId: string, status: 'complete' | 'failed'): void {
     const tc = this.toolCalls.find(t => t.toolUseId === toolUseId);
     if (tc) {
+      // If this tool call has a registered background agent (local_agent) still running,
+      // don't mark it complete yet — completeSubagentSteps() will do it when the agent finishes.
+      if (status === 'complete' && toolUseId && [...this.taskIdToToolUseId.values()].includes(toolUseId)) {
+        // Background agent still running — skip completion
+        return;
+      }
       tc.status = status;
       tc.endTime = Date.now();
       // Cascade: when an Agent finishes, also mark any still-running children as complete.
@@ -308,11 +349,16 @@ export class CardStreamer {
     // Ensure IM message is sent before completing
     await this.ensureMessageSent(fullText);
 
-    // Strip <<THREAD>> and <<REACT:...>> tags from display text
-    fullText = fullText.replace(/<<THREAD>>\s*/g, '').replace(/<<REACT:\w+>>\s*/g, '');
+    // Strip <<THREAD>> and REACT tags from display text
+    fullText = fullText.replace(/<{1,2}\s*THREAD\s*>{1,2}\s*/gi, '').replace(/<{1,2}\s*REACT\s*[:：]\s*\w+\s*>{1,2}\s*/gi, '');
 
-    // Fix code fences for Feishu Markdown rendering
-    fullText = fixCodeFences(fullText);
+    // Fix Markdown for Feishu rendering
+    fullText = fixMarkdownForFeishu(fullText);
+
+    // Resolve @mentions (e.g. @张三 → <at id=ou_xxx></at>)
+    if (this.sessionDir) {
+      fullText = resolveAtMentions(fullText, this.sessionDir);
+    }
 
     // Extract <<BUTTON:...>> tags
     const { cleanText: textWithoutButtons, buttons } = extractButtons(fullText);
@@ -357,6 +403,7 @@ export class CardStreamer {
         this.cardId || undefined,
         this.messageId || undefined,
         usage,
+        this.thinkingEntries.length > 0 ? this.thinkingEntries : undefined,
       );
 
       // Cache card state for button click updates
@@ -482,7 +529,7 @@ export class CardStreamer {
    * Call this when the main turn is done but subagents are still running.
    */
   completeTextOnly(fullText: string): void {
-    fullText = fullText.replace(/<<THREAD>>\s*/g, '');
+    fullText = fullText.replace(/<{1,2}\s*THREAD\s*>{1,2}\s*/gi, '');
     this.pendingText = fullText;
     this.waitingForAgents = true;
     // Ensure IM message is sent
@@ -528,6 +575,8 @@ export class CardStreamer {
         this.toolCalls.length > 0 ? this.toolCalls : undefined,
         Date.now() - this.startTime,
         '⏹ 已中止',
+        undefined, undefined, undefined, undefined, undefined, undefined,
+        this.thinkingEntries.length > 0 ? this.thinkingEntries : undefined,
       );
 
       this.sequence++;
@@ -580,10 +629,9 @@ export class CardStreamer {
     }
   }
 
-  /** Start a 1s heartbeat to keep "总用时" ticking when tool calls are folded. */
+  /** Start a 1s heartbeat to keep the footer's elapsed time ticking. */
   private startHeartbeatIfNeeded(): void {
     if (this.heartbeatTimer || this.completed) return;
-    if (this.toolCalls.length === 0) return;
 
     this.heartbeatTimer = setInterval(() => {
       if (this.completed || !this.cardId) {
@@ -616,13 +664,15 @@ export class CardStreamer {
     this.lastUpdateTime = Date.now();
     this.sequence++;
 
-    // Strip <<THREAD>>, <<REACT:...>>, <<BUTTON:...>> and <<TITLE:...>> tags from display text
+    // Strip THREAD, REACT, BUTTON, TITLE tags from display text (tolerant to single/double
+    // brackets, HTML-mixed, garbled closes). TITLE uses the same patterns as extractTitleFromText —
+    // closing-shaped tags first so the opening strip doesn't eat the inner TITLE of a garbled close.
     const displayText = this.pendingText
-      .replace(/<<THREAD>>\s*/g, '')
-      .replace(/<<REACT:\w+>>\s*/g, '')
-      .replace(/<<BUTTON:[^>]+>>\s*/g, '')
-      .replace(/<?<<TITLE:.+?>>>?\s*\n?/g, '')
-      .replace(/<TITLE:.+?>\s*\n?/g, '');
+      .replace(/<{1,2}\s*THREAD\s*>{1,2}\s*/gi, '')
+      .replace(/<{1,2}\s*REACT\s*[:：]\s*\w+\s*>{1,2}\s*/gi, '')
+      .replace(/<{1,2}\s*BUTTON\s*:[^>]+>{1,2}\s*/gi, '')
+      .replace(/<[\/\s<]*\/[\/\s<]*TITLE[^>]*?>{0,2}\s*\n?/gi, '')
+      .replace(/<{1,2}\s*TITLE\s*[:：]?[^<>\n]*?[<\/\s]*>{1,2}\s*\n?/gi, '');
 
     // Truncate to avoid Feishu card size limit (card gets silently dropped if too long)
     const truncatedText = displayText.length > CARD_TEXT_LIMIT
@@ -630,7 +680,13 @@ export class CardStreamer {
       : displayText;
 
     try {
-      const streamingCard = buildStreamingCard(truncatedText, this.toolCalls, this.startTime);
+      const streamingCard = buildStreamingCard(
+        truncatedText,
+        this.toolCalls,
+        this.startTime,
+        this.thinkingEntries,
+        this.liveUsage,
+      );
 
       await (this.client.cardkit as any).v1.card.update({
         path: { card_id: this.cardId },

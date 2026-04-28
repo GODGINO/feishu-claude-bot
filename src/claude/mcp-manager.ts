@@ -446,6 +446,28 @@ exec node "${cliPath}" "$@"
       args: [path.join(projectRoot, 'dist', 'cron', 'cron-mcp.js')],
     };
 
+    // Alert MCP — exposes condition-triggered alerts (watcher / one_shot) as MCP tools.
+    // Sister to cron: cron triggers on time, alert triggers when check_command returns non-empty events.
+    mcpServers['alert'] = {
+      command: 'node',
+      args: [path.join(projectRoot, 'dist', 'alert', 'alert-mcp.js')],
+    };
+
+    // Claude-mem proxy MCP — wraps the upstream claude-mem plugin's stdio MCP
+    // and forces per-session project isolation (search/timeline/get_observations
+    // filtered by SIGMA_SESSION_PROJECT). The plugin's own mcp-search server is
+    // disabled in settings.json (disabledMcpjsonServers) so this proxy is the
+    // only entry point. No session ever bypasses the filter from sigma's side —
+    // cross-session memory inspection goes through the sigma terminal (sqlite3
+    // direct DB read), not through the in-conversation memory tools.
+    mcpServers['claude-mem'] = {
+      command: 'node',
+      args: [path.join(projectRoot, 'dist', 'claude', 'claude-mem-proxy-cli.js')],
+      env: {
+        SIGMA_SESSION_PROJECT: sessionKey,
+      },
+    };
+
     // Feishu Tools MCP — task, calendar, bitable via OAuth Device Flow + User Access Token.
     mcpServers['feishu-tools'] = {
       command: 'node',
@@ -601,6 +623,11 @@ exec node "${cliPath}" "$@"
     if (Object.keys(mcpServers).length > 0) {
       settings.mcpServers = mcpServers;
     }
+
+    // Disable the upstream claude-mem plugin's mcp-search server so the only
+    // entry point is our session-scoped proxy (registered in mcp-servers.json
+    // as "claude-mem"). disabledMcpjsonServers takes mcp.json server names.
+    settings.disabledMcpjsonServers = ['mcp-search'];
 
     // Merge global enabledPlugins (from real ~/.claude/settings.json) so plugins work with HOME=sessionDir
     try {

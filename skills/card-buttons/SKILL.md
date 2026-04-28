@@ -38,7 +38,7 @@ description: >
 ```
 页面已部署完成！
 
-<<BUTTON:查看页面|https://sigma.tixool.com/tunnel/xxx/index.html|primary>>
+<<BUTTON:查看页面|https://example.com/path/to/page|primary>>
 <<BUTTON:打开文档|https://docs.example.com/xxx|primary>>
 ```
 

@@ -1,8 +1,8 @@
 import { execSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import type { SessionManager } from '../claude/session-manager.js';
-import type { Logger } from '../utils/logger.js';
+import type { SessionManager } from '../../claude/session-manager.js';
+import type { Logger } from '../../utils/logger.js';
 
 const IDLE_MS = 30 * 60 * 1000;       // 30 minutes
 const CHECK_INTERVAL_MS = 5 * 60 * 1000; // every 5 minutes

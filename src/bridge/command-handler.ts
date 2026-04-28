@@ -18,6 +18,27 @@ export interface CommandContext {
 }
 
 /**
+ * Maps Chinese (and short English) command aliases to their canonical English
+ * forms. Translation runs at handle() entry, so dispatch logic doesn't need to
+ * know about aliases. Only the first whitespace-delimited token is translated;
+ * any args after it are preserved verbatim (e.g. `/压缩 关注X` → `/compact 关注X`).
+ */
+const CN_ALIASES: Record<string, string> = {
+  '/新': '/new',
+  '/压缩': '/compact',
+  '/停': '/stop',
+  '/状态': '/status',
+  '/帮助': '/help',
+  '/命令': '/help',
+  '/cmd': '/help',
+  '/邮箱': '/email',
+  '/自动': '/auto',
+  '/模型': '/model',
+  '/思考': '/effort',
+  '/微信': '/wechat',
+};
+
+/**
  * Handles slash commands from Feishu messages.
  * Returns true if the message was a command (handled), false otherwise.
  */
@@ -48,13 +69,29 @@ export class CommandHandler {
   }
 
   async handle(text: string, ctx: CommandContext): Promise<boolean> {
-    const cmd = text.trim().toLowerCase();
+    // Normalize Chinese/short aliases to canonical English commands. Splits on
+    // first whitespace so args like `/压缩 关注X` survive the translation.
+    let normalized = text.trim();
+    const headMatch = normalized.match(/^(\S+)(\s.*)?$/);
+    if (headMatch) {
+      const head = headMatch[1].toLowerCase();
+      const rest = headMatch[2] || '';
+      const translated = CN_ALIASES[head];
+      if (translated) normalized = translated + rest;
+    }
+    const cmd = normalized.toLowerCase();
 
     if (cmd === '/new') {
       return this.handleNew(ctx);
     }
+    if (cmd === '/compact' || cmd.startsWith('/compact ')) {
+      return this.handleCompact(text.trim(), ctx);
+    }
     if (cmd === '/stop') {
       return this.handleStop(ctx);
+    }
+    if (cmd === '/sigma-restart') {
+      return this.handleSigmaRestart(ctx);
     }
     if (cmd === '/status') {
       return this.handleStatus(ctx);
@@ -65,14 +102,14 @@ export class CommandHandler {
     if (cmd.startsWith('/email')) {
       return this.handleEmail(text.trim(), ctx);
     }
-    if (cmd === '/register') {
-      return this.handleRegister(ctx);
-    }
     if (cmd === '/auto' || cmd.startsWith('/auto ')) {
       return this.handleAuto(text.trim(), ctx);
     }
     if (cmd === '/model' || cmd.startsWith('/model ')) {
       return this.handleModel(text.trim(), ctx);
+    }
+    if (cmd === '/effort' || cmd.startsWith('/effort ')) {
+      return this.handleEffort(text.trim(), ctx);
     }
     if (cmd === '/wechat' || cmd.startsWith('/wechat ')) {
       return this.handleWechat(text.trim(), ctx);
@@ -90,6 +127,25 @@ export class CommandHandler {
       ctx.messageId,
     );
     this.logger.info({ sessionKey: ctx.sessionKey }, '/new: process reset, no resume');
+    return true;
+  }
+
+  private async handleSigmaRestart(ctx: CommandContext): Promise<boolean> {
+    // 隐藏命令：通过飞书触发 bot 重启（用于 Claude 子进程卡死场景）
+    // 不进 /help，不做权限检查 — 安全靠 obscurity（自己不要告诉别人即可）
+    // 实现：直接 process.exit(0)，PM2 检测进程退出后按 autorestart 拉起新进程。
+    // 不依赖 spawn / npx / PATH —— PM2 daemon 拉起 bot 时 PATH 不含 nvm node 路径，
+    // spawn 出去的 bash 子进程跑 `npx pm2 restart` 会因找不到 npx 静默失败。
+    await this.sender.sendText(
+      ctx.chatId,
+      '🔄 正在重启 bot... (5-10 秒后自动恢复，发新消息会带回上下文)',
+      ctx.messageId,
+    );
+    this.logger.warn({ sessionKey: ctx.sessionKey, chatId: ctx.chatId }, '/sigma-restart triggered, exiting for PM2 autorestart');
+
+    // 给 sendText 完成的时间，再退出。PM2 看到进程死会立刻拉起新的。
+    setTimeout(() => process.exit(0), 500);
+
     return true;
   }
 
@@ -266,21 +322,6 @@ export class CommandHandler {
     }
   }
 
-  private async handleRegister(ctx: CommandContext): Promise<boolean> {
-    await this.sender.sendReply(
-      ctx.chatId,
-      [
-        '**开发者身份注册**',
-        '',
-        '注册后可以用你自己的 Git 身份（name/email/SSH key）和飞书文档 MCP 进行协作。',
-        '',
-        '请 @我 说「注册开发者身份」，我会引导你完成配置。',
-      ].join('\n'),
-      ctx.messageId,
-    );
-    return true;
-  }
-
   private async handleAuto(text: string, ctx: CommandContext): Promise<boolean> {
     const session = this.sessionMgr.get(ctx.sessionKey) || this.sessionMgr.getOrCreate(ctx.sessionKey);
     const autoReplyFile = `${session.sessionDir}/auto-reply`;
@@ -304,15 +345,31 @@ export class CommandHandler {
         off: '当前：仅回复 @消息（未@消息记录为上下文）',
         always: '当前：Always 模式，所有消息都视为@提及，必定回复',
       };
-      await this.sender.sendReply(ctx.chatId, [
+      const MENU: Array<{ alias: string; label: string }> = [
+        { alias: 'on',     label: '开启 (AI 判断)' },
+        { alias: 'off',    label: '关闭 (仅 @)' },
+        { alias: 'always', label: '全部回复 (Always)' },
+      ];
+      const lines: string[] = [
         `**自动回复状态: ${current}**`,
         '',
         descMap[current] || descMap['on'],
         '',
-        '`/auto on` — 开启（AI 判断是否回复未@消息）',
-        '`/auto off` — 关闭（仅回复@消息）',
-        '`/auto always` — 全部回复（所有消息都当作@处理）',
-      ].join('\n'), ctx.messageId);
+        '点按下方按钮切换（当前高亮）：',
+        '',
+      ];
+      for (const item of MENU) {
+        const style = item.alias === current ? 'primary' : 'default';
+        lines.push(`<<BUTTON:${item.label}|/auto ${item.alias}|${style}>>`);
+      }
+      await this.sender.sendReply(
+        ctx.chatId,
+        lines.join('\n'),
+        ctx.messageId,
+        undefined,
+        undefined,
+        { sessionKey: ctx.sessionKey, chatId: ctx.chatId },
+      );
     }
     return true;
   }
@@ -325,20 +382,46 @@ export class CommandHandler {
     const sub = parts[1]?.toLowerCase();
 
     const ALIASES: Record<string, string> = {
-      'opus': 'opus',
-      'opus 1m': 'claude-opus-4-6[1m]',
-      'sonnet': 'sonnet',
-      'sonnet 1m': 'claude-sonnet-4-6[1m]',
-      'haiku': 'haiku',
+      // Haiku
+      'haiku':           'haiku',
+      // Sonnet (current)
+      'sonnet':          'claude-sonnet-4-6[1m]',
+      'sonnet 1m':       'claude-sonnet-4-6[1m]',
+      'sonnet 200k':     'claude-sonnet-4-6',
+      // Opus 4.6 (previous flagship)
+      'opus 4.6':        'claude-opus-4-6[1m]',
+      'opus 4.6 1m':     'claude-opus-4-6[1m]',
+      'opus 4.6 200k':   'claude-opus-4-6',
+      // Opus 4.7 (current flagship)
+      'opus':            'claude-opus-4-7[1m]',
+      'opus 1m':         'claude-opus-4-7[1m]',
+      'opus 200k':       'claude-opus-4-7',
     };
 
     const DISPLAY: Record<string, string> = {
-      'opus': 'Opus 200K',
-      'claude-opus-4-6[1m]': 'Opus 1M',
-      'sonnet': 'Sonnet 200K',
-      'claude-sonnet-4-6[1m]': 'Sonnet 1M',
-      'haiku': 'Haiku 200K',
+      'haiku':                   'Haiku 4.5 · 200K',
+      'claude-sonnet-4-6[1m]':   'Sonnet 4.6 · 1M',
+      'claude-sonnet-4-6':       'Sonnet 4.6 · 200K',
+      'claude-opus-4-6[1m]':     'Opus 4.6 · 1M',
+      'claude-opus-4-6':         'Opus 4.6 · 200K',
+      'claude-opus-4-7[1m]':     'Opus 4.7 · 1M',
+      'claude-opus-4-7':         'Opus 4.7 · 200K',
+      // Legacy short-form aliases that may still appear in sessionDir/model files
+      'opus[1m]':                'Opus 4.7 · 1M',
+      'sonnet[1m]':              'Sonnet 4.6 · 1M',
     };
+
+    // Display-order: short command alias + (resolved model string)
+    // Keep this in sync with the button card below so the docs & UI match.
+    const MENU: Array<{ alias: string; resolved: string }> = [
+      { alias: 'sonnet',        resolved: 'claude-sonnet-4-6[1m]' },
+      { alias: 'sonnet 200k',   resolved: 'claude-sonnet-4-6' },
+      { alias: 'opus 4.6',      resolved: 'claude-opus-4-6[1m]' },
+      { alias: 'opus 4.6 200k', resolved: 'claude-opus-4-6' },
+      { alias: 'opus',          resolved: 'claude-opus-4-7[1m]' },
+      { alias: 'opus 200k',     resolved: 'claude-opus-4-7' },
+      { alias: 'haiku',         resolved: 'haiku' },
+    ];
 
     const modelArg = parts.slice(1).join(' ').toLowerCase();
     if (modelArg && ALIASES[modelArg]) {
@@ -348,20 +431,107 @@ export class CommandHandler {
       await this.sender.sendText(ctx.chatId, `✅ 模型已切换为 **${DISPLAY[model] || model}**`, ctx.messageId);
       this.logger.info({ sessionKey: ctx.sessionKey, model }, '/model: switched');
     } else if (!modelArg) {
-      let current = 'sonnet';
+      let current = 'claude-sonnet-4-6[1m]';
       try { current = fs.readFileSync(modelFile, 'utf-8').trim(); } catch {}
-      await this.sender.sendReply(ctx.chatId, [
-        `**当前模型: ${DISPLAY[current] || current}**`,
+      const lines: string[] = [
+        `**当前模型：${DISPLAY[current] || current}**`,
         '',
-        '`/model sonnet` — Sonnet 200K（默认，快速均衡）',
-        '`/model sonnet 1m` — Sonnet 1M（长上下文）',
-        '`/model opus` — Opus 200K（强力）',
-        '`/model opus 1m` — Opus 1M（最强，复杂任务）',
-        '`/model haiku` — Haiku 200K（最快，简单任务）',
-      ].join('\n'), ctx.messageId);
+        '点按下方按钮切换（当前高亮）：',
+        '',
+      ];
+      for (const item of MENU) {
+        const style = item.resolved === current ? 'primary' : 'default';
+        const label = DISPLAY[item.resolved] || item.resolved;
+        lines.push(`<<BUTTON:${label}|/model ${item.alias}|${style}>>`);
+      }
+      await this.sender.sendReply(
+        ctx.chatId,
+        lines.join('\n'),
+        ctx.messageId,
+        undefined,
+        undefined,
+        { sessionKey: ctx.sessionKey, chatId: ctx.chatId },
+      );
     } else {
       await this.sender.sendText(ctx.chatId, `⚠️ 未知模型: ${modelArg}`, ctx.messageId);
     }
+    return true;
+  }
+
+
+  private async handleEffort(text: string, ctx: CommandContext): Promise<boolean> {
+    const session = this.sessionMgr.get(ctx.sessionKey) || this.sessionMgr.getOrCreate(ctx.sessionKey);
+    const effortFile = `${session.sessionDir}/effort`;
+    const modelFile = `${session.sessionDir}/model`;
+    const parts = text.split(/\s+/);
+    const sub = parts[1]?.toLowerCase();
+
+    const VALID_LEVELS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
+
+    let currentModel = 'sonnet';
+    try { currentModel = fs.readFileSync(modelFile, 'utf-8').trim(); } catch {}
+    const isOpus47 = currentModel.includes('opus-4-7') || currentModel === 'opus' || currentModel === 'opus 1m';
+
+    if (sub === 'auto') {
+      try { fs.unlinkSync(effortFile); } catch {}
+      this.runner.respawn(ctx.sessionKey);
+      await this.sender.sendText(ctx.chatId, '✅ Effort 已重置为模型默认值（Opus 4.7 默认 xhigh，Sonnet 4.6 默认 high/medium）', ctx.messageId);
+      this.logger.info({ sessionKey: ctx.sessionKey }, '/effort: reset to auto');
+      return true;
+    }
+
+    if (sub && VALID_LEVELS.has(sub)) {
+      fs.writeFileSync(effortFile, sub);
+      this.runner.respawn(ctx.sessionKey);
+      let msg = `✅ Effort 已切换为 **${sub}**`;
+      if (sub === 'xhigh' && !isOpus47) {
+        msg += '\n⚠️ xhigh 仅 Opus 4.7 支持，当前模型将自动降级为 high';
+      }
+      await this.sender.sendText(ctx.chatId, msg, ctx.messageId);
+      this.logger.info({ sessionKey: ctx.sessionKey, effort: sub }, '/effort: switched');
+      return true;
+    }
+
+    if (!sub) {
+      let current = 'auto';
+      try {
+        const saved = fs.readFileSync(effortFile, 'utf-8').trim();
+        if (saved) current = saved;
+      } catch {}
+      const defaultHint = isOpus47 ? 'Opus 4.7 默认 xhigh' : 'Sonnet/Opus 4.6 默认 high 或 medium';
+      const MENU: Array<{ alias: string; label: string }> = [
+        { alias: 'low',    label: 'Low (最快)' },
+        { alias: 'medium', label: 'Medium (中等)' },
+        { alias: 'high',   label: 'High (平衡)' },
+        { alias: 'xhigh',  label: 'xHigh (Opus 4.7 专属)' },
+        { alias: 'max',    label: 'Max (无上限)' },
+        { alias: 'auto',   label: 'Auto (模型默认)' },
+      ];
+      const lines: string[] = [
+        `**当前 effort: ${current}**`,
+        `当前模型: ${currentModel}（${defaultHint}）`,
+        '',
+        'Effort 控制 adaptive reasoning 思考深度。点按下方按钮切换（当前高亮）：',
+        '',
+      ];
+      for (const item of MENU) {
+        const style = item.alias === current ? 'primary' : 'default';
+        lines.push(`<<BUTTON:${item.label}|/effort ${item.alias}|${style}>>`);
+      }
+      lines.push('');
+      lines.push('注: Haiku 不支持 effort。xhigh 在非 Opus 4.7 模型上自动降级为 high。');
+      await this.sender.sendReply(
+        ctx.chatId,
+        lines.join('\n'),
+        ctx.messageId,
+        undefined,
+        undefined,
+        { sessionKey: ctx.sessionKey, chatId: ctx.chatId },
+      );
+      return true;
+    }
+
+    await this.sender.sendText(ctx.chatId, `⚠️ 未知 effort 等级: ${sub}（有效: low/medium/high/xhigh/max/auto）`, ctx.messageId);
     return true;
   }
 
@@ -403,24 +573,76 @@ export class CommandHandler {
     return true;
   }
 
-  private async handleHelp(ctx: CommandContext): Promise<boolean> {
-    const helpText = [
-      '**可用命令**',
-      '',
-      '`/new` — 重置会话，开始新对话（保留记忆和文件）',
-      '`/stop` — 中止当前正在运行的任务',
-      '`/status` — 查看当前会话状态',
-      '`/email` — 邮箱管理（添加、查看、测试）',
-      '`/register` — 注册开发者身份（Git + 飞书 MCP）',
-      '`/auto [on|off|always]` — 群聊自动回复（on=AI判断, off=仅@回复, always=全部回复）',
-      '`/model [sonnet|opus|haiku]` — 切换 AI 模型',
-      '`/wechat` — 绑定微信（扫码后微信消息同步，共享 Claude 会话，仅私聊）',
-      '`/help` — 显示此帮助信息',
-      '',
-      '直接发送消息即可与 Claude 对话。Claude 可以读写文件、执行命令等。',
-    ].join('\n');
+  private async handleCompact(text: string, ctx: CommandContext): Promise<boolean> {
+    const session = this.sessionMgr.get(ctx.sessionKey) || this.sessionMgr.getOrCreate(ctx.sessionKey);
+    // Optional focus instructions: `/compact <instructions>` tells Claude what to
+    // prioritize in the summary. Bare `/compact` keeps the original behavior.
+    const focus = text.replace(/^\/compact\b\s*/i, '').trim();
+    const message = focus ? `/compact ${focus}` : '/compact';
+    await this.sender.sendText(ctx.chatId, '⏳ 正在压缩上下文…', ctx.messageId);
+    try {
+      const result = await this.runner.pool.send({
+        sessionKey: ctx.sessionKey,
+        sessionDir: session.sessionDir,
+        message,
+      });
+      if (result.error) {
+        await this.sender.sendText(ctx.chatId, `❌ 压缩失败：${result.error}`, ctx.messageId);
+      } else {
+        await this.sender.sendText(ctx.chatId, '✅ 上下文已压缩。下一条消息开始使用更轻量的历史。', ctx.messageId);
+      }
+      this.logger.info({ sessionKey: ctx.sessionKey, hasError: !!result.error, hasFocus: !!focus }, '/compact: user-invoked');
+    } catch (err: any) {
+      await this.sender.sendText(ctx.chatId, `❌ 压缩失败：${err?.message || err}`, ctx.messageId);
+      this.logger.error({ err, sessionKey: ctx.sessionKey }, '/compact threw');
+    }
+    return true;
+  }
 
-    await this.sender.sendReply(ctx.chatId, helpText, ctx.messageId);
+  private async handleHelp(ctx: CommandContext): Promise<boolean> {
+    // Each entry becomes one button. ActionId is the canonical English command —
+    // clicking re-routes through handle() which routes to the corresponding
+    // handler (often itself a buttonized sub-menu like /model, /effort, /auto).
+    const MENU: Array<{ label: string; action: string; style: 'default' | 'primary' | 'danger' }> = [
+      { label: '🆕 /新 (开新对话)', action: '/new',     style: 'danger'  },
+      { label: '⏹ /停 (中止任务)',  action: '/stop',    style: 'danger'  },
+      { label: '📊 /状态',          action: '/status',  style: 'primary' },
+      { label: '📋 /压缩',          action: '/compact', style: 'default' },
+      { label: '🤖 /模型',          action: '/model',   style: 'default' },
+      { label: '🧠 /思考',          action: '/effort',  style: 'default' },
+      { label: '💬 /自动',          action: '/auto',    style: 'default' },
+      { label: '📧 /邮箱',          action: '/email',   style: 'default' },
+      { label: '📱 /微信',          action: '/wechat',  style: 'default' },
+    ];
+
+    const lines: string[] = [
+      '**可用命令** （点按按钮即可执行）',
+      '',
+      '- `/新` 重置会话（保留记忆和文件）',
+      '- `/停` 中止当前任务',
+      '- `/状态` 查看会话状态',
+      '- `/压缩 [聚焦提示]` 压缩历史，避免「Prompt is too long」',
+      '- `/模型` 切换 AI 模型',
+      '- `/思考` 切换思考深度（Speed ↔ Intelligence）',
+      '- `/自动` 群聊自动回复策略',
+      '- `/邮箱` 邮箱管理',
+      '- `/微信` 绑定微信（仅私聊）',
+      '',
+      '**中文别名**：所有命令均可用中文输入，例如 `/停`、`/模型`、`/压缩 关注X`。`/命令` `/帮助` `/cmd` 都打开本菜单。',
+      '',
+    ];
+    for (const item of MENU) {
+      lines.push(`<<BUTTON:${item.label}|${item.action}|${item.style}>>`);
+    }
+
+    await this.sender.sendReply(
+      ctx.chatId,
+      lines.join('\n'),
+      ctx.messageId,
+      undefined,
+      undefined,
+      { sessionKey: ctx.sessionKey, chatId: ctx.chatId },
+    );
     return true;
   }
 }

@@ -148,8 +148,12 @@ ws.close()
 ### 使用时机
 
 1. 先尝试正常的 `chrome-devtools` MCP 工具
-2. 如果 MCP 断连且 ToolSearch 返回空，切换到 CDP 直连
+2. 如果遇到以下任何情况，切换到 CDP 直连：
+   - MCP 断连（ToolSearch 返回空、标记为 disconnected）
+   - **MCP 端口不匹配**（工具报告连接到了与配置不同的端口，如配置 9359 但连到 9350）
+   - MCP 工具返回连接错误
 3. CDP 直连不依赖 MCP，只要 Chrome 进程还在就能用
+4. **端口从 .chrome-port 文件读取**：`CHROME_PORT=$(cat {SESSION_DIR}/.chrome-port)`，不要硬编码
 
 ## 判断规则
 

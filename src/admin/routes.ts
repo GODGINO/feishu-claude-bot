@@ -229,6 +229,9 @@ export function createRoutes(sessionsDir: string, feishuClient?: lark.Client): R
   function signalCronChanged(sessionDir: string): void {
     try { fs.writeFileSync(path.join(sessionDir, '.cron-changed'), String(Date.now())); } catch { /* ignore */ }
   }
+  function signalAlertsChanged(sessionDir: string): void {
+    try { fs.writeFileSync(path.join(sessionDir, '.alerts-changed'), String(Date.now())); } catch { /* ignore */ }
+  }
 
   // Helper: validate session key (prevent path traversal)
   function validSessionKey(key: string): boolean {
@@ -264,6 +267,7 @@ export function createRoutes(sessionsDir: string, feishuClient?: lark.Client): R
     const chatId = readText(path.join(dir, 'chat-id')) || (isGroup ? key.replace('group_', '') : null);
     const autoReply = readText(path.join(dir, 'auto-reply'));
     const cronJobs = readJson(path.join(dir, 'cron-jobs.json'));
+    const alerts = readJson(path.join(dir, 'alerts.json'));
     const context = readJson(path.join(dir, 'group-context.json'));
     const hasEmail = fs.existsSync(path.join(dir, 'email-accounts.json'));
     const hasKnowledge = fs.existsSync(path.join(dir, 'CLAUDE.md'));
@@ -338,6 +342,7 @@ export function createRoutes(sessionsDir: string, feishuClient?: lark.Client): R
       autoReply,
       memberCount: memberNames.size,
       cronJobCount: Array.isArray(cronJobs) ? cronJobs.length : 0,
+      alertCount: Array.isArray(alerts) ? alerts.length : 0,
       messageCount: Array.isArray(context) ? context.length : 0,
       hasEmail,
       hasKnowledge,
@@ -559,8 +564,15 @@ export function createRoutes(sessionsDir: string, feishuClient?: lark.Client): R
     const key = param(req, 'key');
     if (!validSessionKey(key)) { res.status(400).json({ error: 'Invalid session key' }); return; }
     const dir = path.join(sessionsDir, key);
-    const variables = parseSessionEnv(dir);
-    const envKeys = new Set(variables.map(v => v.key));
+    const rawVariables = parseSessionEnv(dir);
+    // Mask sensitive values (password, secret, token, key)
+    const variables = rawVariables.map(v => {
+      if (/password|secret|token|key|credential/i.test(v.key) && v.value) {
+        return { key: v.key, value: v.value.slice(0, 3) + '***' };
+      }
+      return v;
+    });
+    const envKeys = new Set(rawVariables.map(v => v.key));
 
     // Build skill -> env var mapping
     const skillEnvMap: Record<string, string[]> = {};
@@ -597,8 +609,12 @@ export function createRoutes(sessionsDir: string, feishuClient?: lark.Client): R
     if (!fs.existsSync(dir)) { res.status(404).json({ error: 'Session not found' }); return; }
     const { variables } = req.body as { variables: { key: string; value: string }[] };
     if (!Array.isArray(variables)) { res.status(400).json({ error: 'Invalid variables' }); return; }
+    // Blocklist: prevent overriding dangerous environment variables
+    const BLOCKED_VARS = new Set(['PATH', 'LD_PRELOAD', 'LD_LIBRARY_PATH', 'DYLD_INSERT_LIBRARIES',
+      'NODE_OPTIONS', 'HOME', 'SHELL', 'USER', 'LOGNAME', 'PYTHONPATH', 'RUBYLIB', 'PERL5LIB']);
     const lines = variables
-      .filter(v => v.key && typeof v.key === 'string')
+      .filter(v => v.key && typeof v.key === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(v.key.trim()))
+      .filter(v => !BLOCKED_VARS.has(v.key.trim().toUpperCase()))
       .map(v => `${v.key.trim()}=${v.value ?? ''}`);
     fs.writeFileSync(path.join(dir, 'session.env'), lines.join('\n') + '\n');
     res.json({ ok: true });
@@ -629,6 +645,7 @@ export function createRoutes(sessionsDir: string, feishuClient?: lark.Client): R
       );
 
       let totalCronJobs = 0;
+      let totalAlerts = 0;
       let totalEmailAccounts = 0;
       let totalMessages = 0;
       let todayMessages = 0;
@@ -639,6 +656,8 @@ export function createRoutes(sessionsDir: string, feishuClient?: lark.Client): R
       for (const d of sessionDirs) {
         const cron = readJson(path.join(sessionsDir, d.name, 'cron-jobs.json'));
         if (Array.isArray(cron)) totalCronJobs += cron.length;
+        const alertsArr = readJson(path.join(sessionsDir, d.name, 'alerts.json'));
+        if (Array.isArray(alertsArr)) totalAlerts += alertsArr.length;
         if (fs.existsSync(path.join(sessionsDir, d.name, 'email-accounts.json'))) {
           totalEmailAccounts++;
         }
@@ -673,6 +692,7 @@ export function createRoutes(sessionsDir: string, feishuClient?: lark.Client): R
         totalMessages,
         todayMessages,
         totalCronJobs,
+        totalAlerts,
         totalEmailAccounts,
         totalSkills,
         totalObservations,
@@ -860,6 +880,63 @@ export function createRoutes(sessionsDir: string, feishuClient?: lark.Client): R
     fs.writeFileSync(filePath, JSON.stringify(jobs, null, 2));
     signalCronChanged(path.join(sessionsDir, key));
     res.json({ ok: true, enabled: job.enabled });
+  });
+
+  // GET /api/sessions/:key/alerts — list alerts
+  router.get('/api/sessions/:key/alerts', (req: Request, res: Response) => {
+    const key = param(req, 'key');
+    if (!validSessionKey(key)) { res.status(400).json({ error: 'Invalid session key' }); return; }
+    const filePath = path.join(sessionsDir, key, 'alerts.json');
+    const alerts = readJson(filePath);
+    res.json(Array.isArray(alerts) ? alerts : []);
+  });
+
+  // DELETE /api/sessions/:key/alerts/:alertId — delete alert
+  router.delete('/api/sessions/:key/alerts/:alertId', (req: Request, res: Response) => {
+    const key = param(req, 'key');
+    const alertId = param(req, 'alertId');
+    if (!validSessionKey(key)) { res.status(400).json({ error: 'Invalid session key' }); return; }
+    const filePath = path.join(sessionsDir, key, 'alerts.json');
+    const alerts: any[] = readJson(filePath) || [];
+    const idx = alerts.findIndex((a: any) => a.id === alertId);
+    if (idx === -1) { res.status(404).json({ error: 'Alert not found' }); return; }
+    alerts.splice(idx, 1);
+    fs.writeFileSync(filePath, JSON.stringify(alerts, null, 2));
+    signalAlertsChanged(path.join(sessionsDir, key));
+    res.json({ ok: true });
+  });
+
+  // PUT /api/sessions/:key/alerts/:alertId/toggle — toggle alert enabled
+  router.put('/api/sessions/:key/alerts/:alertId/toggle', (req: Request, res: Response) => {
+    const key = param(req, 'key');
+    const alertId = param(req, 'alertId');
+    if (!validSessionKey(key)) { res.status(400).json({ error: 'Invalid session key' }); return; }
+    const filePath = path.join(sessionsDir, key, 'alerts.json');
+    const alerts: any[] = readJson(filePath) || [];
+    const a = alerts.find((x: any) => x.id === alertId);
+    if (!a) { res.status(404).json({ error: 'Alert not found' }); return; }
+    a.enabled = !!req.body.enabled;
+    fs.writeFileSync(filePath, JSON.stringify(alerts, null, 2));
+    signalAlertsChanged(path.join(sessionsDir, key));
+    res.json({ ok: true, enabled: a.enabled });
+  });
+
+  // PUT /api/sessions/:key/alerts/:alertId/reset — reset watermark + stats
+  router.put('/api/sessions/:key/alerts/:alertId/reset', (req: Request, res: Response) => {
+    const key = param(req, 'key');
+    const alertId = param(req, 'alertId');
+    if (!validSessionKey(key)) { res.status(400).json({ error: 'Invalid session key' }); return; }
+    const filePath = path.join(sessionsDir, key, 'alerts.json');
+    const alerts: any[] = readJson(filePath) || [];
+    const a = alerts.find((x: any) => x.id === alertId);
+    if (!a) { res.status(404).json({ error: 'Alert not found' }); return; }
+    a.state = {
+      watermark: { last_pubdate: 0, processed_ids: [], max_processed_size: 200 },
+      stats: { polls: 0, triggers: 0, failures: 0 },
+    };
+    fs.writeFileSync(filePath, JSON.stringify(alerts, null, 2));
+    signalAlertsChanged(path.join(sessionsDir, key));
+    res.json({ ok: true });
   });
 
   // DELETE /api/sessions/:key/authors/:openId — remove member from session

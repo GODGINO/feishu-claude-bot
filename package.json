@@ -5,8 +5,11 @@
   "private": false,
   "scripts": {
     "dev": "tsx src/index.ts",
+    "dev:server": "tsx src/index.server.ts",
     "build": "tsc && npm run build:web",
     "build:web": "cd web && npm run build",
+    "build:server": "tsc -p tsconfig.server.json",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.server.json --noEmit",
     "start": "node dist/index.js",
     "bot": "bash scripts/bot.sh start",
     "bot:stop": "bash scripts/bot.sh stop",
