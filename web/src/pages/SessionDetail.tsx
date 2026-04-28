@@ -4,12 +4,13 @@ import { api, type SessionDetail as SessionDetailType } from '../lib/api'
 import OverviewTab from '../components/OverviewTab'
 import KnowledgeView from '../components/KnowledgeView'
 import CronJobTable from '../components/CronJobTable'
+import AlertTable from '../components/AlertTable'
 import ChatHistory from '../components/ChatHistory'
 import EmailView from '../components/EmailView'
 import SkillsView from '../components/SkillsView'
 import MemoryView from '../components/MemoryView'
 
-const tabs = ['Overview', 'Skills', 'Knowledge', 'Cron Jobs', 'Chat', 'Email', 'Memory'] as const
+const tabs = ['Overview', 'Skills', 'Knowledge', 'Cron Jobs', 'Alerts', 'Chat', 'Email', 'Memory'] as const
 type Tab = typeof tabs[number]
 
 export default function SessionDetail() {
@@ -158,6 +159,7 @@ export default function SessionDetail() {
       {tab === 'Skills' && <SkillsView sessionKey={key} />}
       {tab === 'Knowledge' && <KnowledgeView sessionKey={key} />}
       {tab === 'Cron Jobs' && <CronJobTable sessionKey={key} />}
+      {tab === 'Alerts' && <AlertTable sessionKey={key} />}
       {tab === 'Chat' && <ChatHistory sessionKey={key} refreshKey={chatRefreshKey} />}
       {tab === 'Email' && <EmailView sessionKey={key} />}
       {tab === 'Memory' && <MemoryView sessionKey={key} />}

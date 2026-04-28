@@ -64,7 +64,9 @@ CFG.setdefault('threshold', 90)
 CFG.setdefault('check_interval_seconds', 120)          # 2 min — faster reaction to weekly 100% and session hits
 CFG.setdefault('cooldown_hours', 5)                    # default cooldown when trigger is "Current session" (5h rolling)
 CFG.setdefault('weekly_cooldown_hours', 168)           # 7-day fallback if we can't parse the DOM reset time
+CFG.setdefault('cli_login_retries', 3)                 # OAuth login retry attempts when CLI fails to log in (browser already has new session)
 env_override(CFG, ['weekly_cooldown_hours'], 'SWITCHER_WEEKLY_COOLDOWN_HOURS', float)
+env_override(CFG, ['cli_login_retries'], 'SWITCHER_CLI_LOGIN_RETRIES', int)
 CFG.setdefault('http_port', 17222)
 CFG.setdefault('accounts', [])
 CFG.setdefault('feishu_webhook', '')
@@ -354,6 +356,18 @@ def spawn_claude_auth_login_in_terminal():
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def _kill_pending_claude_login():
+    """Kill any lingering `claude auth login` process so the next spawn starts clean.
+    Used between OAuth login retries — old CLI process may be stuck waiting on a
+    callback that never came, blocking a new spawn from getting a fresh shell prompt."""
+    try:
+        subprocess.run(['pkill', '-f', f'{CLAUDE_PATH} auth login'],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       check=False)
+    except Exception as e:
+        log(f'  pkill claude auth login failed (non-fatal): {e}')
+
+
 def poll_claude_auth_status(target_email, timeout_s=120):
     """Poll `claude auth status` until it reports the target email logged in.
     The CLI returns JSON like {"loggedIn": true, "email": "...", ...}."""
@@ -421,26 +435,46 @@ def perform_switch(target_email):
     try: cmd('close_stale_tabs', wait=10)
     except Exception: pass
 
-    log('  launching `claude auth login` in Terminal.app…')
-    spawn_claude_auth_login_in_terminal()
+    # OAuth login retry loop: spawn CLI → click_authorize → poll status.
+    # If CLI fails to log in (e.g. extension didn't see OAuth tab, CLI hung,
+    # browser/CLI desync), kill the lingering CLI process and retry from spawn.
+    # Browser already has the new account session — no need to redo magic-link.
+    max_attempts = int(CFG.get('cli_login_retries', 3))
+    last_click_result = None
+    for attempt in range(1, max_attempts + 1):
+        log(f'  CLI login attempt {attempt}/{max_attempts}')
+        if attempt > 1:
+            _kill_pending_claude_login()
+            time.sleep(2)  # let pkill propagate before respawn
 
-    # CLI opens Chrome to the OAuth URL; poll click_authorize until it succeeds (the CLI
-    # may take a couple of seconds to emit `open <url>`).
-    click_deadline = time.time() + 60
-    click_result = None
-    while time.time() < click_deadline:
-        click_result = cmd('click_authorize', wait=20)
-        log(f'  click_authorize: ok={click_result and click_result.get("ok")} '
-            f'method={click_result and click_result.get("method")}')
-        if click_result and click_result.get('ok') and not click_result.get('auto_approved'):
+        log('  launching `claude auth login` in Terminal.app…')
+        spawn_claude_auth_login_in_terminal()
+
+        # CLI opens Chrome to the OAuth URL; poll click_authorize until it succeeds (the CLI
+        # may take a couple of seconds to emit `open <url>`).
+        click_deadline = time.time() + 60
+        click_result = None
+        while time.time() < click_deadline:
+            click_result = cmd('click_authorize', wait=20)
+            log(f'  click_authorize: ok={click_result and click_result.get("ok")} '
+                f'method={click_result and click_result.get("method")} '
+                f'error={click_result and click_result.get("error")}')
+            if click_result and click_result.get('ok'):
+                break
+            time.sleep(2)
+        last_click_result = click_result
+
+        log('  polling `claude auth status` for new login…')
+        if poll_claude_auth_status(target_email, timeout_s=120):
+            log(f'  ✅ claude CLI logged in as {target_email} (attempt {attempt})')
             break
-        time.sleep(2)
-
-    log('  polling `claude auth status` for new login…')
-    if not poll_claude_auth_status(target_email, timeout_s=120):
-        raise RuntimeError(f'claude CLI did not log in as {target_email} within 120s '
-                           f'(last click_authorize={click_result})')
-    log(f'  ✅ claude CLI logged in as {target_email}')
+        log(f'  ⚠️ attempt {attempt} failed: claude CLI did not log in as {target_email} within 120s')
+    else:
+        # All attempts exhausted. Browser is on target_email but CLI is still on the old
+        # account — inconsistent state. Caller (main_loop) handles notify + cooldown.
+        raise RuntimeError(f'claude CLI did not log in as {target_email} after {max_attempts} attempts '
+                           f'(last click_authorize={last_click_result}). '
+                           f'⚠️ 浏览器已是 {target_email}, CLI 仍是旧账号，请人工处理')
 
     # Tidy up transient tabs (OAuth consent, magic-link landing, stale usage probes).
     try:

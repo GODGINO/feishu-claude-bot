@@ -446,6 +446,13 @@ exec node "${cliPath}" "$@"
       args: [path.join(projectRoot, 'dist', 'cron', 'cron-mcp.js')],
     };
 
+    // Alert MCP — exposes condition-triggered alerts (watcher / one_shot) as MCP tools.
+    // Sister to cron: cron triggers on time, alert triggers when check_command returns non-empty events.
+    mcpServers['alert'] = {
+      command: 'node',
+      args: [path.join(projectRoot, 'dist', 'alert', 'alert-mcp.js')],
+    };
+
     // Feishu Tools MCP — task, calendar, bitable via OAuth Device Flow + User Access Token.
     mcpServers['feishu-tools'] = {
       command: 'node',

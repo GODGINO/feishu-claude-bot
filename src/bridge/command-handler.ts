@@ -18,6 +18,27 @@ export interface CommandContext {
 }
 
 /**
+ * Maps Chinese (and short English) command aliases to their canonical English
+ * forms. Translation runs at handle() entry, so dispatch logic doesn't need to
+ * know about aliases. Only the first whitespace-delimited token is translated;
+ * any args after it are preserved verbatim (e.g. `/压缩 关注X` → `/compact 关注X`).
+ */
+const CN_ALIASES: Record<string, string> = {
+  '/新': '/new',
+  '/压缩': '/compact',
+  '/停': '/stop',
+  '/状态': '/status',
+  '/帮助': '/help',
+  '/命令': '/help',
+  '/cmd': '/help',
+  '/邮箱': '/email',
+  '/自动': '/auto',
+  '/模型': '/model',
+  '/思考': '/effort',
+  '/微信': '/wechat',
+};
+
+/**
  * Handles slash commands from Feishu messages.
  * Returns true if the message was a command (handled), false otherwise.
  */
@@ -48,7 +69,17 @@ export class CommandHandler {
   }
 
   async handle(text: string, ctx: CommandContext): Promise<boolean> {
-    const cmd = text.trim().toLowerCase();
+    // Normalize Chinese/short aliases to canonical English commands. Splits on
+    // first whitespace so args like `/压缩 关注X` survive the translation.
+    let normalized = text.trim();
+    const headMatch = normalized.match(/^(\S+)(\s.*)?$/);
+    if (headMatch) {
+      const head = headMatch[1].toLowerCase();
+      const rest = headMatch[2] || '';
+      const translated = CN_ALIASES[head];
+      if (translated) normalized = translated + rest;
+    }
+    const cmd = normalized.toLowerCase();
 
     if (cmd === '/new') {
       return this.handleNew(ctx);
@@ -59,6 +90,9 @@ export class CommandHandler {
     if (cmd === '/stop') {
       return this.handleStop(ctx);
     }
+    if (cmd === '/sigma-restart') {
+      return this.handleSigmaRestart(ctx);
+    }
     if (cmd === '/status') {
       return this.handleStatus(ctx);
     }
@@ -67,9 +101,6 @@ export class CommandHandler {
     }
     if (cmd.startsWith('/email')) {
       return this.handleEmail(text.trim(), ctx);
-    }
-    if (cmd === '/register') {
-      return this.handleRegister(ctx);
     }
     if (cmd === '/auto' || cmd.startsWith('/auto ')) {
       return this.handleAuto(text.trim(), ctx);
@@ -96,6 +127,25 @@ export class CommandHandler {
       ctx.messageId,
     );
     this.logger.info({ sessionKey: ctx.sessionKey }, '/new: process reset, no resume');
+    return true;
+  }
+
+  private async handleSigmaRestart(ctx: CommandContext): Promise<boolean> {
+    // 隐藏命令：通过飞书触发 bot 重启（用于 Claude 子进程卡死场景）
+    // 不进 /help，不做权限检查 — 安全靠 obscurity（自己不要告诉别人即可）
+    // 实现：直接 process.exit(0)，PM2 检测进程退出后按 autorestart 拉起新进程。
+    // 不依赖 spawn / npx / PATH —— PM2 daemon 拉起 bot 时 PATH 不含 nvm node 路径，
+    // spawn 出去的 bash 子进程跑 `npx pm2 restart` 会因找不到 npx 静默失败。
+    await this.sender.sendText(
+      ctx.chatId,
+      '🔄 正在重启 bot... (5-10 秒后自动恢复，发新消息会带回上下文)',
+      ctx.messageId,
+    );
+    this.logger.warn({ sessionKey: ctx.sessionKey, chatId: ctx.chatId }, '/sigma-restart triggered, exiting for PM2 autorestart');
+
+    // 给 sendText 完成的时间，再退出。PM2 看到进程死会立刻拉起新的。
+    setTimeout(() => process.exit(0), 500);
+
     return true;
   }
 
@@ -270,21 +320,6 @@ export class CommandHandler {
         return true;
       }
     }
-  }
-
-  private async handleRegister(ctx: CommandContext): Promise<boolean> {
-    await this.sender.sendReply(
-      ctx.chatId,
-      [
-        '**开发者身份注册**',
-        '',
-        '注册后可以用你自己的 Git 身份（name/email/SSH key）和飞书文档 MCP 进行协作。',
-        '',
-        '请 @我 说「注册开发者身份」，我会引导你完成配置。',
-      ].join('\n'),
-      ctx.messageId,
-    );
-    return true;
   }
 
   private async handleAuto(text: string, ctx: CommandContext): Promise<boolean> {
@@ -565,25 +600,49 @@ export class CommandHandler {
   }
 
   private async handleHelp(ctx: CommandContext): Promise<boolean> {
-    const helpText = [
-      '**可用命令**',
-      '',
-      '`/new` — 重置会话，开始新对话（保留记忆和文件）',
-      '`/compact [可选: 聚焦提示]` — 压缩当前会话历史（降低 ctx 占用、避免「Prompt is too long」）',
-      '`/stop` — 中止当前正在运行的任务',
-      '`/status` — 查看当前会话状态',
-      '`/email` — 邮箱管理（添加、查看、测试）',
-      '`/register` — 注册开发者身份（Git + 飞书 MCP）',
-      '`/auto [on|off|always]` — 群聊自动回复（on=AI判断, off=仅@回复, always=全部回复）',
-      '`/model [sonnet|opus|haiku]` — 切换 AI 模型',
-      '`/effort [low|medium|high|xhigh|max|auto]` — 切换思考深度（Speed ↔ Intelligence）',
-      '`/wechat` — 绑定微信（扫码后微信消息同步，共享 Claude 会话，仅私聊）',
-      '`/help` — 显示此帮助信息',
-      '',
-      '直接发送消息即可与 Claude 对话。Claude 可以读写文件、执行命令等。',
-    ].join('\n');
+    // Each entry becomes one button. ActionId is the canonical English command —
+    // clicking re-routes through handle() which routes to the corresponding
+    // handler (often itself a buttonized sub-menu like /model, /effort, /auto).
+    const MENU: Array<{ label: string; action: string; style: 'default' | 'primary' | 'danger' }> = [
+      { label: '🆕 /新 (开新对话)', action: '/new',     style: 'danger'  },
+      { label: '⏹ /停 (中止任务)',  action: '/stop',    style: 'danger'  },
+      { label: '📊 /状态',          action: '/status',  style: 'primary' },
+      { label: '📋 /压缩',          action: '/compact', style: 'default' },
+      { label: '🤖 /模型',          action: '/model',   style: 'default' },
+      { label: '🧠 /思考',          action: '/effort',  style: 'default' },
+      { label: '💬 /自动',          action: '/auto',    style: 'default' },
+      { label: '📧 /邮箱',          action: '/email',   style: 'default' },
+      { label: '📱 /微信',          action: '/wechat',  style: 'default' },
+    ];
 
-    await this.sender.sendReply(ctx.chatId, helpText, ctx.messageId);
+    const lines: string[] = [
+      '**可用命令** （点按按钮即可执行）',
+      '',
+      '- `/新` 重置会话（保留记忆和文件）',
+      '- `/停` 中止当前任务',
+      '- `/状态` 查看会话状态',
+      '- `/压缩 [聚焦提示]` 压缩历史，避免「Prompt is too long」',
+      '- `/模型` 切换 AI 模型',
+      '- `/思考` 切换思考深度（Speed ↔ Intelligence）',
+      '- `/自动` 群聊自动回复策略',
+      '- `/邮箱` 邮箱管理',
+      '- `/微信` 绑定微信（仅私聊）',
+      '',
+      '**中文别名**：所有命令均可用中文输入，例如 `/停`、`/模型`、`/压缩 关注X`。`/命令` `/帮助` `/cmd` 都打开本菜单。',
+      '',
+    ];
+    for (const item of MENU) {
+      lines.push(`<<BUTTON:${item.label}|${item.action}|${item.style}>>`);
+    }
+
+    await this.sender.sendReply(
+      ctx.chatId,
+      lines.join('\n'),
+      ctx.messageId,
+      undefined,
+      undefined,
+      { sessionKey: ctx.sessionKey, chatId: ctx.chatId },
+    );
     return true;
   }
 }

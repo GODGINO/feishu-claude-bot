@@ -377,7 +377,8 @@ async function clickAuthorize() {
   }
 
   if (!sawOAuthTab) {
-    return { ok: true, auto_approved: true, note: 'no OAuth tab observed — likely pre-approved' };
+    // fail-closed: no OAuth tab observed in 15s window. Daemon retries CLI login.
+    return { ok: false, error: 'no_oauth_tab', note: 'no oauth/authorize tab observed in 15s window' };
   }
   return { ok: false, error: 'no Authorize button found or clickable', seen: lastSeen, lastUrl };
 }

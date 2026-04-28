@@ -26,6 +26,9 @@
 | 修系统提示词 | `system-prompt/common.md`（共享）+ `env.local.md` / `env.server.md`（模式专属）。**不是** `system-prompt.txt`（已删除） |
 | 加新的 bot 命令（`/xxx`）| `src/bridge/command-handler.ts` |
 | 改卡片渲染 | `src/feishu/card-builder.ts`（构建器）+ `card-streamer.ts`（流式） |
+| 改 Alert 调度（条件触发）| `src/scheduler/alert-runner.ts` |
+| 改 Alert MCP 工具 | `src/alert/alert-mcp.ts` |
+| 改 Admin Alert tab | `web/src/components/AlertTable.tsx` + `web/src/pages/SessionDetail.tsx` (tabs 数组)|
 | 改自定义标签 `<<TITLE:...>>` 等的解析 | `src/feishu/card-builder.ts` `extractTitleFromText()` / `extractButtons()` / `extractReactions()` / `isNoReply()` |
 | 改消息路由（DM/群/微信/admin）| `src/bridge/message-bridge.ts` |
 | 改 Claude 进程管理 | `src/claude/process-pool.ts` |
@@ -50,6 +53,21 @@ src/feishu/event-handler.ts::createEventHandler   ← 飞书 WebSocket 事件入
               → src/feishu/message-sender.ts::sendCard  ← 回到飞书
 ```
 
+### 想理解 "Alert 触发后怎么走"
+
+```
+src/scheduler/alert-runner.ts::pollAlert      ← 每 N 秒轮询
+  → execShell(check_command)                  ← sh 脚本检查
+  → exit 0 + JSON 数组非空 → 触发
+      ├─ execution_mode = 'message_only'      → MessageSender.sendReply
+      ├─ execution_mode = 'shell'             → execShell(trigger_command)
+      └─ execution_mode = 'claude'            → MessageBridge.executeCronJob (复用 cron 执行体)
+  → 成功 → state.watermark.processed_ids.push(item.NEW_ID) + persist
+  → 失败 → state.stats.failures++ → 累计 5 次自动 pause
+```
+
+具体协议：check_command sh 脚本输入 `WATERMARK_JSON` 环境变量，输出 `[{NEW_ID, NEW_PUBDATE, ...}]` JSON 数组（按 pubdate 升序）。
+
 ---
 
 ## 核心能力
@@ -60,6 +78,7 @@ src/feishu/event-handler.ts::createEventHandler   ← 飞书 WebSocket 事件入
 - **卡片交互** — 流式回复、工具调用面板、按钮（callback + URL）、emoji reactions
 - **邮件收发** — IMAP IDLE 推送 + SMTP 发件
 - **定时任务** — cron 表达式，热加载（每 15 秒扫 `cron-jobs.json` 变化）
+- **Alert 系统** — 条件触发任务（cron 的兄弟功能）。watcher（持续监听新事件）/ one_shot（一次性）双形态；执行模式三档：claude / shell / message_only；watermark + processed_ids 双重去重，失败 5 次自动 pause
 - **Skill 系统** — 20+ 内置技能，可 session 级启用
 - **Admin Dashboard** — React SPA，会话管理、Send as Sigma、知识库编辑
 
@@ -78,6 +97,7 @@ Admin    ─── REST + WS ────────┘        │
                                          ├── Relay Server (WSS → 远程设备，HMAC 签名)
                                          ├── Admin Server (Express + admin-chat WS)
                                          ├── Cron Runner
+                                         ├── Alert Runner (条件触发)
                                          ├── Email IDLE Monitor
                                          └── WeChat Bridge (iLink 长轮询)
 
@@ -307,6 +327,14 @@ npm run bot:log         # 看日志
 8. **Feishu 卡片静默丢弃**：卡片正文超过约 28000 字符会被飞书默默扔掉（不报错，用户看到空卡片）。`card-streamer.ts` 和 `card-builder.ts` 都有截断保护（`CARD_TEXT_LIMIT`）
 9. **Markdown 代码围栏**：某些 Markdown 在飞书 v2 卡片里需要前置换行才渲染正确（`fixMarkdownForFeishu`），否则 ``` 号贴着正文会乱
 10. **群成员 400 错误**：启动时同步群成员会对已被踢出的群返回 400，日志里会看到一堆 axios error dump。已经被 `.catch(() => {})` 吞掉，无需处理
+11. **前端改动 vs 后端改动的重启边界**（实测后修正）：
+    - **改 React 前端（`web/`）→ `npm run build:web` 即可，不需要 bot:restart**。admin server 是静态文件 serve，浏览器刷新就看到新页面（因为 vite 直接写到 `web/dist/`）。
+    - **改 Express routes（`src/admin/routes.ts`）或任何 backend ts 代码 → 必须 `npm run build` + `bot:restart`**，否则新接口路由不会注册。
+    - **常见踩坑**：改了 React Tab + 加了对应后端 route → build 后只看见 Tab UI 但点击会 401/404，因为后端没重载。务必两端都 build + 重启。
+    - `scripts/bot.sh` 里的 `npx tsc` 只编译 backend ts；前端编译走 `npm run build:web`。`npm run build` 包含两者。
+12. **PM2 vs 简单 daemon**：README 历史描述是 PM2，但当前 Mac mini 上 `pm2` 命令可能已不在 PATH 里。如果 `pm2 list` 报 command not found，说明改成了 `bot.sh` 直接管理 .bot.pid（验证方法：`ps aux | grep node` 看 master 进程是不是被 PM2 包着）
+13. **Alert watcher 失败 5 次自动 pause**：`src/scheduler/alert-runner.ts` 的 `CONSECUTIVE_FAILURE_THRESHOLD=5`。如果 check_command 持续失败（如 API 风控），到 5 次后会自动 disable + 飞书告警。修复后用 `mcp__alert__toggle_alert` 重新启用，或在 admin UI 点 Enable
+14. **B 站 watcher WBI 签名 412**：`skills/agent-reach/scripts/check_bili_uploader.sh` 现在依赖 bilix 的 `_add_sign`，但 B 站 2026-04+ 加了新风控（buvid3 / b_nut），bilix 可能过时。短期 workaround：用 RSSHub 公共服务 / 注入用户登录 cookie；长期：升级 bilix 或自实现 WBI
 
 ---
 
@@ -425,7 +453,10 @@ sigma/
 │   │   └── wechat-bridge.ts        # iLink Bot 长轮询
 │   ├── email/                      # IMAP IDLE + SMTP
 │   ├── scheduler/
-│   │   └── cron-runner.ts          # Cron 调度器
+│   │   ├── cron-runner.ts          # Cron 调度器（时间触发）
+│   │   └── alert-runner.ts         # Alert 调度器（条件触发，sister to cron）
+│   ├── alert/
+│   │   └── alert-mcp.ts            # Alert MCP（list/create/delete/toggle/reset/inspect）
 │   ├── members/
 │   │   └── member-manager.ts       # MEMBER.md 持久档案
 │   ├── utils/                      # logger, encryption 等
@@ -475,6 +506,7 @@ sigma/
 │       ├── mcp-servers.json        # stdio MCP 配置
 │       ├── .chrome-data/           # Chrome 独立 profile（仅本地版）
 │       ├── cron-jobs.json          # 该 session 的定时任务
+│       ├── alerts.json             # 该 session 的 Alert 列表（条件触发）
 │       ├── email-accounts.json     # 邮箱账户
 │       └── ... (用户 skill/文件产物)
 │

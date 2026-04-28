@@ -40,6 +40,7 @@ export interface SessionSummary {
   autoReply: string | null;
   memberCount: number;
   cronJobCount: number;
+  alertCount: number;
   messageCount: number;
   hasEmail: boolean;
   hasKnowledge: boolean;
@@ -75,6 +76,35 @@ export interface CronJob {
   lastResult?: string;
 }
 
+export interface AlertWatermark {
+  last_pubdate: number;
+  processed_ids: string[];
+  max_processed_size?: number;
+}
+
+export interface AlertStats {
+  polls: number;
+  triggers: number;
+  failures: number;
+  last_poll?: string;
+  last_trigger?: string;
+}
+
+export interface Alert {
+  id: string;
+  name: string;
+  type: 'one_shot' | 'watcher';
+  enabled: boolean;
+  interval_seconds: number;
+  check_command: string;
+  prompt: string;
+  execution_mode: 'claude' | 'shell' | 'message_only';
+  trigger_command?: string;
+  state: { watermark: AlertWatermark; stats: AlertStats };
+  max_runtime_days?: number;
+  createdAt: string;
+}
+
 export interface ChatMessage {
   timestamp: number;
   senderName: string;
@@ -97,6 +127,7 @@ export interface Stats {
   totalMessages: number;
   todayMessages: number;
   totalCronJobs: number;
+  totalAlerts: number;
   totalEmailAccounts: number;
   totalSkills: number;
   totalObservations: number;
@@ -226,6 +257,15 @@ export const api = {
     mutate('DELETE', `/sessions/${sessionKey}/cron/${jobId}`),
   toggleCronJob: (sessionKey: string, jobId: string, enabled: boolean) =>
     mutate('PUT', `/sessions/${sessionKey}/cron/${jobId}/toggle`, { enabled }),
+
+  // Alert management
+  alerts: (key: string) => fetchJson<Alert[]>(`/sessions/${key}/alerts`),
+  deleteAlert: (sessionKey: string, alertId: string) =>
+    mutate('DELETE', `/sessions/${sessionKey}/alerts/${alertId}`),
+  toggleAlert: (sessionKey: string, alertId: string, enabled: boolean) =>
+    mutate('PUT', `/sessions/${sessionKey}/alerts/${alertId}/toggle`, { enabled }),
+  resetAlert: (sessionKey: string, alertId: string) =>
+    mutate('PUT', `/sessions/${sessionKey}/alerts/${alertId}/reset`, {}),
 
   // Author management
   deleteAuthor: (sessionKey: string, openId: string) =>

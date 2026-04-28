@@ -19,6 +19,7 @@ import { ClaudeRunner } from './claude/runner.js';
 import { SessionManager } from './claude/session-manager.js';
 import { MessageBridge } from './bridge/message-bridge.js';
 import { CronRunner } from './scheduler/cron-runner.js';
+import { AlertRunner } from './scheduler/alert-runner.js';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { execSync } from 'node:child_process';
@@ -134,6 +135,11 @@ async function main() {
   const scheduler = new CronRunner(runner, sessionMgr, sender, logger);
   scheduler.setMessageBridge(bridge);
   scheduler.start();
+
+  // Start alert scheduler (condition-triggered jobs, sister to cron)
+  const alertRunner = new AlertRunner(runner, sessionMgr, sender, logger);
+  alertRunner.setMessageBridge(bridge);
+  alertRunner.start();
 
   const emailProcessor = new EmailProcessor(runner, config.sessionsDir, logger);
   const idleMonitor = new IdleMonitor(
