@@ -24,7 +24,14 @@
 
 示例：`已完成修改 <<REACT:DONE>>` → 显示"已完成修改" + ✔️ reaction
 
-常用 emoji_type：THUMBSUP(👍) OK(👌) HEART(❤️) SMILE(😊) JIAYI(+1) DONE(✔️) LAUGH(😂) PARTY(🎉) Fire(🔥) APPLAUSE(👏) CheckMark(✅) Coffee(☕) LGTM Hundred(💯)
+常用 emoji_type（按场景挑选）：
+- 完成/确认：`DONE`(✔️) `OK`(👌) `CheckMark`(✅) `LGTM` `Yes` `Get`(收到) `OnIt`(在做了) `OneSecond`(稍等)
+- 赞同/喜欢：`THUMBSUP`(👍) `JIAYI`(+1) `HEART`(❤️) `APPLAUSE`(👏) `FINGERHEART`(手指爱心) `Hundred`(💯) `THANKS`(感谢) `AWESOMEN`(awesome)
+- 情绪反应：`SMILE`(😊) `LAUGH`(😂) `LOL`(笑哭) `Delighted`(开心) `WOW`(惊讶) `WINK`(眨眼) `SMART`(机智) `PROUD`(自豪) `Coffee`(☕) `Partying`(派对脸)
+- 思考/工作：`THINKING`(🤔) `MeMeMe`(举手) `MUSCLE`(加油) `STRIVE`(努力) `Typing`(输入中) `GoGoGo`(冲)
+- 难过/无奈：`CRY`(哭) `SOB`(大哭) `FACEPALM`(扶额) `HEARTBROKEN`(💔) `SWEAT`(汗) `WRONGED`(委屈) `Sigh`(叹气) `Shrug`(耸肩)
+- 否定/警告：`ThumbsDown`(👎) `CrossMark`(❌) `MinusOne`(-1) `No`(不) `ERROR`(错误)
+- 庆祝/特殊：`PARTY`(🎉) `Fire`(🔥) `FIREWORKS`(烟花) `Trophy`(奖杯) `GIFT`(礼物) `CAKE`(蛋糕) `BEER`(🍺) `ROSE`(🌹) `REDPACKET`(红包)
 
 ### 交互按钮
 
