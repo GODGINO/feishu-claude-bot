@@ -3,12 +3,14 @@ import type { ImageAttachment } from '../claude/runner.js';
 import type { Logger } from '../utils/logger.js';
 
 /**
- * Job — every per-session unit of outbound work that must be serialized
- * within a single sessionKey. Two families:
- *   - claude-* : spawns Claude (consumes ProcessPool slot, may run minutes)
- *   - broadcast: pure sender API call (no Claude, ~200ms)
- * Both families share the same FIFO queue and runningTasks lock so
- * messages reach the user in strict chronological order.
+ * Job — a per-session unit of work that spawns Claude (or otherwise
+ * holds the ProcessPool slot). Routed through the FIFO queue so two
+ * Claude tasks for the same session never run concurrently.
+ *
+ * Pure broadcasts (IDLE email push, Alert message_only, agent
+ * unsolicited results, admin-as-sigma) are intentionally NOT modeled
+ * as Jobs — they are <200ms sender API calls and must reach the user
+ * immediately, so they bypass the queue.
  */
 export type Job =
   | { kind: 'claude-user-msg';   sessionKey: string; msg: IncomingMessage }
@@ -16,8 +18,7 @@ export type Job =
   | { kind: 'claude-cron';       sessionKey: string; chatId: string; prompt: string; jobName: string }
   | { kind: 'claude-alert';      sessionKey: string; chatId: string; prompt: string; alertName: string }
   | { kind: 'claude-wechat';     sessionKey: string; chatId: string; prompt: string; images?: ImageAttachment[] }
-  | { kind: 'claude-admin-chat'; sessionKey: string; chatId: string; text: string; echo: boolean; showSource: boolean }
-  | { kind: 'broadcast';         sessionKey: string; chatId: string; text: string; subType: 'idle-email' | 'alert-msg' | 'agent-result' | 'admin-as-sigma'; replyToMessageId?: string; sessionDir?: string };
+  | { kind: 'claude-admin-chat'; sessionKey: string; chatId: string; text: string; echo: boolean; showSource: boolean };
 
 /**
  * Per-session FIFO Job queue with capacity limit.

@@ -147,7 +147,7 @@ export class MessageBridge {
     };
   }
 
-  /** Send a message directly as Sigma bot — no Claude processing. */
+  /** Send a message directly as Sigma bot — no Claude processing, no queueing (admin manual action). */
   private async handleSendAsSigma(sessionKey: string, text: string, addToContext: boolean): Promise<void> {
     const session = this.sessionMgr.getOrCreate(sessionKey);
     const chatIdFile = path.join(session.sessionDir, 'chat-id');
@@ -186,7 +186,7 @@ export class MessageBridge {
     }
   }
 
-  /** Handle a message from Admin Chat — route to Claude, optionally echo to Feishu/WeChat. */
+  /** Handle a message from Admin Chat — route through unified queue. */
   private async handleAdminChatMessage(sessionKey: string, text: string, echo: boolean, showSource: boolean): Promise<void> {
     const session = this.sessionMgr.getOrCreate(sessionKey);
     const chatIdFile = path.join(session.sessionDir, 'chat-id');
@@ -197,35 +197,10 @@ export class MessageBridge {
       this.adminChat?.sendError(sessionKey, 'No chat-id found for this session');
       return;
     }
-
-    this.logger.info({ sessionKey, textLen: text.length, echo }, 'Admin chat → Claude');
-
-    // Store for echo
-    this.adminChatPendingEcho.set(sessionKey, { text, echo, showSource });
-
-    // Record admin message to group context (for chat history persistence)
-    if (!this.groupContext['buffers'].has(chatId)) {
-      this.groupContext.load(session.sessionDir, chatId);
-    }
-    this.groupContext.add(chatId, {
-      timestamp: Date.now(),
-      senderName: 'Admin',
-      senderId: 'admin',
-      text,
-    });
-    this.groupContext.save(session.sessionDir, chatId);
-
-    await this.executeAndReply({
-      sessionKey,
-      chatId,
-      prompt: `<admin>${text}</admin>`,
-      sessionDir: session.sessionDir,
-      replyToMessageId: undefined,
-      isNonMentionGroup: false,
-    });
+    await this.enqueueOrRunJob({ kind: 'claude-admin-chat', sessionKey, chatId, text, echo, showSource });
   }
 
-  /** Handle a message from WeChat — route directly to Claude, then send combined reply to Feishu. */
+  /** Handle a message from WeChat — route through unified queue. */
   private async handleWechatMessage(sessionKey: string, text: string, wechatUserId: string, attachments?: import('../wechat/wechat-bridge.js').WechatAttachment[]): Promise<void> {
     const session = this.sessionMgr.getOrCreate(sessionKey);
     const chatIdFile = path.join(session.sessionDir, 'chat-id');
@@ -244,11 +219,6 @@ export class MessageBridge {
     const safeId = userId.replace(/[\n\r\]]/g, '');
     const prompt = `[发送者: ${safeName} | id: ${safeId}]${mcpHint}\n${text}`;
 
-    this.logger.info({ sessionKey, textLen: text.length }, 'WeChat message → Claude');
-
-    // Store original WeChat text for combined Feishu echo after Claude replies
-    this.wechatPendingEcho.set(sessionKey, text);
-
     // Build image attachments for Claude (vision)
     let images: ImageAttachment[] | undefined;
     if (attachments) {
@@ -258,16 +228,11 @@ export class MessageBridge {
       }
     }
 
-    // Run Claude and get reply (no replyToMessageId — WeChat messages don't have Feishu message IDs)
-    await this.executeAndReply({
-      sessionKey,
-      chatId,
-      prompt,
-      sessionDir: session.sessionDir,
-      replyToMessageId: undefined,
-      isNonMentionGroup: false,
-      images,
-    });
+    await this.enqueueOrRunJob({ kind: 'claude-wechat', sessionKey, chatId, prompt, images });
+    // Echo + group context recording happen inside runWechatJob just before Claude runs,
+    // so they are correctly ordered with respect to other jobs in the queue.
+    // Capture the original wechat text so it can be picked up at run time.
+    this.wechatPendingEcho.set(sessionKey, text);
   }
 
   /** Resolve a display name: event name → member profile name → fallback. */
@@ -659,19 +624,55 @@ export class MessageBridge {
    * No typing indicator, no引用回复, no NO_REPLY injection.
    */
   async executeCronJob(sessionKey: string, chatId: string, prompt: string, jobName: string): Promise<void> {
-    const session = this.sessionMgr.getOrCreate(sessionKey);
-
-    // Check if session is muted
+    // Mute check happens here (before queueing) so muted sessions don't fill the queue
     try {
+      const session = this.sessionMgr.getOrCreate(sessionKey);
       if (fs.existsSync(path.join(session.sessionDir, 'muted'))) {
         this.logger.info({ sessionKey, jobName }, 'Session muted, skipping cron job');
         return;
       }
     } catch { /* ignore */ }
 
+    await this.enqueueOrRunJob({ kind: 'claude-cron', sessionKey, chatId, prompt, jobName });
+  }
+
+  /**
+   * Public entry for non-user producers (cron, alert, wechat, admin chat,
+   * IDLE email, agent unsolicited results). Routes the Job through the
+   * unified per-session FIFO queue: runs immediately if no task is busy,
+   * otherwise enqueues. Caller must not assume completion on return.
+   */
+  async enqueueOrRunJob(job: Job): Promise<void> {
+    if (this.runningTasks.has(job.sessionKey)) {
+      const queued = this.queue.enqueue(job.sessionKey, job);
+      if (queued) {
+        this.logger.info(
+          { sessionKey: job.sessionKey, kind: job.kind, queueSize: this.queue.queueSize(job.sessionKey) },
+          'Job queued (session busy)',
+        );
+      } else {
+        this.logger.warn({ sessionKey: job.sessionKey, kind: job.kind }, 'Job dropped — queue full');
+      }
+      return;
+    }
+    // No task running — execute immediately. runJob's per-kind handler
+    // owns the runningTasks lock + finally processQueue chain.
+    await this.runJob(job);
+  }
+
+  /**
+   * Run a queued cron Job. Holds runningTasks lock for the session.
+   */
+  private async runCronJob(job: Extract<Job, { kind: 'claude-cron' }>): Promise<void> {
+    const { sessionKey, chatId, prompt, jobName } = job;
+    const session = this.sessionMgr.getOrCreate(sessionKey);
     const cronPrompt = `[定时任务执行: ${jobName}] ${prompt}\n[这是定时任务，必须输出实际文字内容发送给用户]`;
 
     this.logger.info({ sessionKey, jobName }, 'Executing cron job via reply pipeline');
+
+    this.runningTasks.add(sessionKey);
+    const abortController = new AbortController();
+    this.abortControllers.set(sessionKey, abortController);
 
     try {
       await this.executeAndReply({
@@ -679,14 +680,102 @@ export class MessageBridge {
         chatId,
         prompt: cronPrompt,
         sessionDir: session.sessionDir,
-        replyToMessageId: undefined, // No message to reply to
+        replyToMessageId: undefined,
         existingRootId: undefined,
         isNonMentionGroup: false,
         isCronJob: true,
+        abortSignal: abortController.signal,
       });
     } catch (err) {
       this.logger.error({ err, sessionKey, jobName }, 'Cron job execution failed');
-      await this.sender.sendReply(chatId, `⚠️ 定时任务 **${jobName}** 执行失败: ${(err as Error).message}`);
+      try {
+        await this.sender.sendReply(chatId, `⚠️ 定时任务 **${jobName}** 执行失败: ${(err as Error).message}`);
+      } catch { /* ignore */ }
+    } finally {
+      this.runningTasks.delete(sessionKey);
+      this.abortControllers.delete(sessionKey);
+      await this.processQueue(sessionKey);
+    }
+  }
+
+  /**
+   * Run a queued WeChat Job. Holds runningTasks lock for the session.
+   */
+  private async runWechatJob(job: Extract<Job, { kind: 'claude-wechat' }>): Promise<void> {
+    const { sessionKey, chatId, prompt, images } = job;
+    const session = this.sessionMgr.getOrCreate(sessionKey);
+
+    this.logger.info({ sessionKey, textLen: prompt.length }, 'Running WeChat job via reply pipeline');
+
+    this.runningTasks.add(sessionKey);
+    const abortController = new AbortController();
+    this.abortControllers.set(sessionKey, abortController);
+
+    try {
+      await this.executeAndReply({
+        sessionKey,
+        chatId,
+        prompt,
+        sessionDir: session.sessionDir,
+        replyToMessageId: undefined,
+        existingRootId: undefined,
+        isNonMentionGroup: false,
+        abortSignal: abortController.signal,
+        images,
+      });
+    } catch (err) {
+      this.logger.error({ err, sessionKey }, 'WeChat job execution failed');
+    } finally {
+      this.runningTasks.delete(sessionKey);
+      this.abortControllers.delete(sessionKey);
+      await this.processQueue(sessionKey);
+    }
+  }
+
+  /**
+   * Run a queued Admin Chat Job. Holds runningTasks lock for the session.
+   */
+  private async runAdminChatJob(job: Extract<Job, { kind: 'claude-admin-chat' }>): Promise<void> {
+    const { sessionKey, chatId, text, echo, showSource } = job;
+    const session = this.sessionMgr.getOrCreate(sessionKey);
+
+    this.logger.info({ sessionKey, textLen: text.length, echo }, 'Running admin chat job via reply pipeline');
+
+    // Stash echo metadata for the streamer to consume after Claude replies
+    this.adminChatPendingEcho.set(sessionKey, { text, echo, showSource });
+
+    // Record admin message to group context (chat history persistence)
+    if (!this.groupContext['buffers'].has(chatId)) {
+      this.groupContext.load(session.sessionDir, chatId);
+    }
+    this.groupContext.add(chatId, {
+      timestamp: Date.now(),
+      senderName: 'Admin',
+      senderId: 'admin',
+      text,
+    });
+    this.groupContext.save(session.sessionDir, chatId);
+
+    this.runningTasks.add(sessionKey);
+    const abortController = new AbortController();
+    this.abortControllers.set(sessionKey, abortController);
+
+    try {
+      await this.executeAndReply({
+        sessionKey,
+        chatId,
+        prompt: `<admin>${text}</admin>`,
+        sessionDir: session.sessionDir,
+        replyToMessageId: undefined,
+        isNonMentionGroup: false,
+        abortSignal: abortController.signal,
+      });
+    } catch (err) {
+      this.logger.error({ err, sessionKey }, 'Admin chat job execution failed');
+    } finally {
+      this.runningTasks.delete(sessionKey);
+      this.abortControllers.delete(sessionKey);
+      await this.processQueue(sessionKey);
     }
   }
 
@@ -1281,9 +1370,19 @@ export class MessageBridge {
       case 'claude-button':
         await this.runButtonAction(job.sessionKey, job.chatId, job.label, job.userName, job.messageId);
         return;
-      // Phase 3 will add: claude-cron / claude-alert / claude-wechat /
-      // claude-admin-chat / broadcast. For now these kinds cannot appear
-      // in the queue (no producers route them through Job yet).
+      case 'claude-cron':
+        await this.runCronJob(job);
+        return;
+      case 'claude-wechat':
+        await this.runWechatJob(job);
+        return;
+      case 'claude-admin-chat':
+        await this.runAdminChatJob(job);
+        return;
+      // Phase 3c will add: claude-alert. Pure broadcasts (IDLE email,
+      // Alert message_only, agent results, admin-as-sigma) intentionally
+      // bypass the queue — they are <200ms sends that must reach the
+      // user immediately and don't risk Claude concurrency.
       default:
         this.logger.error({ kind: (job as Job).kind }, 'Unhandled job kind — Phase 3 not yet wired');
         return;
