@@ -279,21 +279,10 @@ const VALID_HEADER_COLORS = new Set([
   'red', 'carmine', 'violet', 'purple', 'indigo', 'grey',
 ]);
 
-/**
- * Per-user preference remap: green is reserved for upward/positive market
- * scenarios; success/completion (the LLM's typical green use-case) should
- * render as blue. Done in code rather than prompt because prompt is a
- * soft constraint the LLM may ignore, and we want the rule enforced.
- */
-const COLOR_REMAP: Record<string, string> = {
-  green: 'blue',
-};
-
 function normalizeColor(c: string | undefined | null): string {
   if (!c) return 'blue';
   const lower = c.trim().toLowerCase();
-  if (!VALID_HEADER_COLORS.has(lower)) return 'blue';
-  return COLOR_REMAP[lower] ?? lower;
+  return VALID_HEADER_COLORS.has(lower) ? lower : 'blue';
 }
 
 export function extractTitleFromText(text: string, maxLen = 40): { title: string; body: string; color: string } {
