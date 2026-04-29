@@ -411,7 +411,7 @@ export function buildCompleteCard(
   // Extract TITLE tag via shared tolerant parser (handles <<TITLE:xxx>>, <<TITLE:xxx|color>>, HTML-mixed, etc.)
   const { title: extracted, body, color: headerColor } = extractTitleFromText(text || '(空回复)', 30);
   let displayText = body;
-  let headerTitle = title || (extracted ? `✅ ${extracted}` : '');
+  let headerTitle = title || extracted || '';
 
   const elements: object[] = [];
 
