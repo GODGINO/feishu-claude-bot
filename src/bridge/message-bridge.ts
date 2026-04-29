@@ -19,7 +19,7 @@ import { CardStreamer } from '../feishu/card-streamer.js';
 import type { MemberManager } from '../members/member-manager.js';
 import type { WechatBridge } from '../wechat/wechat-bridge.js';
 
-const TITLE_INSTRUCTION = '\n\n[当你的回复包含 markdown 格式（表格、列表、代码块、加粗、链接、分隔线等）时，必须在第一行写 <<TITLE:简短标题>>，然后空一行写正文。标题10字以内，概括主题。纯文字短回复（打招呼、一两句话确认）不要写标题。]';
+const TITLE_INSTRUCTION = '\n\n[当你的回复包含 markdown 格式（表格、列表、代码块、加粗、链接、分隔线等）时，必须在第一行写 <<TITLE:简短标题|颜色>>，然后空一行写正文。颜色可选：blue（默认/信息）/ green（成功/完成）/ red（失败/紧急）/ orange（警告）/ yellow（提醒/亮点）/ wathet（次级信息/数据播报）/ turquoise（进展中）/ carmine（严重警告）/ violet/purple/indigo（特殊场景）/ grey（中立/不活跃）。不指定颜色时省略 |颜色 即可（默认 blue）。示例：<<TITLE:部署成功|green>>、<<TITLE:沪指 -1.5%|orange>>、<<TITLE:回复内容>>。标题10字以内，概括主题。纯文字短回复（打招呼、一两句话确认）不要写标题。]';
 
 /**
  * Get feishu MCP tool restriction hint for a specific user in group chat.

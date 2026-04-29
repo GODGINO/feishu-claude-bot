@@ -75,9 +75,21 @@ for seg in d['body']:
 " > "$WORK/transcript.txt"
   SOURCE="official_subtitle"
 else
-  echo ">>> [4/6] No subtitle, downloading audio with bilix" >&2
-  $PY -m bilix v "$URL" --only-audio -d "$WORK" >&2 \
-    || { echo "ERR: bilix download failed" >&2; exit 6; }
+  echo ">>> [4/6] No subtitle, downloading audio (bilix → yt-dlp fallback)" >&2
+  if ! $PY -m bilix v "$URL" --only-audio -d "$WORK" >&2; then
+    echo "    bilix failed (likely B 站反爬), trying yt-dlp with session cookies" >&2
+    COOKIES="$SCRIPT_DIR/bilibili-cookies.txt"
+    if [ -f "$COOKIES" ] && command -v yt-dlp >/dev/null 2>&1; then
+      yt-dlp --cookies "$COOKIES" -f "bestaudio" \
+        -o "$WORK/%(id)s.%(ext)s" "$URL" >&2 \
+        || { echo "ERR: yt-dlp fallback also failed" >&2; exit 6; }
+    else
+      echo "ERR: bilix failed and yt-dlp fallback unavailable" >&2
+      [ -f "$COOKIES" ] || echo "  (missing $COOKIES — see bilibili-cookies-refresh.sh)" >&2
+      command -v yt-dlp >/dev/null 2>&1 || echo "  (missing yt-dlp — brew install yt-dlp)" >&2
+      exit 6
+    fi
+  fi
 
   AUDIO=$(find "$WORK" -maxdepth 2 -type f \( -name '*.m4a' -o -name '*.mp4' -o -name '*.aac' \) | head -1)
   [ -z "$AUDIO" ] && { echo "ERR: bilix did not produce audio file" >&2; exit 6; }

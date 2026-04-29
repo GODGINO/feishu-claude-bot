@@ -80,7 +80,7 @@ export function buildStreamingCard(
   const elements: object[] = [];
 
   // Detect TITLE tag in streamed text via the shared tolerant parser.
-  const { title: extracted, body } = extractTitleFromText(text || '', 30);
+  const { title: extracted, body, color: headerColor } = extractTitleFromText(text || '', 30);
   let displayText = body;
   let headerTitle = extracted;
 
@@ -173,7 +173,7 @@ export function buildStreamingCard(
   // Only render header when bot has emitted a TITLE tag
   if (headerTitle) {
     card.header = {
-      template: 'blue',
+      template: headerColor,
       title: { tag: 'plain_text', content: `✍️ ${headerTitle}` },
     };
   }
@@ -271,13 +271,33 @@ export function extractReactions(text: string): { cleanText: string; emojis: str
  * Closing-tag pattern accepts any combination of `/`, `<`, whitespace as garbage between `<` and `TITLE`,
  * which tolerates common Claude mistakes like `</<TITLE>`, `< / TITLE>`, `</TITLE`.
  */
-export function extractTitleFromText(text: string, maxLen = 40): { title: string; body: string } {
-  // Priority 1: canonical <<TITLE:xxx>> — title body must not contain < > or newline.
-  // `[<\/\s]*` before the closing `>>` tolerates trailing garbage like `<<TITLE:xxx</>>`
-  // (Claude sometimes inserts a stray `</` right before the closing double-bracket).
-  let match = text.match(/<{1,2}\s*TITLE\s*[:：]\s*([^<>\n]+?)[<\/\s]*>{1,2}\s*\n?/i);
+/**
+ * Valid Feishu card header `template` values. Anything else falls back to 'blue'.
+ */
+const VALID_HEADER_COLORS = new Set([
+  'blue', 'wathet', 'turquoise', 'green', 'yellow', 'orange',
+  'red', 'carmine', 'violet', 'purple', 'indigo', 'grey',
+]);
+
+function normalizeColor(c: string | undefined | null): string {
+  if (!c) return 'blue';
+  const lower = c.trim().toLowerCase();
+  return VALID_HEADER_COLORS.has(lower) ? lower : 'blue';
+}
+
+export function extractTitleFromText(text: string, maxLen = 40): { title: string; body: string; color: string } {
+  // Priority 0: extended <<TITLE:xxx|color>> — color suffix to drive header.template.
+  // Title body must not contain < > | or newline. `[<\/\s]*` before the closing `>>`
+  // tolerates trailing garbage like `<<TITLE:xxx|green</>>`.
+  let match = text.match(/<{1,2}\s*TITLE\s*[:：]\s*([^<>\n|]+?)\s*\|\s*([a-zA-Z]+)\s*[<\/\s]*>{1,2}\s*\n?/i);
+  let color = 'blue';
+  if (match) {
+    color = normalizeColor(match[2]);
+  } else {
+    // Priority 1: canonical <<TITLE:xxx>> — title body must not contain < > or newline.
+    match = text.match(/<{1,2}\s*TITLE\s*[:：]\s*([^<>\n]+?)[<\/\s]*>{1,2}\s*\n?/i);
+  }
   // Priority 2: HTML-mixed <TITLE:xxx</TITLE> — colon form with (possibly garbled) close.
-  // Closing regex requires `/` so it can't accidentally match a nested opening `<TITLE>`.
   if (!match) {
     match = text.match(/<{1,2}\s*TITLE\s*[:：]\s*([^<\n]+?)\s*<[\/\s<]*\/[\/\s<]*TITLE[^>]*?>{0,2}\s*\n?/i);
   }
@@ -285,17 +305,15 @@ export function extractTitleFromText(text: string, maxLen = 40): { title: string
   if (!match) {
     match = text.match(/<{1,2}\s*TITLE\s*>\s*([^<\n]+?)\s*<[\/\s<]*\/[\/\s<]*TITLE[^>]*?>{0,2}\s*\n?/i);
   }
-  if (!match) return { title: '', body: text };
+  if (!match) return { title: '', body: text, color: 'blue' };
   let body = text.slice(0, match.index).concat(text.slice((match.index || 0) + match[0].length));
   // Strip any stray TITLE fragments left behind (duplicates, orphan closes — including garbled `</<TITLE>`).
-  // Order matters: closing-shaped tags first so the opening-tag strip doesn't eat the inner `<TITLE>`
-  // from a garbled close (e.g. `</<TITLE>`), leaving a trailing `</` artifact.
-  // The closing regex REQUIRES `/` (via `\/`) so it doesn't accidentally match bare opening tags like `<<TITLE`.
+  // The opening-tag strip pattern also catches `<<TITLE:xxx|color>>` variants since `[^<>\n]` permits `|`.
   body = body
     .replace(/<[\/\s<]*\/[\/\s<]*TITLE[^>]*?>{0,2}\s*\n?/gi, '')
     .replace(/<{1,2}\s*TITLE\s*[:：]?[^<>\n]*?[<\/\s]*>{1,2}\s*\n?/gi, '')
     .replace(/^\n+/, '');
-  return { title: match[1].trim().slice(0, maxLen), body };
+  return { title: match[1].trim().slice(0, maxLen), body, color };
 }
 
 /**
@@ -390,8 +408,8 @@ export function buildCompleteCard(
   usage?: UsageInfo,
   thinkingEntries?: ThinkingEntry[],
 ): object {
-  // Extract TITLE tag via shared tolerant parser (handles <<TITLE:xxx>>, HTML-mixed, etc.)
-  const { title: extracted, body } = extractTitleFromText(text || '(空回复)', 30);
+  // Extract TITLE tag via shared tolerant parser (handles <<TITLE:xxx>>, <<TITLE:xxx|color>>, HTML-mixed, etc.)
+  const { title: extracted, body, color: headerColor } = extractTitleFromText(text || '(空回复)', 30);
   let displayText = body;
   let headerTitle = title || (extracted ? `✅ ${extracted}` : '');
 
@@ -480,7 +498,7 @@ export function buildCompleteCard(
   };
   if (headerTitle) {
     card.header = {
-      template: 'blue',
+      template: headerColor,
       title: { tag: 'plain_text', content: headerTitle },
     };
   }

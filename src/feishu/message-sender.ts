@@ -724,7 +724,7 @@ function detectRenderMode(text: string): 'card' | 'text' {
  * Callback buttons require ctx.sessionKey; link buttons render unconditionally.
  */
 function buildMarkdownCard(text: string, buttons: import('./card-builder.js').ButtonInfo[] = [], ctx: ButtonContext = {}): object {
-  const { title, body } = extractTitleFromText(text);
+  const { title, body, color } = extractTitleFromText(text);
 
   // Truncate if too long for card (Feishu limit ~28000 chars)
   const truncated = body.length > 28000 ? body.slice(0, 28000) + '\n\n...(内容已截断)' : body;
@@ -747,7 +747,7 @@ function buildMarkdownCard(text: string, buttons: import('./card-builder.js').Bu
   if (title) {
     card.header = {
       title: { tag: 'plain_text', content: title },
-      template: 'blue',
+      template: color,
     };
   }
   return card;

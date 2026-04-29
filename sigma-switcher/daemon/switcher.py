@@ -626,7 +626,14 @@ def main_loop():
                         iteration_ok = False
                 elif pct is None:
                     parse_fail_count += 1
+                    # Diagnostic: dump raw extension response so we can see what claude.ai
+                    # actually returned (URL, limits list shape, page state) when parsing failed.
+                    try:
+                        raw_dump = json.dumps(r, ensure_ascii=False)[:1500]
+                    except Exception:
+                        raw_dump = repr(r)[:1500]
                     log(f'  could not parse usage (#{parse_fail_count} in a row), skipping this round')
+                    log(f'  raw get_usage response: {raw_dump}')
                     if parse_fail_count >= PARSE_FAIL_WARN_AT and not parse_fail_warned:
                         notify(f'⚠️ usage 解析连续失败 {parse_fail_count} 次 (current={state["current"]}) — '
                                f'检查 Chrome/扩展是否正常、claude.ai 是否改版')
