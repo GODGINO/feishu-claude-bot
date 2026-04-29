@@ -1,5 +1,7 @@
 import type { IncomingMessage } from '../feishu/event-handler.js';
 import type { ImageAttachment } from '../claude/runner.js';
+import type { RawEmail } from '../email/email-processor.js';
+import type { EmailAccount } from '../email/account-store.js';
 import type { Logger } from '../utils/logger.js';
 
 /**
@@ -18,7 +20,8 @@ export type Job =
   | { kind: 'claude-cron';       sessionKey: string; chatId: string; prompt: string; jobName: string }
   | { kind: 'claude-alert';      sessionKey: string; chatId: string; prompt: string; alertName: string }
   | { kind: 'claude-wechat';     sessionKey: string; chatId: string; prompt: string; images?: ImageAttachment[] }
-  | { kind: 'claude-admin-chat'; sessionKey: string; chatId: string; text: string; echo: boolean; showSource: boolean };
+  | { kind: 'claude-admin-chat'; sessionKey: string; chatId: string; text: string; echo: boolean; showSource: boolean }
+  | { kind: 'claude-email-process'; sessionKey: string; chatId: string; emails: RawEmail[]; account: EmailAccount; sessionDir: string };
 
 /**
  * Per-session FIFO Job queue with capacity limit.

@@ -14,6 +14,9 @@ import { MessageQueue, type Job } from './message-queue.js';
 import { GroupContextBuffer } from './group-context.js';
 import { EmailSetup } from './email-setup.js';
 import type { IdleMonitor } from '../email/idle-monitor.js';
+import type { EmailProcessor, RawEmail } from '../email/email-processor.js';
+import { formatPushNotification } from '../email/email-processor.js';
+import type { EmailAccount } from '../email/account-store.js';
 import { CardStreamer } from '../feishu/card-streamer.js';
 import type { MemberManager } from '../members/member-manager.js';
 import type { WechatBridge } from '../wechat/wechat-bridge.js';
@@ -53,6 +56,7 @@ export class MessageBridge {
   private memberMgr?: MemberManager;
   private wechatBridge?: WechatBridge;
   private adminChat?: import('../admin/admin-chat.js').AdminChatServer;
+  private emailProcessor?: EmailProcessor;
   // Track original text per session for cross-channel echo
   private wechatPendingEcho = new Map<string, string>();
   private feishuPendingEcho = new Map<string, string>();
@@ -119,6 +123,56 @@ export class MessageBridge {
   setIdleMonitor(monitor: IdleMonitor): void {
     this.emailSetup.setIdleMonitor(monitor);
     this.commandHandler.setIdleMonitor(monitor);
+  }
+
+  /** Set the EmailProcessor reference (used by enqueueEmailProcess). */
+  setEmailProcessor(processor: EmailProcessor): void {
+    this.emailProcessor = processor;
+  }
+
+  /**
+   * Public entry called by IdleMonitor when new emails arrive. Routes the
+   * spam-classification + push-notification through the user session's
+   * unified queue so it cannot run concurrently with the user's own
+   * Claude tasks. Classification itself still uses the isolated
+   * `_email_processor` session inside emailProcessor.process so the
+   * user's transcript stays clean.
+   */
+  enqueueEmailProcess(sessionKey: string, chatId: string, emails: RawEmail[], account: EmailAccount, sessionDir: string): void {
+    if (emails.length === 0) return;
+    void this.enqueueOrRunJob({ kind: 'claude-email-process', sessionKey, chatId, emails, account, sessionDir });
+  }
+
+  /**
+   * Run a queued email-process Job. Holds the user sessionKey lock so
+   * the LLM-based spam filter does not contend with the user's own
+   * Claude tasks for the same session.
+   */
+  private async runEmailProcessJob(job: Extract<Job, { kind: 'claude-email-process' }>): Promise<void> {
+    const { sessionKey, chatId, emails, account, sessionDir } = job;
+    if (!this.emailProcessor) {
+      this.logger.error({ sessionKey, accountId: account.id }, 'emailProcessor not set — dropping job');
+      return;
+    }
+
+    this.runningTasks.add(sessionKey);
+    try {
+      const processed = await this.emailProcessor.process(emails, account, sessionDir);
+      const toNotify = processed.filter(e => !e.isSpam);
+      if (toNotify.length > 0) {
+        const text = formatPushNotification(toNotify);
+        await this.sender.sendReply(chatId, text);
+      }
+      const spamCount = processed.length - toNotify.length;
+      if (spamCount > 0) {
+        this.logger.debug({ sessionKey, accountId: account.id, spamCount }, 'Filtered spam emails');
+      }
+    } catch (err) {
+      this.logger.error({ err, sessionKey, accountId: account.id }, 'Email process job failed');
+    } finally {
+      this.runningTasks.delete(sessionKey);
+      await this.processQueue(sessionKey);
+    }
   }
 
   /** Set the MemberManager for per-user profile tracking. */
@@ -1379,8 +1433,11 @@ export class MessageBridge {
       case 'claude-admin-chat':
         await this.runAdminChatJob(job);
         return;
-      // Phase 3c will add: claude-alert. Pure broadcasts (IDLE email,
-      // Alert message_only, agent results, admin-as-sigma) intentionally
+      case 'claude-email-process':
+        await this.runEmailProcessJob(job);
+        return;
+      // Phase 3c will add: claude-alert. Pure broadcasts (Alert
+      // message_only, agent results, admin-as-sigma) intentionally
       // bypass the queue — they are <200ms sends that must reach the
       // user immediately and don't risk Claude concurrency.
       default:

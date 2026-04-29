@@ -15,7 +15,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { execSync } from 'node:child_process';
 import { IdleMonitor } from './email/idle-monitor.js';
-import { EmailProcessor, formatPushNotification } from './email/email-processor.js';
+import { EmailProcessor } from './email/email-processor.js';
 import { startAdminServer } from './admin/server.js';
 import { WechatBridge } from './wechat/wechat-bridge.js';
 
@@ -155,27 +155,17 @@ async function main() {
   alertRunner.setMessageBridge(bridge);
   alertRunner.start();
 
-  // Start email IDLE monitor (push notifications for new emails)
+  // Start email IDLE monitor (push notifications for new emails).
+  // Spam classification + send is routed through bridge.enqueueEmailProcess
+  // so it shares the per-session FIFO queue with the user's own Claude
+  // tasks (no concurrent Claude runs on the same sessionKey).
   const emailProcessor = new EmailProcessor(runner, config.sessionsDir, logger);
+  bridge.setEmailProcessor(emailProcessor);
   const idleMonitor = new IdleMonitor(
     config.sessionsDir,
     async (sessionKey, chatId, account, emails) => {
-      try {
-        const session = sessionMgr.getOrCreate(sessionKey);
-        const processed = await emailProcessor.process(emails, account, session.sessionDir);
-        const toNotify = processed.filter(e => !e.isSpam);
-        if (toNotify.length > 0) {
-          const text = formatPushNotification(toNotify);
-          await sender.sendReply(chatId, text);
-
-        }
-        const spamCount = processed.filter(e => e.isSpam).length;
-        if (spamCount > 0) {
-          logger.debug({ sessionKey, accountId: account.id, spamCount }, 'Filtered spam emails');
-        }
-      } catch (err) {
-        logger.error({ err, sessionKey, accountId: account.id }, 'Failed to process new emails');
-      }
+      const session = sessionMgr.getOrCreate(sessionKey);
+      bridge.enqueueEmailProcess(sessionKey, chatId, emails, account, session.sessionDir);
     },
     logger,
   );
