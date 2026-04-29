@@ -553,30 +553,43 @@ action_lock = threading.Lock()
 def triggered_switch(email, cooldown_hours=None):
     """Entry point registered with server for POST /trigger_switch.
 
-    Freezes the previous account in state['cooldowns'] so main_loop's round-robin
-    doesn't immediately pick it back. Defaults to the session cooldown (5h);
-    callers can override via the `cooldown_hours` field (useful for weekly
-    preempts: pass 168). No cooldown applied when re-logging into the same
-    account (e.g. NOT_LOGGED_IN path routes through main_loop, not here).
+    Cooldown semantics (post-fix): cooldowns[X] = X's 5h rolling deadline,
+    set when X is *activated* — so prev_email is naturally still in
+    cooldown from when *it* was last activated, no need to re-freeze it.
+
+    Exception: when caller passes a weekly cooldown (cooldown_hours >= 24),
+    we still freeze prev_email — a weekly-saturated account really is
+    unavailable until the parsed reset time, regardless of when it was
+    last "activated".
     """
     with action_lock:
         log(f'━━━ Manual switch triggered → {email} ━━━')
         state = load_state()
         prev_email = state['current']
         perform_switch(email)
-        freeze_desc = '—'
-        if prev_email and prev_email != email:
-            cd = cooldown_hours if cooldown_hours is not None else CFG['cooldown_hours']
-            deadline = time.time() + float(cd) * 3600
+        cd = cooldown_hours if cooldown_hours is not None else CFG['cooldown_hours']
+        cd = float(cd)
+        weekly = cd >= 24
+        timer_desc = '—'
+        if weekly and prev_email and prev_email != email:
+            # Weekly limit hit on prev — it really is unreachable for ~a week
+            deadline = time.time() + cd * 3600
             state['cooldowns'][prev_email] = deadline
             readable = time.strftime('%Y-%m-%d %H:%M', time.localtime(deadline))
-            log(f'  froze {prev_email} for {cd}h (until {readable})')
-            freeze_desc = f'{cd}h'
+            log(f'  weekly: froze {prev_email} for {cd}h (until {readable})')
+            timer_desc = f'{prev_email} 冻结 {cd}h (until {readable})'
+        elif not weekly:
+            # Session 5h rolling — track when the *new* account was activated
+            deadline = time.time() + cd * 3600
+            state['cooldowns'][email] = deadline
+            readable = time.strftime('%Y-%m-%d %H:%M', time.localtime(deadline))
+            log(f'  session: {email} 5h timer → {readable}')
+            timer_desc = f'{email} 5h 计时器 → {readable}'
         state['current'] = email
         state['switch_count'] = state.get('switch_count', 0) + 1
         save_state(state)
         notify(f'✅ manual switch → {email}\n'
-               f'   previous: {prev_email} (frozen {freeze_desc})\n'
+               f'   {timer_desc}\n'
                f'   #{state["switch_count"]}')
         log('━━━ Manual switch complete ━━━')
 
@@ -666,8 +679,13 @@ def main_loop():
                         readable = time.strftime('%Y-%m-%d %H:%M', time.localtime(deadline))
                         kind = 'weekly' if weekly else 'session'
                         log(f'  ⚠️ trigger — {trigger} at {trigger_pct}% → {kind} cooldown {cd_hours_actual:.1f}h (until {readable}, source: {reset_source})')
-                        # Record deadline (NOT start time) — pick_next uses `now >= deadline` semantics
-                        state['cooldowns'][state['current']] = deadline
+                        # cooldowns[X] = deadline before which X must not be re-activated.
+                        # Weekly: freeze the just-saturated current — it really is gone for ~a week.
+                        # Session: freeze the *new* account once we know who it is (below) — the
+                        # 5h rolling window belongs to whoever just started using it. The previous
+                        # current is already in its own cooldown from when *it* was last activated.
+                        if weekly:
+                            state['cooldowns'][state['current']] = deadline
                         # Try accounts in pick_next order; if a candidate's magic-link
                         # delivery exhausts retries (forwarding broken for that mailbox),
                         # short-cool it for 30 min and immediately try the next candidate.
@@ -696,12 +714,19 @@ def main_loop():
                             all_cooled_warned = False
                             prev_email = state['current']
                             state['current'] = switched_to['email']
+                            # Session 5h: timer belongs to the new account (the 5h rolling
+                            # window starts when *it* begins serving requests).
+                            if not weekly:
+                                state['cooldowns'][switched_to['email']] = deadline
                             state['switch_count'] = state.get('switch_count', 0) + 1
                             save_state(state)
-                            freeze_desc = f'{cd_hours_actual:.1f}h ({kind})'
+                            if weekly:
+                                timer_line = f'   {prev_email} 冻结 {cd_hours_actual:.1f}h ({kind}) until {readable}'
+                            else:
+                                timer_line = f'   {switched_to["email"]} 5h 计时器 → {readable}'
                             notify(f'✅ switched → {state["current"]}\n'
                                    f'   trigger: {trigger} {trigger_pct}%\n'
-                                   f'   {prev_email} frozen for {freeze_desc} until {readable}\n'
+                                   f'{timer_line}\n'
                                    f'   #{state["switch_count"]}')
                             # Fast post-switch verify: don't wait the full 120s, do an
                             # immediate get_usage on the new account to confirm it works
