@@ -10,7 +10,7 @@ import type { Config } from '../config.js';
 import type { Logger } from '../utils/logger.js';
 import { isNoReply } from '../feishu/card-builder.js';
 import { CommandHandler } from './command-handler.js';
-import { MessageQueue } from './message-queue.js';
+import { MessageQueue, type Job } from './message-queue.js';
 import { GroupContextBuffer } from './group-context.js';
 import { EmailSetup } from './email-setup.js';
 import type { IdleMonitor } from '../email/idle-monitor.js';
@@ -44,8 +44,6 @@ export class MessageBridge {
   private abortControllers = new Map<string, AbortController>();
   // Cache finalized card state for button click updates (cardId → card data)
   private buttonCardCache = new Map<string, { cardJson: object; sequence: number; expiresAt: number }>();
-  // Pending button actions queued while session is busy
-  private pendingButtonActions = new Map<string, Array<{ sessionKey: string; chatId: string; label: string; userName: string; cardId?: string; messageId?: string }>>();
   private commandHandler: CommandHandler;
   private queue: MessageQueue;
   private groupContext: GroupContextBuffer;
@@ -381,7 +379,7 @@ export class MessageBridge {
 
     // Check if session is busy — silently queue message (FIFO, processed when current task ends)
     if (this.runningTasks.has(sessionKey)) {
-      const queued = this.queue.enqueue(sessionKey, msg);
+      const queued = this.queue.enqueue(sessionKey, { kind: 'claude-user-msg', sessionKey, msg });
       if (queued) {
         this.logger.info(
           { sessionKey, isMentioned: msg.isMentioned, queueSize: this.queue.queueSize(sessionKey) },
@@ -727,15 +725,16 @@ export class MessageBridge {
       }
     } catch { /* ignore */ }
 
-    // If session is busy, queue the button action for later
+    // If session is busy, queue the button action into the unified Job queue
     if (this.runningTasks.has(sessionKey)) {
-      let queue = this.pendingButtonActions.get(sessionKey);
-      if (!queue) {
-        queue = [];
-        this.pendingButtonActions.set(sessionKey, queue);
+      const queued = this.queue.enqueue(sessionKey, {
+        kind: 'claude-button', sessionKey, chatId, actionId, label, userName, operatorId, cardId, messageId,
+      });
+      if (queued) {
+        this.logger.info({ sessionKey, label, queueSize: this.queue.queueSize(sessionKey) }, 'Button action queued (session busy)');
+      } else {
+        this.logger.warn({ sessionKey, label }, 'Button action dropped — queue full');
       }
-      queue.push({ sessionKey, chatId, label, userName, cardId, messageId });
-      this.logger.info({ sessionKey, label, queueSize: queue.length }, 'Button action queued (session busy)');
       return;
     }
 
@@ -1258,22 +1257,36 @@ export class MessageBridge {
     }
   }
 
+  /**
+   * Dequeue the next Job for a session and dispatch by kind.
+   * Single FIFO queue covers all Job kinds — messages, buttons, cron, alert,
+   * wechat, admin-chat, and broadcast — so they reach the user in order.
+   */
   private async processQueue(sessionKey: string): Promise<void> {
-    // Messages take priority over button actions
-    const next = this.queue.dequeue(sessionKey);
-    if (next) {
-      this.logger.info({ sessionKey, isMentioned: next.msg.isMentioned }, 'Processing queued message');
-      await this.executeMessage(next.msg, next.sessionKey);
-      return;
-    }
+    const job = this.queue.dequeue(sessionKey);
+    if (!job) return;
+    await this.runJob(job);
+  }
 
-    // Then check pending button actions
-    const btnQueue = this.pendingButtonActions.get(sessionKey);
-    if (btnQueue && btnQueue.length > 0) {
-      const btn = btnQueue.shift()!;
-      if (btnQueue.length === 0) this.pendingButtonActions.delete(sessionKey);
-      this.logger.info({ sessionKey, label: btn.label }, 'Processing queued button action');
-      await this.runButtonAction(btn.sessionKey, btn.chatId, btn.label, btn.userName, btn.messageId);
+  /**
+   * Execute a single Job. Caller must ensure runningTasks lock is not held
+   * by another task in the same session.
+   */
+  private async runJob(job: Job): Promise<void> {
+    this.logger.info({ sessionKey: job.sessionKey, kind: job.kind }, 'Running job');
+    switch (job.kind) {
+      case 'claude-user-msg':
+        await this.executeMessage(job.msg, job.sessionKey);
+        return;
+      case 'claude-button':
+        await this.runButtonAction(job.sessionKey, job.chatId, job.label, job.userName, job.messageId);
+        return;
+      // Phase 3 will add: claude-cron / claude-alert / claude-wechat /
+      // claude-admin-chat / broadcast. For now these kinds cannot appear
+      // in the queue (no producers route them through Job yet).
+      default:
+        this.logger.error({ kind: (job as Job).kind }, 'Unhandled job kind — Phase 3 not yet wired');
+        return;
     }
   }
 }
