@@ -15,7 +15,7 @@ import type { Logger } from '../utils/logger.js';
  * immediately, so they bypass the queue.
  */
 export type Job =
-  | { kind: 'claude-user-msg';   sessionKey: string; msg: IncomingMessage }
+  | { kind: 'claude-user-msg';   sessionKey: string; msg: IncomingMessage; enqueuedAt?: number }
   | { kind: 'claude-button';     sessionKey: string; chatId: string; actionId: string; label: string; userName: string; operatorId: string; cardId?: string; messageId?: string }
   | { kind: 'claude-cron';       sessionKey: string; chatId: string; prompt: string; jobName: string }
   | { kind: 'claude-alert';      sessionKey: string; chatId: string; prompt: string; alertName: string }
@@ -79,5 +79,24 @@ export class MessageQueue {
 
   clear(sessionKey: string): void {
     this.queues.delete(sessionKey);
+  }
+
+  /**
+   * Remove the first user-message Job whose msg.messageId matches the
+   * given id, across ALL session queues. Used when a Feishu recall
+   * event arrives for a still-queued message.
+   *
+   * Returns the dropped Job (for logging) or null if no match.
+   */
+  removeByMessageId(messageId: string): Job | null {
+    for (const [sessionKey, queue] of this.queues) {
+      const idx = queue.findIndex(j => j.kind === 'claude-user-msg' && j.msg.messageId === messageId);
+      if (idx >= 0) {
+        const [removed] = queue.splice(idx, 1);
+        if (queue.length === 0) this.queues.delete(sessionKey);
+        return removed;
+      }
+    }
+    return null;
   }
 }

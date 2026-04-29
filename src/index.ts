@@ -107,7 +107,7 @@ async function main() {
 
   // Create core components (botStartTime filters out stale events from before startup)
   const botStartTime = Date.now();
-  const { dispatcher, onMessage, onCardAction } = createEventHandler(botOpenId, logger, botStartTime);
+  const { dispatcher, onMessage, onCardAction, onRecall } = createEventHandler(botOpenId, logger, botStartTime);
   const sender = new MessageSender(client, logger);
   const typing = new TypingIndicator(client, logger);
   const runner = new ClaudeRunner(config, logger, config.sessionsDir);
@@ -135,6 +135,11 @@ async function main() {
   // Route all messages through the bridge
   onMessage(async (msg) => {
     await bridge.handleMessage(msg);
+  });
+
+  // Drop queued messages when the user recalls them in Feishu
+  onRecall(({ messageId, chatId }) => {
+    bridge.handleRecall(messageId, chatId);
   });
 
   // Handle card button clicks — actionId prefixed with '/' routes to command handler,

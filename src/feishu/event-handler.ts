@@ -36,13 +36,16 @@ const DEDUP_TTL_MS = 600_000; // 10 minutes
 
 export type CardActionHandler = (action: { sessionKey: string; chatId: string; actionId: string; label: string; operatorId: string; cardId?: string; messageId?: string }) => void | Promise<void>;
 
+export type RecallHandler = (event: { messageId: string; chatId: string; recallTime: string; recallType: string }) => void | Promise<void>;
+
 export function createEventHandler(
   botOpenId: string,
   logger: Logger,
   botStartTime: number = Date.now(),
-): { dispatcher: lark.EventDispatcher; onMessage: (handler: MessageHandler) => void; onCardAction: (handler: CardActionHandler) => void } {
+): { dispatcher: lark.EventDispatcher; onMessage: (handler: MessageHandler) => void; onCardAction: (handler: CardActionHandler) => void; onRecall: (handler: RecallHandler) => void } {
   let messageHandler: MessageHandler | null = null;
   let cardActionHandler: CardActionHandler | null = null;
+  let recallHandler: RecallHandler | null = null;
 
   const dispatcher = new lark.EventDispatcher({}).register({
     'im.message.receive_v1': async (data: any) => {
@@ -200,6 +203,26 @@ export function createEventHandler(
         logger.error({ err }, 'Error handling Feishu message event');
       }
     },
+    'im.message.recalled_v1': async (data: any) => {
+      try {
+        const messageId: string = data?.message_id || '';
+        const chatId: string = data?.chat_id || '';
+        const recallTime: string = data?.recall_time || '';
+        const recallType: string = data?.recall_type || '';
+        if (!messageId || !chatId) {
+          logger.warn({ data }, 'Recall event missing message_id or chat_id');
+          return;
+        }
+        logger.info({ messageId, chatId, recallType }, 'Message recalled');
+        if (recallHandler) {
+          Promise.resolve(recallHandler({ messageId, chatId, recallTime, recallType })).catch((err: any) => {
+            logger.error({ err }, 'Error in recall handler');
+          });
+        }
+      } catch (err) {
+        logger.error({ err }, 'Error handling Feishu recall event');
+      }
+    },
     'card.action.trigger': async (data: any) => {
       try {
         const event = data;
@@ -242,6 +265,9 @@ export function createEventHandler(
     },
     onCardAction: (handler: CardActionHandler) => {
       cardActionHandler = handler;
+    },
+    onRecall: (handler: RecallHandler) => {
+      recallHandler = handler;
     },
   };
 }

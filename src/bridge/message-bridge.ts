@@ -398,7 +398,7 @@ export class MessageBridge {
 
     // Check if session is busy — silently queue message (FIFO, processed when current task ends)
     if (this.runningTasks.has(sessionKey)) {
-      const queued = this.queue.enqueue(sessionKey, { kind: 'claude-user-msg', sessionKey, msg });
+      const queued = this.queue.enqueue(sessionKey, { kind: 'claude-user-msg', sessionKey, msg, enqueuedAt: Date.now() });
       if (queued) {
         this.logger.info(
           { sessionKey, isMentioned: msg.isMentioned, queueSize: this.queue.queueSize(sessionKey) },
@@ -749,6 +749,62 @@ export class MessageBridge {
       this.runningTasks.delete(sessionKey);
       this.abortControllers.delete(sessionKey);
       await this.processQueue(sessionKey);
+    }
+  }
+
+  /**
+   * Run a queued user-message Job. If the message has been waiting >2s
+   * we re-fetch it via Feishu API in case the user edited it while
+   * waiting. If the fetch fails (likely because the message was just
+   * recalled and the recall event hasn't reached us yet), the job is
+   * silently dropped.
+   *
+   * Note: only text/post messages are re-fetched. Image/file/interactive
+   * payloads are immutable in Feishu so refetch adds no value.
+   */
+  private async runUserMsgJob(job: Extract<Job, { kind: 'claude-user-msg' }>): Promise<void> {
+    const waitedMs = job.enqueuedAt ? Date.now() - job.enqueuedAt : 0;
+    const refetchable = job.msg.messageType === 'text' || job.msg.messageType === 'post';
+    if (waitedMs > 2000 && refetchable) {
+      try {
+        const fresh = await this.sender.fetchMessageText(job.msg.messageId);
+        if (fresh == null) {
+          this.logger.warn({ messageId: job.msg.messageId, waitedMs }, 'Queued message gone (likely recalled) — dropping job');
+          return;
+        }
+        if (fresh !== job.msg.text) {
+          this.logger.info(
+            { messageId: job.msg.messageId, waitedMs, oldLen: job.msg.text.length, newLen: fresh.length },
+            'Queued message edited while waiting — using latest content',
+          );
+          job.msg.text = fresh;
+        }
+      } catch (err) {
+        this.logger.warn({ err, messageId: job.msg.messageId, waitedMs }, 'Failed to refetch queued message — dropping job');
+        return;
+      }
+    }
+    await this.executeMessage(job.msg, job.sessionKey);
+  }
+
+  /**
+   * Public handler for Feishu recall events. Removes the matching job
+   * from the queue if it is still waiting. If the message has already
+   * been dequeued or finished, this is a no-op (the in-flight LLM
+   * task is intentionally NOT cancelled — too disruptive).
+   */
+  handleRecall(messageId: string, chatId: string): void {
+    const removed = this.queue.removeByMessageId(messageId);
+    if (removed) {
+      this.logger.info(
+        { messageId, chatId, kind: removed.kind, sessionKey: removed.sessionKey },
+        'Removed recalled message from queue',
+      );
+    } else {
+      this.logger.debug(
+        { messageId, chatId },
+        'Recall event for message not in queue (already processed or unknown)',
+      );
     }
   }
 
@@ -1419,7 +1475,7 @@ export class MessageBridge {
     this.logger.info({ sessionKey: job.sessionKey, kind: job.kind }, 'Running job');
     switch (job.kind) {
       case 'claude-user-msg':
-        await this.executeMessage(job.msg, job.sessionKey);
+        await this.runUserMsgJob(job);
         return;
       case 'claude-button':
         await this.runButtonAction(job.sessionKey, job.chatId, job.label, job.userName, job.messageId);
