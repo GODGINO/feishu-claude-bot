@@ -37,6 +37,7 @@
     "pino-pretty": "^11.0.0",
     "puppeteer": "^24.40.0",
     "qrcode": "^1.5.4",
+    "sharp": "^0.34.5",
     "ws": "^8.20.0"
   },
   "devDependencies": {

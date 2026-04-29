@@ -4,6 +4,7 @@ import { Readable } from 'node:stream';
 import type * as lark from '@larksuiteoapi/node-sdk';
 import type { Logger } from '../utils/logger.js';
 import { extractButtons, extractReactions, extractTitleFromText, buildButtonElements, type ButtonContext } from './card-builder.js';
+import { resizeIfTooBig } from './image-resize.js';
 
 const NAME_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
@@ -324,6 +325,9 @@ export class MessageSender {
 
       // Detect media type from magic bytes
       const mediaType = detectImageType(buffer);
+      // Resize before base64 so any side > 1900px is shrunk; Anthropic's
+      // many-image request cap is 2000px on any side and we leave headroom.
+      buffer = await resizeIfTooBig(buffer, mediaType, this.logger);
       const base64 = buffer.toString('base64');
 
       this.logger.info({ messageId, imageKey, mediaType, sizeKB: Math.round(buffer.length / 1024) }, 'Downloaded image');
