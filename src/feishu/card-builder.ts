@@ -418,6 +418,7 @@ export function buildCompleteCard(
   messageId?: string,
   usage?: UsageInfo,
   thinkingEntries?: ThinkingEntry[],
+  aborted?: boolean,
 ): object {
   // Extract TITLE tag via shared tolerant parser (handles <<TITLE:xxx>>, <<TITLE:xxx|color>>, HTML-mixed, etc.)
   const { title: extracted, body, color: headerColor } = extractTitleFromText(text || '(空回复)', 30);
@@ -431,7 +432,10 @@ export function buildCompleteCard(
 
   // Tool + thinking panel — collapsible panel at the top, default collapsed
   if (toolCount > 0 || thinkingCount > 0) {
-    let toolPanelTitle = toolCount > 0 ? `✅ ${toolCount} 次工具调用` : `✅ ${thinkingCount} 次思考`;
+    const statusEmoji = aborted ? '⏹' : '✅';
+    let toolPanelTitle = aborted
+      ? (toolCount > 0 ? `${statusEmoji} 已暂停 · ${toolCount} 次工具调用` : `${statusEmoji} 已暂停 · ${thinkingCount} 次思考`)
+      : (toolCount > 0 ? `${statusEmoji} ${toolCount} 次工具调用` : `${statusEmoji} ${thinkingCount} 次思考`);
     if (toolCount > 0 && thinkingCount > 0) toolPanelTitle += ` · ${thinkingCount} 次思考`;
     if (elapsed) toolPanelTitle += ` · ${formatDuration(elapsed)}`;
     elements.push({
@@ -466,7 +470,7 @@ export function buildCompleteCard(
   // Footer — status + metrics
   elements.push({ tag: 'hr' });
   const footerParts: string[] = [];
-  footerParts.push(elapsed ? `✅ ${formatDuration(elapsed)}` : '✅');
+  footerParts.push(elapsed ? `${aborted ? '⏹' : '✅'} ${formatDuration(elapsed)}` : (aborted ? '⏹' : '✅'));
   if (toolCalls && toolCalls.length > 0) {
     footerParts.push(`${toolCalls.length} 工具调用`);
   }

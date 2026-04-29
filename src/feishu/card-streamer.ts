@@ -67,6 +67,13 @@ export class CardStreamer {
   // Shared cache for button card state (set by caller)
   buttonCardCache?: Map<string, { cardJson: object; sequence: number; expiresAt: number }>;
   private completed = false;
+  private aborted = false;
+
+  /** Mark this stream as aborted (e.g. /stop). Affects emoji/labels in the
+   *  finalized card so the user can tell the run was paused, not finished. */
+  markAborted(): void {
+    this.aborted = true;
+  }
   // Latest usage snapshot pushed from the stream parser — surfaced in the live footer.
   private liveUsage?: UsageInfo;
 
@@ -404,6 +411,7 @@ export class CardStreamer {
         this.messageId || undefined,
         usage,
         this.thinkingEntries.length > 0 ? this.thinkingEntries : undefined,
+        this.aborted,
       );
 
       // Cache card state for button click updates

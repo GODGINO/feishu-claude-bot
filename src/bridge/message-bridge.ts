@@ -1086,6 +1086,14 @@ export class MessageBridge {
     streamer.chatId = chatId;
     streamer.buttonCardCache = this.buttonCardCache;
 
+    // If /stop fires the abort signal mid-stream, flag the streamer so the
+    // finalized card uses ⏹ "已暂停" instead of ✅.
+    if (abortSignal) {
+      const onAbort = () => streamer.markAborted();
+      if (abortSignal.aborted) onAbort();
+      else abortSignal.addEventListener('abort', onAbort, { once: true });
+    }
+
     let cardCreated = false;
     let cardCreating = false;
     let bufferedText = '';
