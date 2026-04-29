@@ -4,7 +4,6 @@ import type { IncomingMessage } from '../feishu/event-handler.js';
 import type { MessageSender } from '../feishu/message-sender.js';
 import type { TypingIndicator } from '../feishu/typing.js';
 import type { ClaudeRunner, ImageAttachment } from '../claude/runner.js';
-import { ProcessPool } from '../claude/process-pool.js';
 import type { LiveUsage } from '../claude/stream-parser.js';
 import { SessionManager } from '../claude/session-manager.js';
 import type { Config } from '../config.js';
@@ -43,8 +42,6 @@ function getFeishuMcpHint(sessionDir: string, userId: string): string {
 export class MessageBridge {
   private runningTasks = new Set<string>();
   private abortControllers = new Map<string, AbortController>();
-  // Track background tasks for progress reporting (user can ask about status)
-  private backgroundSessions = new Map<string, { chatId: string; messageId: string; startedAt: number; recentTools: { desc: string; time: number }[] }>();
   // Cache finalized card state for button click updates (cardId → card data)
   private buttonCardCache = new Map<string, { cardJson: object; sequence: number; expiresAt: number }>();
   // Pending button actions queued while session is busy
@@ -94,16 +91,6 @@ export class MessageBridge {
         if (entry.expiresAt < now) this.buttonCardCache.delete(id);
       }
     }, 60 * 60 * 1000).unref();
-
-    // Accumulate progress events for background tasks (user can query status)
-    this.runner.onProgress((sessionKey, toolName) => {
-      const bg = this.backgroundSessions.get(sessionKey);
-      if (!bg) return;
-      const desc = ProcessPool.describeToolUse(toolName);
-      bg.recentTools.push({ desc, time: Date.now() });
-      // Keep only last 20 events to avoid unbounded growth
-      if (bg.recentTools.length > 20) bg.recentTools.shift();
-    });
 
     // Handle unsolicited output from background agents
     this.runner.onUnsolicitedResult(async (sessionKey, result) => {
@@ -392,7 +379,7 @@ export class MessageBridge {
       if (handled) return;
     }
 
-    // Check if session is busy — queue message and optionally reply with progress
+    // Check if session is busy — silently queue message (FIFO, processed when current task ends)
     if (this.runningTasks.has(sessionKey)) {
       const queued = this.queue.enqueue(sessionKey, msg);
       if (queued) {
@@ -400,16 +387,6 @@ export class MessageBridge {
           { sessionKey, isMentioned: msg.isMentioned, queueSize: this.queue.queueSize(sessionKey) },
           'Message queued (session busy)',
         );
-        // Reply with progress status if background task is tracked
-        if (msg.isMentioned || msg.chatType === 'p2p') {
-          const bg = this.backgroundSessions.get(sessionKey);
-          if (bg) {
-            const elapsed = Math.round((Date.now() - bg.startedAt) / 1000);
-            const progressMsg = this.formatProgress(bg.recentTools, elapsed);
-            this.logger.info({ sessionKey, elapsed, toolCount: bg.recentTools.length }, 'Sending progress reply');
-            await this.sender.sendText(msg.chatId, progressMsg, bg.messageId);
-          }
-        }
       } else {
         // Queue full — still record non-@mention in context buffer
         if (!msg.isMentioned && msg.chatType === 'group') {
@@ -1279,34 +1256,6 @@ export class MessageBridge {
     } catch (err) {
       this.logger.warn({ err }, 'Failed to send mentioned files');
     }
-  }
-
-  /**
-   * Format progress info for user query about background task status.
-   */
-  private formatProgress(recentTools: { desc: string; time: number }[], elapsedSec: number): string {
-    const mins = Math.floor(elapsedSec / 60);
-    const secs = elapsedSec % 60;
-    const timeStr = mins > 0 ? `${mins}分${secs}秒` : `${secs}秒`;
-
-    if (recentTools.length === 0) {
-      return `⏳ 任务正在处理中（已运行 ${timeStr}），完成后会自动回复你。你的新消息已排队，会在当前任务完成后处理。`;
-    }
-
-    // Deduplicate consecutive same descriptions
-    const steps: string[] = [];
-    let lastDesc = '';
-    for (const t of recentTools) {
-      if (t.desc !== lastDesc) {
-        steps.push(t.desc);
-        lastDesc = t.desc;
-      }
-    }
-
-    const latestDesc = steps[steps.length - 1];
-    const stepsStr = steps.length > 1 ? `已完成: ${steps.slice(0, -1).join(' → ')}\n当前: ${latestDesc}` : `当前: ${latestDesc}`;
-
-    return `⏳ 任务正在处理中（已运行 ${timeStr}）\n${stepsStr}\n\n完成后会自动回复。你的新消息已排队。`;
   }
 
   private async processQueue(sessionKey: string): Promise<void> {
