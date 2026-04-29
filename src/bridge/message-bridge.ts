@@ -489,8 +489,11 @@ export class MessageBridge {
     const existingRootId = msg.threadId ? msg.rootId : undefined;
     let threadRootId: string | undefined = existingRootId;
 
-    // Start typing indicator (THINKING emoji for non-@mention, normal for @mention)
-    const reactionId = await this.typing.start(msg.messageId, isNonMentionGroup ? 'THINKING' : undefined);
+    // Start typing indicator (THINKING for non-@mention, MeMeMe for @mention).
+    // Mutable: when a non-@mention group bot decides to reply, we swap
+    // THINKING → MeMeMe (via onWillReply hook below) and the reactionId
+    // changes — finally block stops whatever the latest id is.
+    let reactionId = await this.typing.start(msg.messageId, isNonMentionGroup ? 'THINKING' : undefined);
 
     try {
       // Resolve user name: member profile (already created in handleMessage), then fallback
@@ -626,6 +629,11 @@ export class MessageBridge {
         isNonMentionGroup,
         abortSignal: abortController.signal,
         images,
+        // For non-@mention groups: when bot first writes anything, upgrade
+        // THINKING → MeMeMe (signal "I've decided to insert a reply").
+        onWillReply: isNonMentionGroup
+          ? async () => { reactionId = await this.typing.swap(msg.messageId, reactionId, 'MeMeMe'); }
+          : undefined,
       });
 
 
@@ -1060,8 +1068,12 @@ export class MessageBridge {
     abortSignal?: AbortSignal;
     images?: ImageAttachment[];
     isCronJob?: boolean;
+    /** Fire-once hook: invoked the moment the bot first writes anything
+     *  visible in Feishu (streaming card sent OR plain-text reply about
+     *  to be sent). Used to upgrade THINKING → MeMeMe in non-@ groups. */
+    onWillReply?: () => Promise<void> | void;
   }): Promise<void> {
-    const { sessionKey, chatId, prompt, sessionDir, replyToMessageId, existingRootId, isNonMentionGroup, abortSignal, images, isCronJob } = opts;
+    const { sessionKey, chatId, prompt, sessionDir, replyToMessageId, existingRootId, isNonMentionGroup, abortSignal, images, isCronJob, onWillReply } = opts;
 
     this.logger.info({ sessionKey, isNonMentionGroup, isCronJob }, 'Entering reply pipeline');
 
@@ -1092,6 +1104,21 @@ export class MessageBridge {
       const onAbort = () => streamer.markAborted();
       if (abortSignal.aborted) onAbort();
       else abortSignal.addEventListener('abort', onAbort, { once: true });
+    }
+
+    // First-visible-output hook (THINKING → MeMeMe in non-@ groups). Streaming
+    // path fires when the card IM message is delivered; plain-text path fires
+    // just before sendReply below. Fire-once, so wrap with a guard.
+    let willReplyFired = false;
+    const fireWillReply = async () => {
+      if (willReplyFired || !onWillReply) return;
+      willReplyFired = true;
+      try { await onWillReply(); } catch (err) {
+        this.logger.warn({ err, sessionKey }, 'onWillReply hook threw');
+      }
+    };
+    if (onWillReply) {
+      streamer.onCardSent = () => { void fireWillReply(); };
     }
 
     let cardCreated = false;
@@ -1239,6 +1266,7 @@ export class MessageBridge {
       } else if (!cardCreated && !cardCreating && !rawText.includes('<<BUTTON:')) {
         // No card, no buttons — send as plain text
         this.logger.info({ sessionKey, textLen: cleanText.length }, 'No tools used, sending plain text reply');
+        await fireWillReply();
         await this.sender.sendReply(chatId, cleanText || '(空回复)', replyToMessageId, sessionDir, streamRootId);
         await this.sendMentionedFiles(chatId, cleanText, sessionDir, undefined, streamRootId, sessionKey);
         this.runner.onSubagentStream(sessionKey, undefined);

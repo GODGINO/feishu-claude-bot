@@ -66,6 +66,10 @@ export class CardStreamer {
   chatId?: string;
   // Shared cache for button card state (set by caller)
   buttonCardCache?: Map<string, { cardJson: object; sequence: number; expiresAt: number }>;
+  /** Fire-once callback invoked after the card IM message is delivered.
+   *  Used by MessageBridge to upgrade the typing reaction (THINKING → MeMeMe)
+   *  for non-@mention groups, signaling "I've decided to reply". */
+  onCardSent?: () => void;
   private completed = false;
   private aborted = false;
 
@@ -206,6 +210,15 @@ export class CardStreamer {
       }
 
       this.logger.info({ cardId: this.cardId, messageId: this.messageId, wantsThread }, 'Card message sent');
+
+      // First time the card becomes visible to the user — let MessageBridge
+      // upgrade the typing reaction (THINKING → MeMeMe) for non-@mention groups.
+      if (this.messageId && this.onCardSent) {
+        try { this.onCardSent(); } catch (err) {
+          this.logger.warn({ err }, 'onCardSent callback threw');
+        }
+        this.onCardSent = undefined; // fire-once
+      }
     } catch (err: any) {
       this.logger.warn({ err: err?.message, cardId: this.cardId }, 'Failed to send card IM message');
     }

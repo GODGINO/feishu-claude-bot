@@ -35,6 +35,20 @@ export class TypingIndicator {
   }
 
   /**
+   * Swap an existing reaction for a new emoji on the same message.
+   * Returns the NEW reaction id; pass it back to stop() in the finally
+   * block. Order is start-then-stop so the user sees no empty gap
+   * (better than emoji flicker if start were to fail).
+   */
+  async swap(messageId: string, oldReactionId: string | null, newEmoji: string): Promise<string | null> {
+    const newId = await this.start(messageId, newEmoji);
+    if (oldReactionId) {
+      this.stop(messageId, oldReactionId).catch(() => {});
+    }
+    return newId;
+  }
+
+  /**
    * Remove the typing indicator.
    */
   async stop(messageId: string, reactionId: string | null): Promise<void> {
