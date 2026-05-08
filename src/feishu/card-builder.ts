@@ -133,7 +133,7 @@ export function buildStreamingCard(
     footerParts.push('🕙');
   }
   if (toolCount > 0) {
-    footerParts.push(`${toolCount} 工具调用`);
+    footerParts.push(`${toolCount} tools`);
   }
   if (usage) {
     const totalTokens = (usage.inputTokens || 0) + (usage.outputTokens || 0);
@@ -145,9 +145,8 @@ export function buildStreamingCard(
     const promptForCtx = peakPrompt > 0 ? peakPrompt : aggregatePrompt;
     if (promptForCtx > 0) {
       const window = contextWindowOf(usage.model);
-      const windowLabel = window >= 1_000_000 ? '1M' : `${window / 1000}K`;
       const ctxPct = Math.min(100, Math.round((promptForCtx / window) * 100));
-      footerParts.push(`ctx ${ctxPct}% of ${windowLabel}${ctxHint(ctxPct)}`);
+      footerParts.push(`ctx ${ctxPct}%${ctxHint(ctxPct)}`);
     }
     const cacheReadForHit = peakPrompt > 0 ? (usage.peakCallCacheReadTokens || 0) : (usage.cacheReadTokens || 0);
     if (cacheReadForHit > 0 && promptForCtx > 0) {
@@ -461,7 +460,7 @@ export function buildCompleteCard(
   const footerParts: string[] = [];
   footerParts.push(elapsed ? `${aborted ? '⏹' : '✅'} ${formatDuration(elapsed)}` : (aborted ? '⏹' : '✅'));
   if (toolCalls && toolCalls.length > 0) {
-    footerParts.push(`${toolCalls.length} 工具调用`);
+    footerParts.push(`${toolCalls.length} tools`);
   }
   if (usage) {
     const totalTokens = (usage.inputTokens || 0) + (usage.outputTokens || 0);
@@ -475,9 +474,8 @@ export function buildCompleteCard(
     const promptForCtx = peakPrompt > 0 ? peakPrompt : aggregatePrompt;
     if (promptForCtx > 0) {
       const window = contextWindowOf(usage.model);
-      const windowLabel = window >= 1_000_000 ? '1M' : `${window / 1000}K`;
       const ctxPct = Math.min(100, Math.round((promptForCtx / window) * 100));
-      footerParts.push(`ctx ${ctxPct}% of ${windowLabel}${ctxHint(ctxPct)}`);
+      footerParts.push(`ctx ${ctxPct}%${ctxHint(ctxPct)}`);
     }
     // Cache hit% uses the same call's numbers as ctx% for consistency.
     const cacheReadForHit = peakPrompt > 0 ? (usage.peakCallCacheReadTokens || 0) : (usage.cacheReadTokens || 0);

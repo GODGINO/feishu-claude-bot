@@ -129,6 +129,15 @@ class H(BaseHTTPRequestHandler):
                              kwargs={'cooldown_hours': cooldown_hours},
                              daemon=True).start()
             self._ok({'ok': True, 'triggered': email, 'cooldown_hours': cooldown_hours})
+        elif self.path == '/pause':
+            # Touch a flag file; main_loop checks it before each auto-trigger.
+            Path(os.path.expanduser('~/.sigma-switcher/PAUSED')).touch()
+            self._ok({'ok': True, 'paused': True})
+        elif self.path == '/resume':
+            p = Path(os.path.expanduser('~/.sigma-switcher/PAUSED'))
+            if p.exists():
+                p.unlink()
+            self._ok({'ok': True, 'paused': False})
         else:
             self._json(404, {'error': 'not found'})
 

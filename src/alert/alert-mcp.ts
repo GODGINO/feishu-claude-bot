@@ -10,6 +10,61 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as readline from 'node:readline';
+import { execFile } from 'node:child_process';
+
+const DRYRUN_TIMEOUT_MS = 45_000; // create-time validation; alert-runner uses 30s
+
+/**
+ * Run check_command once with the same env that alert-runner.ts uses, so the
+ * "creation succeeded" outcome implies "first poll will succeed" — closing the
+ * gap between "I tested it in my shell" and "it works under PM2 god daemon".
+ *
+ * Returns parsed JSON array on success, or { error } on failure.
+ */
+function dryRunCheckCommand(
+  cmd: string,
+  alertName: string,
+): Promise<{ items: any[]; stderr: string } | { error: string; stderr?: string; exitCode?: number; stdoutPreview?: string }> {
+  return new Promise((resolve) => {
+    const env = {
+      ...process.env,
+      WATERMARK_JSON: JSON.stringify({ last_pubdate: 0, processed_ids: [] }),
+      ALERT_NAME: alertName,
+      ALERT_ID: 'dry-run',
+      SESSION_DIR,
+    };
+    execFile('/bin/bash', ['-c', cmd], {
+      env,
+      cwd: SESSION_DIR,
+      timeout: DRYRUN_TIMEOUT_MS,
+      maxBuffer: 4 * 1024 * 1024,
+    }, (err, stdout, stderr) => {
+      const stderrStr = String(stderr || '');
+      if (err) {
+        const exitCode = (err as any).code ?? 1;
+        resolve({ error: 'check_command exited non-zero', stderr: stderrStr.slice(0, 800), exitCode, stdoutPreview: String(stdout || '').slice(0, 200) });
+        return;
+      }
+      const stdoutStr = String(stdout || '').trim();
+      if (!stdoutStr) {
+        // Empty stdout is *valid* for an alert (means "no events right now"),
+        // so we treat this as success with empty items list.
+        resolve({ items: [], stderr: stderrStr });
+        return;
+      }
+      try {
+        const parsed = JSON.parse(stdoutStr);
+        if (!Array.isArray(parsed)) {
+          resolve({ error: 'stdout must be a JSON array', stdoutPreview: stdoutStr.slice(0, 300) });
+          return;
+        }
+        resolve({ items: parsed, stderr: stderrStr });
+      } catch (e) {
+        resolve({ error: 'stdout is not valid JSON', stdoutPreview: stdoutStr.slice(0, 300) });
+      }
+    });
+  });
+}
 
 const SESSION_DIR = process.env.SESSION_DIR || '';
 if (!SESSION_DIR) {
@@ -39,7 +94,12 @@ interface Alert {
   name: string;
   type: 'one_shot' | 'watcher';
   enabled: boolean;
-  interval_seconds: number;
+  // Two scheduling modes — exactly one must be set:
+  //   interval_seconds : poll every N seconds, around the clock
+  //   schedule         : 5-field cron in `schedule_tz` (default Asia/Shanghai)
+  interval_seconds?: number;
+  schedule?: string;
+  schedule_tz?: string;
   check_command: string;
   prompt: string;
   execution_mode: 'claude' | 'shell' | 'message_only';
@@ -58,8 +118,33 @@ function readAlerts(): Alert[] {
   return [];
 }
 
-function writeAlerts(alerts: Alert[]): void {
-  fs.writeFileSync(ALERTS_FILE, JSON.stringify(alerts, null, 2));
+/**
+ * Write alerts to disk with optional state-merge to avoid races with alert-runner.
+ *
+ * Background: alert-runner persists watermark.processed_ids + stats every poll.
+ * If alert-mcp does plain read-modify-write, it can clobber a freshly-pushed
+ * processed_ids entry (causing the same event to fire twice). We re-read disk
+ * right before writing and, for any matching id, keep disk's `state` field
+ * (which alert-runner is the authoritative writer of).
+ *
+ * resetAlert wants to *overwrite* state — it passes preserveStateOnConflict=false.
+ */
+function writeAlerts(alerts: Alert[], opts: { preserveStateOnConflict?: boolean } = {}): void {
+  const preserve = opts.preserveStateOnConflict !== false; // default true
+  let toWrite: Alert[] = alerts;
+  if (preserve) {
+    const onDisk = readAlerts();
+    toWrite = alerts.map((m) => {
+      const fresh = onDisk.find((d) => d.id === m.id);
+      if (fresh && fresh.state) {
+        // disk's state wins — alert-runner may have updated watermark/stats
+        // since we read; keep our config-field changes (name/schedule/enabled etc).
+        return { ...m, state: fresh.state };
+      }
+      return m;
+    });
+  }
+  fs.writeFileSync(ALERTS_FILE, JSON.stringify(toWrite, null, 2));
 }
 
 function signalChange(): void {
@@ -84,8 +169,11 @@ function listAlerts(): string {
       ? new Date(stats.last_trigger).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })
       : '从未触发';
     const wmSize = (a.state?.watermark?.processed_ids || []).length;
+    const cadence = a.schedule
+      ? `cron: ${a.schedule}${a.schedule_tz && a.schedule_tz !== 'Asia/Shanghai' ? ` (${a.schedule_tz})` : ''}`
+      : `间隔: ${a.interval_seconds}s`;
     lines.push(`**${a.name}** (ID: ${a.id})`);
-    lines.push(`  类型: ${a.type} | 状态: ${status} | 间隔: ${a.interval_seconds}s | 模式: ${a.execution_mode}`);
+    lines.push(`  类型: ${a.type} | 状态: ${status} | ${cadence} | 模式: ${a.execution_mode}`);
     lines.push(`  统计: polls=${stats.polls} triggers=${stats.triggers} failures=${stats.failures} 已处理=${wmSize}`);
     lines.push(`  上次触发: ${lastTrigger}`);
     lines.push(`  prompt: ${a.prompt.slice(0, 150)}${a.prompt.length > 150 ? '...' : ''}`);
@@ -94,33 +182,96 @@ function listAlerts(): string {
   return lines.join('\n');
 }
 
-function createAlert(args: {
+async function createAlert(args: {
   name: string;
   type?: 'one_shot' | 'watcher';
-  interval_seconds: number;
+  interval_seconds?: number;
+  schedule?: string;
+  schedule_tz?: string;
   check_command: string;
   prompt: string;
   execution_mode?: 'claude' | 'shell' | 'message_only';
   trigger_command?: string;
   max_runtime_days?: number;
-}): string {
+  // When true, skip the dry-run check_command validation. Use only if you have
+  // already validated the script in the same env alert-runner uses, or when the
+  // initial poll is intentionally slow (e.g. Selenium warm-up). Default: false.
+  skip_dryrun?: boolean;
+}): Promise<string> {
   if (!args.name) return 'Error: name is required';
   if (!args.check_command) return 'Error: check_command is required';
   if (!args.prompt) return 'Error: prompt is required';
-  if (!args.interval_seconds || args.interval_seconds < 10) return 'Error: interval_seconds must be >= 10';
+
+  const hasInterval = typeof args.interval_seconds === 'number' && args.interval_seconds > 0;
+  const hasSchedule = typeof args.schedule === 'string' && args.schedule.trim().length > 0;
+  if (hasInterval && hasSchedule) {
+    return 'Error: 只能二选一：interval_seconds 或 schedule（cron 表达式）';
+  }
+  if (!hasInterval && !hasSchedule) {
+    return 'Error: 必须提供 interval_seconds 或 schedule（cron 表达式）之一';
+  }
+  if (hasInterval && (args.interval_seconds as number) < 10) {
+    return 'Error: interval_seconds must be >= 10';
+  }
+  if (hasSchedule && args.schedule!.trim().split(/\s+/).length !== 5) {
+    return 'Error: schedule 必须是 5 字段 cron 表达式（分 时 日 月 周），如 "*/10 11-17 * * *"';
+  }
+
+  // Dry-run: execute check_command in the same env alert-runner uses, BEFORE
+  // committing the alert to disk. Catches PATH/dependency/script bugs at
+  // creation time instead of letting them fail silently in the first poll.
+  // Side effect: also auto-establishes the watermark baseline using the items
+  // returned now, so the very first real poll won't trigger the historical flood.
+  let baselineProcessedIds: string[] = [];
+  let baselineLastPubdate = 0;
+  let dryRunReport = '';
+  if (!args.skip_dryrun) {
+    const result = await dryRunCheckCommand(args.check_command, args.name);
+    if ('error' in result) {
+      let msg = `❌ Dry-run 失败：${result.error}`;
+      if (result.exitCode !== undefined) msg += ` (exit ${result.exitCode})`;
+      if (result.stderr) msg += `\n\nstderr 预览：\n${result.stderr}`;
+      if (result.stdoutPreview) msg += `\n\nstdout 预览：\n${result.stdoutPreview}`;
+      msg += `\n\n常见原因：脚本依赖（yt-dlp/python 等）不在 alert-runner 的 PATH、cookie 失效、脚本本身 bug。修脚本后重试，或传 skip_dryrun=true 强制创建（不推荐——你会得到一个 silent-failing alert）。`;
+      return msg;
+    }
+    const items = result.items;
+    // Auto-baseline: pre-fill processed_ids with everything check_command returns
+    // *now* so the first real poll only triggers on items that arrive *after* creation.
+    for (const it of items) {
+      if (it && typeof it.NEW_ID === 'string') baselineProcessedIds.push(it.NEW_ID);
+      if (it && typeof it.NEW_PUBDATE === 'number' && it.NEW_PUBDATE > baselineLastPubdate) {
+        baselineLastPubdate = it.NEW_PUBDATE;
+      }
+    }
+    dryRunReport = `\n\n✅ Dry-run 通过：check_command 输出 ${items.length} 条样例事件。`;
+    if (items.length > 0) {
+      const first = items[0];
+      const hint = first?.NEW_TITLE || first?.NEW_ID || JSON.stringify(first).slice(0, 80);
+      dryRunReport += `\n  样例：${String(hint).slice(0, 100)}\n  Watermark baseline 已自动建立（${baselineProcessedIds.length} 个 ID 标记为已处理，避免首次轮询洪水）。`;
+    } else {
+      dryRunReport += `\n  当前没有事件——下次有新事件时会触发。`;
+    }
+  }
 
   const alert: Alert = {
     id: generateId(),
     name: args.name,
     type: args.type || 'watcher',
     enabled: true,
-    interval_seconds: args.interval_seconds,
+    interval_seconds: hasInterval ? args.interval_seconds : undefined,
+    schedule: hasSchedule ? args.schedule!.trim() : undefined,
+    schedule_tz: hasSchedule ? (args.schedule_tz || 'Asia/Shanghai') : undefined,
     check_command: args.check_command,
     prompt: args.prompt,
     execution_mode: args.execution_mode || 'claude',
     trigger_command: args.trigger_command,
     state: {
-      watermark: { last_pubdate: 0, processed_ids: [], max_processed_size: 200 },
+      watermark: {
+        last_pubdate: baselineLastPubdate,
+        processed_ids: baselineProcessedIds,
+        max_processed_size: 200,
+      },
       stats: { polls: 0, triggers: 0, failures: 0 },
     },
     max_runtime_days: args.max_runtime_days ?? 30,
@@ -132,7 +283,10 @@ function createAlert(args: {
   writeAlerts(alerts);
   signalChange();
 
-  return `Alert 已创建：\n  名称: ${alert.name}\n  ID: ${alert.id}\n  类型: ${alert.type}\n  间隔: ${alert.interval_seconds}秒\n  执行模式: ${alert.execution_mode}\n  check: ${alert.check_command.slice(0, 100)}${alert.check_command.length > 100 ? '...' : ''}\n\nAlert 已上线，将在 ${alert.interval_seconds} 秒后首次轮询。`;
+  const cadenceLabel = hasSchedule
+    ? `调度: cron "${alert.schedule}" (${alert.schedule_tz})`
+    : `间隔: ${alert.interval_seconds}秒`;
+  return `Alert 已创建：\n  名称: ${alert.name}\n  ID: ${alert.id}\n  类型: ${alert.type}\n  ${cadenceLabel}\n  执行模式: ${alert.execution_mode}\n  check: ${alert.check_command.slice(0, 100)}${alert.check_command.length > 100 ? '...' : ''}${dryRunReport}\n\nAlert 已上线。`;
 }
 
 function deleteAlert(args: { id: string }): string {
@@ -166,7 +320,8 @@ function resetAlert(args: { id: string }): string {
     watermark: { last_pubdate: 0, processed_ids: [], max_processed_size: 200 },
     stats: { polls: 0, triggers: 0, failures: 0 },
   };
-  writeAlerts(alerts);
+  // resetAlert *wants* to clobber state — opt out of the preserve-on-conflict default.
+  writeAlerts(alerts, { preserveStateOnConflict: false });
   signalChange();
   return `已重置 Alert "${a.name}" 的 watermark 和统计。下一轮将从当前最新状态重新建立基线。`;
 }
@@ -189,20 +344,23 @@ const TOOLS = [
   },
   {
     name: 'create_alert',
-    description: 'Create a condition-triggered alert. Two types: watcher (持续监听新事件，如 UP 主新视频) | one_shot (一次性条件，触发后自动停). check_command 是 sh 脚本，输出 JSON 数组 [{NEW_ID, NEW_PUBDATE, ...}]; exit 0 + 非空数组 = 触发. prompt 支持 {{NEW_ID}} {{NEW_TITLE}} 等模板替换. execution_mode: claude (启 Claude 子进程跑 prompt) | shell (跑 trigger_command) | message_only (直接发消息).',
+    description: 'Create a condition-triggered alert. Two types: watcher (持续监听新事件) | one_shot (触发后自动停). check_command 是 sh 脚本，exit 0 + 非空 JSON 数组 = 触发. prompt 支持 {{NEW_ID}} 等模板. execution_mode: claude/shell/message_only. **调度二选一**：interval_seconds（每 N 秒轮询，全天）或 schedule（5 字段 cron 表达式，可限定时段/星期，如 "*/10 11-17 * * *" = 每天 11:00-17:50 每 10 分钟）。',
     inputSchema: {
       type: 'object' as const,
       properties: {
         name: { type: 'string', description: 'Alert 名称' },
         type: { type: 'string', enum: ['one_shot', 'watcher'], description: '类型，默认 watcher' },
-        interval_seconds: { type: 'number', description: '轮询间隔（秒），最小 10' },
-        check_command: { type: 'string', description: 'sh 检查脚本（可访问 $WATERMARK_JSON 环境变量），输出 JSON 数组' },
-        prompt: { type: 'string', description: '触发时的 prompt 或消息模板，支持 {{字段}} 替换 check 输出的 NEW_xxx 字段' },
+        interval_seconds: { type: 'number', description: '【调度方式 1】轮询间隔（秒），最小 10。全天候。和 schedule 二选一。' },
+        schedule: { type: 'string', description: '【调度方式 2】5 字段 cron 表达式（分 时 日 月 周）。能表达时段+星期窗口。例：`*/10 11-17 * * *`（每天 11-17 点每 10 分钟）、`*/30 8-22 * * 1-5`（工作日 8-22 点每 30 分钟）、`0 9 * * 1-5`（工作日 9:00）。和 interval_seconds 二选一。' },
+        schedule_tz: { type: 'string', description: 'schedule 的时区，IANA 名称如 Asia/Shanghai（默认）/America/New_York。' },
+        check_command: { type: 'string', description: 'sh 检查脚本（可访问 $WATERMARK_JSON），输出 JSON 数组' },
+        prompt: { type: 'string', description: '触发时的 prompt 或消息模板，支持 {{字段}} 替换' },
         execution_mode: { type: 'string', enum: ['claude', 'shell', 'message_only'], description: '默认 claude' },
         trigger_command: { type: 'string', description: 'execution_mode=shell 时执行的命令' },
         max_runtime_days: { type: 'number', description: 'watcher 自动停用天数（默认 30，0=永不）' },
+        skip_dryrun: { type: 'boolean', description: '默认 false：创建前会用 alert-runner 同款 env 试跑一次 check_command 验证脚本可用 + 自动建立 watermark baseline（避免首次轮询历史洪水）。试跑超时 45s。仅当脚本初次启动慢/有意失败时设 true 跳过——会失去环境一致性保证。' },
       },
-      required: ['name', 'interval_seconds', 'check_command', 'prompt'],
+      required: ['name', 'check_command', 'prompt'],
     },
   },
   {
@@ -234,7 +392,7 @@ const TOOLS = [
   },
 ];
 
-function handleRequest(req: { id: number | string; method: string; params?: any }): any {
+async function handleRequest(req: { id: number | string; method: string; params?: any }): Promise<any> {
   switch (req.method) {
     case 'initialize':
       return {
@@ -249,7 +407,7 @@ function handleRequest(req: { id: number | string; method: string; params?: any 
       let text: string;
       switch (name) {
         case 'list_alerts': text = listAlerts(); break;
-        case 'create_alert': text = createAlert(args || {}); break;
+        case 'create_alert': text = await createAlert(args || {}); break;
         case 'delete_alert': text = deleteAlert(args || {}); break;
         case 'toggle_alert': text = toggleAlert(args || {}); break;
         case 'reset_alert': text = resetAlert(args || {}); break;
@@ -276,7 +434,10 @@ rl.on('line', (line) => {
   let req: any;
   try { req = JSON.parse(line); } catch { return; }
   if (req.id === undefined) return;
-  const result = handleRequest(req);
-  if (result !== null) sendResponse(req.id, result);
-  else sendError(req.id, -32601, `Method not found: ${req.method}`);
+  handleRequest(req).then((result) => {
+    if (result !== null) sendResponse(req.id, result);
+    else sendError(req.id, -32601, `Method not found: ${req.method}`);
+  }).catch((err) => {
+    sendError(req.id, -32603, `Internal error: ${err?.message || String(err)}`);
+  });
 });

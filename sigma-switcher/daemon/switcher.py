@@ -100,6 +100,10 @@ if _missing:
     print(f'        Set via .env or {CFG_PATH}', flush=True)
     sys.exit(1)
 
+# Minimum interval between two switches (anti ping-pong throttle, post user
+# policy that removed 5h/weekly cooldowns). Pure rotation otherwise.
+MIN_SWITCH_INTERVAL_S = 300
+
 STATE_FILE = Path(os.path.expanduser(CFG['paths']['state_file']))
 LOG_FILE = Path(os.path.expanduser(CFG['paths']['log_file']))
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -293,11 +297,19 @@ def pick_next(state):
     accounts = CFG["accounts"]
     n = len(accounts)
     if n == 0: return None
+    # Anti ping-pong throttle: refuse to switch if we already switched
+    # less than MIN_SWITCH_INTERVAL_S ago (replaces the old 5h/weekly
+    # cooldowns; user policy: 3 accounts rotate freely).
+    last_switch = state.get("last_switch_ts", 0)
+    if time.time() - last_switch < MIN_SWITCH_INTERVAL_S:
+        return None
     emails = [a["email"] for a in accounts]
     try: cur_idx = emails.index(state["current"])
     except ValueError: cur_idx = -1
     now = time.time()
-    # Phase 1: first ready-to-use account after current
+    # Phase 1: first ready-to-use account after current.
+    # cooldowns dict is now only populated by MagicLinkExhausted (30min
+    # short-cool for accounts whose magic-link mailbox is broken).
     for step in range(1, n + 1):
         i = (cur_idx + step) % n
         a = accounts[i]
@@ -567,29 +579,17 @@ def triggered_switch(email, cooldown_hours=None):
         state = load_state()
         prev_email = state['current']
         perform_switch(email)
+        # Cooldown writes removed (user policy: pure rotation, no freeze).
+        # cooldown_hours arg accepted for backward compat, used only as a
+        # 'kind' hint in the notify text (weekly vs session).
         cd = cooldown_hours if cooldown_hours is not None else CFG['cooldown_hours']
-        cd = float(cd)
-        weekly = cd >= 24
-        timer_desc = '—'
-        if weekly and prev_email and prev_email != email:
-            # Weekly limit hit on prev — it really is unreachable for ~a week
-            deadline = time.time() + cd * 3600
-            state['cooldowns'][prev_email] = deadline
-            readable = time.strftime('%Y-%m-%d %H:%M', time.localtime(deadline))
-            log(f'  weekly: froze {prev_email} for {cd}h (until {readable})')
-            timer_desc = f'{prev_email} 冻结 {cd}h (until {readable})'
-        elif not weekly:
-            # Session 5h rolling — track when the *new* account was activated
-            deadline = time.time() + cd * 3600
-            state['cooldowns'][email] = deadline
-            readable = time.strftime('%Y-%m-%d %H:%M', time.localtime(deadline))
-            log(f'  session: {email} 5h timer → {readable}')
-            timer_desc = f'{email} 5h 计时器 → {readable}'
+        kind = 'weekly' if float(cd) >= 24 else 'session'
         state['current'] = email
+        state['last_switch_ts'] = time.time()
         state['switch_count'] = state.get('switch_count', 0) + 1
         save_state(state)
         notify(f'✅ manual switch → {email}\n'
-               f'   {timer_desc}\n'
+               f'   prev={prev_email} kind={kind} (no cooldown)\n'
                f'   #{state["switch_count"]}')
         log('━━━ Manual switch complete ━━━')
 
@@ -602,6 +602,7 @@ def main_loop():
     parse_fail_count = 0
     parse_fail_warned = False
     all_cooled_warned = False
+    paused_warned = False
     BACKOFF_START = 3       # after N consecutive failures, start exponential backoff
     BACKOFF_MAX_S = 3600    # cap sleep at 1 hour no matter how many failures
     PARSE_FAIL_WARN_AT = 3  # notify after N consecutive pct=None probes
@@ -659,7 +660,20 @@ def main_loop():
                         parse_fail_count = 0
                         parse_fail_warned = False
                     not_logged_in_warned = False
-                    trigger_lim = effective_trigger((detail or {}).get('limits', []))
+                    # Pause flag — when ~/.sigma-switcher/PAUSED exists, skip auto-trigger entirely.
+                    # POST /pause / /resume to the server toggles this file.
+                    if Path(os.path.expanduser('~/.sigma-switcher/PAUSED')).exists():
+                        if not paused_warned:
+                            log('  ⏸ switcher paused — auto-trigger disabled')
+                            notify('⏸ switcher paused — 不再自动切换 (POST /resume 解除)')
+                            paused_warned = True
+                        trigger_lim = None
+                    else:
+                        if paused_warned:
+                            log('  ▶️ switcher resumed — auto-trigger re-enabled')
+                            notify('▶️ switcher resumed — 自动切换已恢复')
+                            paused_warned = False
+                        trigger_lim = effective_trigger((detail or {}).get('limits', []))
                     if trigger_lim:
                         trigger = trigger_lim.get('label', '?')
                         trigger_pct = trigger_lim.get('pct_int', 0)
@@ -679,13 +693,10 @@ def main_loop():
                         readable = time.strftime('%Y-%m-%d %H:%M', time.localtime(deadline))
                         kind = 'weekly' if weekly else 'session'
                         log(f'  ⚠️ trigger — {trigger} at {trigger_pct}% → {kind} cooldown {cd_hours_actual:.1f}h (until {readable}, source: {reset_source})')
-                        # cooldowns[X] = deadline before which X must not be re-activated.
-                        # Weekly: freeze the just-saturated current — it really is gone for ~a week.
-                        # Session: freeze the *new* account once we know who it is (below) — the
-                        # 5h rolling window belongs to whoever just started using it. The previous
-                        # current is already in its own cooldown from when *it* was last activated.
-                        if weekly:
-                            state['cooldowns'][state['current']] = deadline
+                        # Cooldown writes removed (user policy: pure rotation, no freeze).
+                        # `weekly` and `deadline` are still computed above for log/notify use,
+                        # but we no longer persist a deadline that would block re-activation.
+                        # Anti ping-pong is handled by MIN_SWITCH_INTERVAL_S in pick_next.
                         # Try accounts in pick_next order; if a candidate's magic-link
                         # delivery exhausts retries (forwarding broken for that mailbox),
                         # short-cool it for 30 min and immediately try the next candidate.
@@ -714,16 +725,11 @@ def main_loop():
                             all_cooled_warned = False
                             prev_email = state['current']
                             state['current'] = switched_to['email']
-                            # Session 5h: timer belongs to the new account (the 5h rolling
-                            # window starts when *it* begins serving requests).
-                            if not weekly:
-                                state['cooldowns'][switched_to['email']] = deadline
+                            # Session/weekly cooldown writes removed (user policy: pure rotation).
+                            state['last_switch_ts'] = time.time()
                             state['switch_count'] = state.get('switch_count', 0) + 1
                             save_state(state)
-                            if weekly:
-                                timer_line = f'   {prev_email} 冻结 {cd_hours_actual:.1f}h ({kind}) until {readable}'
-                            else:
-                                timer_line = f'   {switched_to["email"]} 5h 计时器 → {readable}'
+                            timer_line = f'   kind={kind} (no cooldown — pure rotation)'
                             notify(f'✅ switched → {state["current"]}\n'
                                    f'   trigger: {trigger} {trigger_pct}%\n'
                                    f'{timer_line}\n'
@@ -738,11 +744,17 @@ def main_loop():
                             # candidate exhausted magic-link retries). Persist current's cooldown
                             # and sleep until the earliest non-current wake.
                             save_state(state)
-                            non_cur_deadlines = [state["cooldowns"].get(a["email"], 0)
-                                                 for a in CFG["accounts"]
-                                                 if a["email"] != state["current"]]
-                            if non_cur_deadlines:
-                                earliest = min(non_cur_deadlines)
+                            # Only consider real (non-zero) cooldowns — under user policy
+                            # we no longer write 5h/weekly deadlines, so this list is
+                            # typically empty. The remaining cause of pick_next() returning
+                            # None is the MIN_SWITCH_INTERVAL_S throttle (or MagicLinkExhausted
+                            # short-cool, which does write a real deadline).
+                            real_deadlines = [d for d in (state["cooldowns"].get(a["email"], 0)
+                                                          for a in CFG["accounts"]
+                                                          if a["email"] != state["current"])
+                                              if d > time.time()]
+                            if real_deadlines:
+                                earliest = min(real_deadlines)
                                 wait_sec = max(60, int(earliest - time.time()) + 60)
                                 readable_w = time.strftime('%Y-%m-%d %H:%M', time.localtime(earliest))
                                 sleep_override = (wait_sec, f'all-cooled until {readable_w}')
@@ -751,11 +763,16 @@ def main_loop():
                                            f'(trigger: {trigger} {trigger_pct}%, kind={kind})\n'
                                            f'   sleeping until earliest wake at {readable_w}')
                                     all_cooled_warned = True
-                            else:
+                            elif len(CFG["accounts"]) <= 1:
                                 if not all_cooled_warned:
                                     notify(f'⚠️ only one account configured — cannot rotate '
                                            f'(trigger: {trigger} {trigger_pct}%)')
                                     all_cooled_warned = True
+                            else:
+                                # No real deadlines — pick_next was throttled by
+                                # MIN_SWITCH_INTERVAL_S. Just sleep a short interval
+                                # and retry; throttle will expire naturally.
+                                sleep_override = (60, f'switch throttled (recent switch < {MIN_SWITCH_INTERVAL_S}s ago)')
             except Exception as e:
                 iteration_ok = False
                 log(f'main loop error: {e}')

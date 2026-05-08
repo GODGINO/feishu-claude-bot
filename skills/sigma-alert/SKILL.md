@@ -75,19 +75,59 @@ WATERMARK_JSON='{"last_pubdate": 0, "processed_ids": []}' bash .claude/skills/si
 
 ### Step 4: 调 mcp__alert__create_alert
 
+**关于自动 dry-run（重要）：** `mcp__alert__create_alert` 默认会**用 alert-runner 同款 env**（继承 bot daemon 的 PATH，即 PM2 god daemon 的 PATH）跑一次 check_command 验证脚本能用 + 自动建立 watermark baseline。
+
+- ✅ 通过：alert 上线，返回里会写 "Dry-run 通过：N 条样例事件 + 样例标题 + watermark baseline 已建立"
+- ❌ 失败：alert **不会创建**，返回 stderr/stdout 预览。常见原因：脚本依赖（yt-dlp/python 等）不在 alert-runner 的 PATH、cookie 失效。**不要急着加 `skip_dryrun=true` 跳过**——先修脚本（在脚本顶部加 `export PATH=$HOME/homebrew/bin:...:$PATH` 兜底）
+
+如果脚本初次启动很慢（比如 selenium warm-up 几十秒）或者你**确实知道**首次跑会失败但后续会好，再传 `skip_dryrun=true`。否则一律让 dry-run 把关。
+
 用户点确认后调：
 
 ```python
 mcp__alert__create_alert(
     name="盯熊哥新视频",                 # 简短中文，方便用户认
     type="watcher",                       # 持续监听
-    interval_seconds=300,                 # 默认 5 分钟，重要场景可用 60，宽松场景可用 1800
+    # 调度二选一：interval_seconds（全天每 N 秒）或 schedule（cron 表达式，可限时段/星期）
+    schedule="*/10 9-23 * * *",           # 每天 9-23 点每 10 分钟（夜间不浪费 RPS）
+    schedule_tz="Asia/Shanghai",          # 默认就是这个，可省
+    # 或者：interval_seconds=300,         # 简单全天模式（不能限时段）
     check_command="bash .claude/skills/sigma-alert/scripts/watchers/check_bili_uploader.sh 3493270623619373",
     prompt="🎬 熊哥新视频出炉！\n标题：{{NEW_TITLE}}\n链接：{{NEW_URL}}\n发布时间：{{NEW_PUBDATE}}\n\n执行 bili-transcribe.sh 拿转写，给我 3 句话核心观点。",
     execution_mode="claude",              # claude / shell / message_only 三选一（见下方决策表）
     max_runtime_days=30,                  # 默认 30 天自动停（防遗忘）
 )
 ```
+
+### 调度模式选哪个？（决策树）
+
+> **核心原则**：能用 `schedule` 就别用 `interval_seconds`。原因：cron 表达式在死时段不产生 fire，省 b 站/外部 API RPS 暴露面，也不浪费 yt-dlp 调用。
+
+| 用户语义 | 用什么 | 例子 |
+|---|---|---|
+| "盯 XX，每 10 分钟" | 没说时间窗口的话先**反问**："白天就够了吗？还是夜间也要？" | — |
+| "工作日 8-22 点每 30 分钟" | `schedule` | `"*/30 8-22 * * 1-5"` |
+| "每天 9-23 点每 10 分钟" | `schedule` | `"*/10 9-23 * * *"` |
+| "工作日早上 9 点" | `schedule` | `"0 9 * * 1-5"` |
+| "每两小时" | `schedule` 或 `interval_seconds=7200` | `"0 */2 * * *"` |
+| "BTC 跌破 X 通知"（24h 都要监控） | `interval_seconds` | `60` 或 `300` |
+| "每天 6:00 体检报告" | 这是定时任务，**走 cron MCP 不走 alert** | — |
+
+cron 表达式速查（5 字段：分 时 日 月 周）：
+- `*/N` 每 N 个单位
+- `A-B` 范围
+- `A,B,C` 列表
+- `*` 任意
+- 周：0=周日, 1=周一, ..., 6=周六
+
+**A 股市场场景的常用 schedule**：
+
+| 场景 | schedule |
+|---|---|
+| 跟盘期间盯 UP 主 | `*/10 9-15 * * 1-5`（工作日 9-15:50 每 10 分钟）|
+| 全天盯，工作日加密 | 不支持，建两个 alert 或用 `*/10 9-23 * * *` 折中 |
+| A 股开盘前后摘要 | `*/15 9-15 * * 1-5` |
+| 盘后 + 晚间复盘 | `*/15 15-22 * * 1-5` |
 
 ### Step 5: 告知用户已创建
 

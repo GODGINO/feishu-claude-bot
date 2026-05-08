@@ -27,7 +27,7 @@ SWITCHER_PYTHON="$SWITCHER_DIR/venv/bin/python3"
 SWITCHER_SCRIPT="$SWITCHER_DIR/switcher.py"
 SWITCHER_CONFIG="$SWITCHER_DIR/config.yaml"
 SWITCHER_PID_FILE="$PROJECT_DIR/.switcher.pid"
-export PATH="$(dirname "$(which node)"):$HOME/.local/bin:$HOME/.bun/bin:$PATH"
+export PATH="$(dirname "$(which node)"):$HOME/homebrew/bin:$HOME/.local/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 pm2_cmd() {
   npx pm2 "$@" 2>/dev/null

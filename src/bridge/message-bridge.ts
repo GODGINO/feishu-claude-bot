@@ -234,7 +234,7 @@ export class MessageBridge {
         senderName: 'Sigma',
         senderId: 'bot',
         text: '(Send as Sigma)',
-        botReply: text.length > 500 ? text.slice(0, 500) + '...' : text,
+        botReply: text.length > 50000 ? text.slice(0, 50000) + '...[truncated]' : text,
       });
       this.groupContext.save(session.sessionDir, chatId);
     }
@@ -563,7 +563,13 @@ export class MessageBridge {
 
       // Add quoted message context if present
       if (msg.parentId) {
-        const quotedText = await this.sender.fetchMessageText(msg.parentId);
+        // First check local group-context: bot-sent cards return only a fallback
+        // string ("请升级至最新版本客户端") via IM get_message, so look up the
+        // original markdown by message_id from our own buffer.
+        let quotedText: string | null | undefined = this.groupContext.lookupBotReply(msg.chatId, msg.parentId);
+        if (!quotedText) {
+          quotedText = await this.sender.fetchMessageText(msg.parentId);
+        }
         if (quotedText) {
           prompt = `[用户引用了一条消息]\n引用内容: "${quotedText}"\n\n${prompt}`;
         }
@@ -663,10 +669,11 @@ export class MessageBridge {
     threadRootId?: string,
   ): Promise<void> {
     const replyText = result.fullText || '(空回复)';
+    let sentMsgId: string | null = null;
     if (result.error && !result.fullText) {
       await this.sender.sendReply(msg.chatId, `❌ 出错了: ${result.error}`, undefined, undefined, threadRootId);
     } else {
-      await this.sender.sendReply(msg.chatId, replyText, undefined, session.sessionDir, threadRootId);
+      sentMsgId = await this.sender.sendReply(msg.chatId, replyText, undefined, session.sessionDir, threadRootId);
       await this.sendMentionedFiles(msg.chatId, replyText, session.sessionDir, undefined, threadRootId, sessionKey);
     }
 
@@ -674,8 +681,11 @@ export class MessageBridge {
     if (msg.chatType === 'group' || msg.chatType === 'p2p') {
       const entries = this.groupContext['buffers'].get(msg.chatId);
       if (entries && entries.length > 0) {
-        entries[entries.length - 1].botReply = replyText.length > 500
-          ? replyText.slice(0, 500) + '...' : replyText;
+        entries[entries.length - 1].botReply = replyText.length > 50000
+          ? replyText.slice(0, 50000) + '...[truncated]' : replyText;
+      }
+      if (sentMsgId) {
+        this.groupContext.setLastBotReplyMessageId(msg.chatId, sentMsgId);
       }
       this.groupContext.save(session.sessionDir, msg.chatId);
     }
@@ -1214,6 +1224,7 @@ export class MessageBridge {
       const replyText = rawText.replace(/<{1,2}\s*THREAD\s*>{1,2}\s*/gi, '').trim();
       const streamRootId = existingRootId;
       const cleanText = replyText;
+      let plainTextSentMsgId: string | null = null;
 
       if (isNoReply(replyText) || (!cardCreated && !cardCreating && isNonMentionGroup && !replyText) || (!cardCreated && !cardCreating && !replyText)) {
         // NO_REPLY or empty text without card — finalize card if it was already created
@@ -1267,7 +1278,7 @@ export class MessageBridge {
         // No card, no buttons — send as plain text
         this.logger.info({ sessionKey, textLen: cleanText.length }, 'No tools used, sending plain text reply');
         await fireWillReply();
-        await this.sender.sendReply(chatId, cleanText || '(空回复)', replyToMessageId, sessionDir, streamRootId);
+        plainTextSentMsgId = await this.sender.sendReply(chatId, cleanText || '(空回复)', replyToMessageId, sessionDir, streamRootId);
         await this.sendMentionedFiles(chatId, cleanText, sessionDir, undefined, streamRootId, sessionKey);
         this.runner.onSubagentStream(sessionKey, undefined);
       } else {
@@ -1299,17 +1310,27 @@ export class MessageBridge {
           this.groupContext.load(sessionDir, chatId);
         }
         const entries = this.groupContext['buffers'].get(chatId);
+        const cappedReply = cleanReply.length > 50000
+          ? cleanReply.slice(0, 50000) + '...[truncated]' : cleanReply;
         if (isCronJob) {
           // Cron: add as new context entry
           this.groupContext.add(chatId, {
             timestamp: Date.now(),
             senderName: `⏰ 定时任务`,
             text: prompt,
-            botReply: cleanReply.length > 500 ? cleanReply.slice(0, 500) + '...' : cleanReply,
+            botReply: cappedReply,
           });
         } else if (entries && entries.length > 0) {
-          entries[entries.length - 1].botReply = cleanReply.length > 500
-            ? cleanReply.slice(0, 500) + '...' : cleanReply;
+          entries[entries.length - 1].botReply = cappedReply;
+        }
+        // Capture the Feishu message_id of whatever was actually sent — card or
+        // plain text — so future `引用` of this reply can be reverse-looked-up.
+        // Card creation can race; getMessageId() may be null if streamer.start
+        // hadn't completed yet, in which case we just skip the index update.
+        const cardMsgId = cardCreated ? streamer.getMessageId() : null;
+        const sentMsgId = cardMsgId || plainTextSentMsgId;
+        if (sentMsgId) {
+          this.groupContext.setLastBotReplyMessageId(chatId, sentMsgId);
         }
         this.groupContext.save(sessionDir, chatId);
       }

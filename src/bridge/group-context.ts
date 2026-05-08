@@ -11,6 +11,10 @@ export interface ContextEntry {
   senderId?: string;
   text: string;
   botReply?: string;
+  /** Feishu message_id of the bot's reply (card or text). Used to look up the
+   *  original markdown when the user later @-replies/quotes a card the bot sent —
+   *  IM `get_message` returns only a fallback string for cards. */
+  botReplyMessageId?: string;
 }
 
 export class GroupContextBuffer {
@@ -92,6 +96,34 @@ export class GroupContextBuffer {
       }
     }
     return lines.join('\n');
+  }
+
+  /**
+   * Look up the original bot reply text for a given Feishu message_id.
+   * Returns the `botReply` of the entry whose `botReplyMessageId === messageId`,
+   * or undefined if no match is found.
+   */
+  lookupBotReply(chatId: string, messageId: string): string | undefined {
+    const entries = this.buffers.get(chatId);
+    if (!entries || entries.length === 0) return undefined;
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const e = entries[i];
+      if (e.botReplyMessageId === messageId) return e.botReply;
+    }
+    return undefined;
+  }
+
+  /**
+   * Set `botReplyMessageId` on the LAST entry of the chat — but only if that
+   * entry already has a `botReply` populated. No-op otherwise (we don't want
+   * to attach a message_id to an entry that has no reply text to look up).
+   */
+  setLastBotReplyMessageId(chatId: string, messageId: string): void {
+    const entries = this.buffers.get(chatId);
+    if (!entries || entries.length === 0) return;
+    const last = entries[entries.length - 1];
+    if (!last.botReply) return;
+    last.botReplyMessageId = messageId;
   }
 
   /**
