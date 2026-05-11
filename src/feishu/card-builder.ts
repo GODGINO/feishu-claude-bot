@@ -334,6 +334,347 @@ export function extractButtons(text: string): { cleanText: string; buttons: Butt
   return { cleanText, buttons };
 }
 
+/** Single SELECT field — parsed from `<<SELECT:placeholder|name|key1=label1|key2=label2|...>>`. */
+export interface SelectInfo {
+  placeholder: string;
+  name: string;
+  options: Array<{ key: string; label: string }>;
+}
+
+/**
+ * Extract <<SELECT:placeholder|name|key1=label1|key2=label2|...>> tags from text.
+ * Each tag becomes one dropdown field in the rendered form.
+ *
+ * Tolerance (mirrors BUTTON's robustness):
+ *   - Single-edge brackets: `<SELECT...>` accepted (LLM occasionally drops one)
+ *   - Half/full-width separators: `:` or `：`, `|` or `｜`, `=` or `＝`
+ *   - Whitespace between any tokens
+ *   - Case-insensitive `SELECT`/`select`/`Select`
+ *   - Duplicate `name` fields are de-duplicated (keeps first, drops rest)
+ */
+export function extractSelects(text: string): { cleanText: string; selects: SelectInfo[] } {
+  const selects: SelectInfo[] = [];
+  const seenNames = new Set<string>();
+  // Half- and full-width separator tolerance — full-width `：｜＝` are common when
+  // user IME mode is Chinese punctuation. Splitting on the character class
+  // [|｜] handles either separator without preprocessing.
+  const cleanText = text.replace(/<{1,2}\s*SELECT\s*[:：]\s*([^>]+?)\s*>{1,2}\s*/gi, (_, body) => {
+    const parts = String(body)
+      .split(/[|｜]/)
+      .map((p: string) => p.trim())
+      .filter((p: string) => p.length > 0);
+    if (parts.length < 3) return ''; // need at least placeholder|name|option1
+    const placeholder = parts[0];
+    const name = parts[1];
+    // Skip duplicate names (same field declared twice → form submit collision)
+    if (seenNames.has(name)) return '';
+    const options: Array<{ key: string; label: string }> = [];
+    for (const opt of parts.slice(2)) {
+      // Accept `=` or `＝` (full-width)
+      const eq = opt.search(/[=＝]/);
+      if (eq > 0) {
+        options.push({ key: opt.slice(0, eq).trim(), label: opt.slice(eq + 1).trim() });
+      } else {
+        // No `=` → reuse the literal as both key and label
+        options.push({ key: opt, label: opt });
+      }
+    }
+    if (options.length === 0) return '';
+    seenNames.add(name);
+    selects.push({ placeholder, name, options });
+    return '';
+  }).trim();
+  return { cleanText, selects };
+}
+
+/** Single MSELECT (multi-select) field — same shape as SelectInfo, rendered as `multi_select_static`. */
+export interface MultiSelectInfo extends SelectInfo {}
+
+/** Parsed <<IMG:url|alt?>> tag — `url` is either https or a local absolute path. */
+export interface ImageInfo {
+  url: string;
+  alt?: string;
+}
+
+/** Ordered fragment of the reply body — alternating text, image, and form-field markers. */
+export type ContentSegment =
+  | { kind: 'text'; content: string }
+  | { kind: 'image'; index: number }
+  | { kind: 'select'; index: number }
+  | { kind: 'mselect'; index: number };
+
+/**
+ * Parse <<IMG:url|alt?>> tags in body text. Returns three views of the same content:
+ *   - `images`: raw IMG references in order (caller uploads them and gets image_keys)
+ *   - `segments`: text/image fragments preserving the *position* of each image so the
+ *     renderer can interleave markdown blocks with img elements (inline rendering)
+ *   - `cleanText`: text with IMG tags removed (used by callers that only want plain text)
+ *
+ * Tolerance mirrors BUTTON/SELECT: half/full-width separators, single brackets, case-insensitive.
+ */
+export function parseImages(text: string): { images: ImageInfo[]; segments: ContentSegment[]; cleanText: string } {
+  const images: ImageInfo[] = [];
+  const segments: ContentSegment[] = [];
+  let cleanText = '';
+  let lastEnd = 0;
+  const re = /<{1,2}\s*IMG\s*[:：]\s*([^>]+?)\s*>{1,2}\s*/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    const before = text.slice(lastEnd, m.index);
+    if (before.length > 0) {
+      segments.push({ kind: 'text', content: before });
+      cleanText += before;
+    }
+    const parts = String(m[1]).split(/[|｜]/).map((p: string) => p.trim()).filter((p: string) => p.length > 0);
+    if (parts.length > 0) {
+      const url = parts[0];
+      const alt = parts[1];
+      const index = images.length;
+      images.push({ url, alt });
+      segments.push({ kind: 'image', index });
+    }
+    lastEnd = m.index + m[0].length;
+  }
+  const tail = text.slice(lastEnd);
+  if (tail.length > 0) {
+    segments.push({ kind: 'text', content: tail });
+    cleanText += tail;
+  }
+  cleanText = cleanText.trim();
+  return { images, segments, cleanText };
+}
+
+/**
+ * Backward-compatible wrapper — same shape as before. New callers should use
+ * `parseImages` to get position-aware segments.
+ */
+export function extractImages(text: string): { cleanText: string; images: ImageInfo[] } {
+  const r = parseImages(text);
+  return { cleanText: r.cleanText, images: r.images };
+}
+
+/**
+ * Unified position-aware parser for IMG, SELECT, and MSELECT tags. Walks the text
+ * once and emits an ordered `segments` list plus the raw lists per tag type:
+ *   - `images` for `<<IMG:url|alt?>>`
+ *   - `selects` for `<<SELECT:placeholder|name|key=label|...>>`
+ *   - `multiSelects` for `<<MSELECT:...>>`
+ *
+ * Names are deduplicated across SELECT and MSELECT (they share the same form_value
+ * keyspace, so a clash would silently overwrite). First wins, later dupes are dropped.
+ */
+export function parseInteractive(text: string): {
+  segments: ContentSegment[];
+  images: ImageInfo[];
+  selects: SelectInfo[];
+  multiSelects: MultiSelectInfo[];
+  cleanText: string;
+} {
+  const segments: ContentSegment[] = [];
+  const images: ImageInfo[] = [];
+  const selects: SelectInfo[] = [];
+  const multiSelects: MultiSelectInfo[] = [];
+  let cleanText = '';
+  let lastEnd = 0;
+  // MSELECT first in alternation — guards against any edge case where the engine
+  // could short-circuit on SELECT inside MSELECT. Tag spelling itself disambiguates,
+  // but order is cheap insurance.
+  const re = /<{1,2}\s*(IMG|MSELECT|SELECT)\s*[:：]\s*([^>]+?)\s*>{1,2}\s*/gi;
+  const seenFieldNames = new Set<string>();
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    const before = text.slice(lastEnd, m.index);
+    if (before.length > 0) {
+      segments.push({ kind: 'text', content: before });
+      cleanText += before;
+    }
+    const tag = m[1].toUpperCase();
+    const parts = String(m[2]).split(/[|｜]/).map((p: string) => p.trim()).filter((p: string) => p.length > 0);
+
+    if (tag === 'IMG') {
+      if (parts.length > 0) {
+        const idx = images.length;
+        images.push({ url: parts[0], alt: parts[1] });
+        segments.push({ kind: 'image', index: idx });
+      }
+    } else {
+      // SELECT or MSELECT — same parsing logic
+      if (parts.length >= 3) {
+        const placeholder = parts[0];
+        const name = parts[1];
+        if (!seenFieldNames.has(name)) {
+          const options: Array<{ key: string; label: string }> = [];
+          for (const opt of parts.slice(2)) {
+            const eq = opt.search(/[=＝]/);
+            if (eq > 0) {
+              options.push({ key: opt.slice(0, eq).trim(), label: opt.slice(eq + 1).trim() });
+            } else {
+              options.push({ key: opt, label: opt });
+            }
+          }
+          if (options.length > 0) {
+            seenFieldNames.add(name);
+            if (tag === 'MSELECT') {
+              const idx = multiSelects.length;
+              multiSelects.push({ placeholder, name, options });
+              segments.push({ kind: 'mselect', index: idx });
+            } else {
+              const idx = selects.length;
+              selects.push({ placeholder, name, options });
+              segments.push({ kind: 'select', index: idx });
+            }
+          }
+        }
+      }
+    }
+    lastEnd = m.index + m[0].length;
+  }
+  const tail = text.slice(lastEnd);
+  if (tail.length > 0) {
+    segments.push({ kind: 'text', content: tail });
+    cleanText += tail;
+  }
+  cleanText = cleanText.trim();
+  return { segments, images, selects, multiSelects, cleanText };
+}
+
+/**
+ * Build Feishu card `img` elements from resolved image_keys. Each entry is an
+ * `{ image_key, alt? }` tuple — caller has already uploaded the source and got
+ * the key back. Entries with no key are rendered as `[图片: <url>]` markdown text
+ * so the user knows the upload failed but the message still goes through.
+ */
+export function buildImageElements(
+  resolved: Array<{ imageKey: string | null; url: string; alt?: string }>,
+): object[] {
+  const out: object[] = [];
+  for (const r of resolved) {
+    if (r.imageKey) {
+      out.push({
+        tag: 'img',
+        img_key: r.imageKey,
+        alt: { tag: 'plain_text', content: r.alt || '' },
+        scale_type: 'crop_center',
+        preview: true,
+      });
+    } else {
+      out.push({
+        tag: 'markdown',
+        content: `_[图片: ${r.url}]_`,
+      });
+    }
+  }
+  return out;
+}
+
+/**
+ * Extract <<MSELECT:placeholder|name|key1=label1|key2=label2|...>> tags from text.
+ * Same syntax as SELECT but rendered as a `multi_select_static` (user can pick multiple options).
+ * Same tolerance rules as extractSelects.
+ */
+export function extractMultiSelects(text: string): { cleanText: string; multiSelects: MultiSelectInfo[] } {
+  const multiSelects: MultiSelectInfo[] = [];
+  const seenNames = new Set<string>();
+  const cleanText = text.replace(/<{1,2}\s*MSELECT\s*[:：]\s*([^>]+?)\s*>{1,2}\s*/gi, (_, body) => {
+    const parts = String(body)
+      .split(/[|｜]/)
+      .map((p: string) => p.trim())
+      .filter((p: string) => p.length > 0);
+    if (parts.length < 3) return '';
+    const placeholder = parts[0];
+    const name = parts[1];
+    if (seenNames.has(name)) return '';
+    const options: Array<{ key: string; label: string }> = [];
+    for (const opt of parts.slice(2)) {
+      const eq = opt.search(/[=＝]/);
+      if (eq > 0) {
+        options.push({ key: opt.slice(0, eq).trim(), label: opt.slice(eq + 1).trim() });
+      } else {
+        options.push({ key: opt, label: opt });
+      }
+    }
+    if (options.length === 0) return '';
+    seenNames.add(name);
+    multiSelects.push({ placeholder, name, options });
+    return '';
+  }).trim();
+  return { cleanText, multiSelects };
+}
+
+/** Submit action id for SELECT-based interactive forms. */
+export const FORM_SUBMIT_ACTION = '__submit_form__';
+
+/** Form name used inside the card (referenced by Feishu form_value payload). */
+export const INTERACTIVE_FORM_NAME = 'interactive_form';
+
+/**
+ * Build a single Feishu `form` element containing N single-select dropdowns
+ * and M multi-select dropdowns, plus a submit button at the end.
+ * Single-selects render before multi-selects to keep the simpler decisions first.
+ * The submit button uses `form_action_type: submit` so Feishu collects all
+ * field values into `event.action.form_value` (string for single, string[] for multi).
+ */
+export function buildSelectFormElement(
+  selects: SelectInfo[],
+  ctx: ButtonContext = {},
+  submitLabel = '提交',
+  multiSelects: MultiSelectInfo[] = [],
+): object | null {
+  if (!selects.length && !multiSelects.length) return null;
+  if (!ctx.sessionKey) return null; // callback buttons need a session to route to
+
+  const formElements: object[] = [];
+
+  for (const sel of selects) {
+    formElements.push({
+      tag: 'select_static',
+      name: sel.name,
+      placeholder: { tag: 'plain_text', content: sel.placeholder },
+      options: sel.options.map((opt) => ({
+        value: opt.key,
+        text: { tag: 'plain_text', content: opt.label },
+      })),
+    });
+  }
+
+  for (const msel of multiSelects) {
+    formElements.push({
+      tag: 'multi_select_static',
+      name: msel.name,
+      placeholder: { tag: 'plain_text', content: msel.placeholder },
+      options: msel.options.map((opt) => ({
+        value: opt.key,
+        text: { tag: 'plain_text', content: opt.label },
+      })),
+    });
+  }
+
+  formElements.push({
+    tag: 'button',
+    text: { tag: 'plain_text', content: submitLabel },
+    type: 'primary',
+    width: 'default',
+    form_action_type: 'submit',
+    behaviors: [{
+      type: 'callback',
+      value: {
+        action: FORM_SUBMIT_ACTION,
+        label: submitLabel,
+        sessionKey: ctx.sessionKey || '',
+        chatId: ctx.chatId || '',
+        cardId: ctx.cardId || '',
+        messageId: ctx.messageId || '',
+      },
+    }],
+  });
+
+  return {
+    tag: 'form',
+    name: INTERACTIVE_FORM_NAME,
+    elements: formElements,
+  };
+}
+
 export interface ButtonContext {
   sessionKey?: string;
   chatId?: string;
@@ -407,6 +748,10 @@ export function buildCompleteCard(
   usage?: UsageInfo,
   thinkingEntries?: ThinkingEntry[],
   aborted?: boolean,
+  selects?: SelectInfo[],
+  multiSelects?: MultiSelectInfo[],
+  images?: Array<{ imageKey: string | null; url: string; alt?: string }>,
+  segments?: ContentSegment[],
 ): object {
   // Extract TITLE tag via shared tolerant parser (handles <<TITLE:xxx>>, <<TITLE:xxx|color>>, HTML-mixed, etc.)
   const { title: extracted, body, color: headerColor } = extractTitleFromText(text || '(空回复)', 30);
@@ -442,14 +787,136 @@ export function buildCompleteCard(
     });
   }
 
-  // Main text content
-  elements.push({
+  // Build helpers for the body — each kind of segment maps to a card element.
+  const buildTextElement = (content: string, withStreamId: boolean): object => ({
     tag: 'markdown',
-    content: displayText,
-    element_id: STREAMING_ELEMENT_ID,
+    content,
+    ...(withStreamId ? { element_id: STREAMING_ELEMENT_ID } : {}),
+  });
+  const buildImageElement = (r: { imageKey: string | null; url: string; alt?: string }): object =>
+    r.imageKey
+      ? { tag: 'img', img_key: r.imageKey, alt: { tag: 'plain_text', content: r.alt || '' }, scale_type: 'crop_center', preview: true }
+      : { tag: 'markdown', content: `_[图片: ${r.url}]_` };
+  // Single-select has no native clear button on Feishu — we prepend a synthetic
+  // `none=不选` option as the first item so the user can "uncheck" a previous choice.
+  // Callbacks treat `value === 'none'` as unselected (see buildFormSubmitPrompt /
+  // updateCardSelectState / empty-form guard in message-bridge.ts).
+  const NONE_KEY = 'none';
+  const NONE_LABEL = '不选';
+  const buildSelectElement = (sel: SelectInfo): object => {
+    const opts: Array<{ key: string; label: string }> = [];
+    // Avoid duplicate if LLM already declared a `none` option.
+    if (!sel.options.some((o) => o.key === NONE_KEY)) {
+      opts.push({ key: NONE_KEY, label: NONE_LABEL });
+    }
+    opts.push(...sel.options);
+    return {
+      tag: 'select_static',
+      name: sel.name,
+      placeholder: { tag: 'plain_text', content: sel.placeholder },
+      // Experimental hidden fields — Feishu silently ignores unknown keys, so these are no-op
+      // on unsupported clients but may enable clearing on supported ones.
+      clearable: true,
+      width: 'fill',
+      options: opts.map((opt) => ({ value: opt.key, text: { tag: 'plain_text', content: opt.label } })),
+    };
+  };
+  const buildMSelectElement = (msel: MultiSelectInfo): object => ({
+    tag: 'multi_select_static',
+    name: msel.name,
+    placeholder: { tag: 'plain_text', content: msel.placeholder },
+    // Experimental hidden fields to try to expand tag display instead of `+N` collapse.
+    clearable: true,
+    width: 'fill',
+    display_lines: 0,
+    options: msel.options.map((opt) => ({ value: opt.key, text: { tag: 'plain_text', content: opt.label } })),
   });
 
-  // Buttons (if any) — 2 per row, each column 50% via weighted width
+  const hasFormFields = (selects && selects.length > 0) || (multiSelects && multiSelects.length > 0);
+
+  // BIG-FORM-CONTAINER MODE: when there are SELECT/MSELECT fields, wrap the entire body
+  // (text + img + select + mselect) into a single `form` element. Submit button is the last
+  // child. Selectors render in-place at their tag position. KNOWN: Feishu PC desktop client
+  // reports error 200530 on submit (and may not allow opening dropdowns) — this is a
+  // long-standing PC client bug with form/select_static not related to nested children.
+  // Mobile works fine; we accept this until Feishu PC fixes the issue.
+  if (hasFormFields && segments && segments.length > 0 && sessionKey) {
+    const formChildren: object[] = [];
+    let firstText = true;
+    for (const seg of segments) {
+      if (seg.kind === 'text') {
+        let content = firstText ? extractTitleFromText(seg.content, 30).body : seg.content;
+        firstText = false;
+        if (!content || content.trim().length === 0) continue;
+        formChildren.push(buildTextElement(content, false));
+      } else if (seg.kind === 'image') {
+        const r = images?.[seg.index];
+        if (r) formChildren.push(buildImageElement(r));
+      } else if (seg.kind === 'select') {
+        const sel = selects?.[seg.index];
+        if (sel) formChildren.push(buildSelectElement(sel));
+      } else if (seg.kind === 'mselect') {
+        const msel = multiSelects?.[seg.index];
+        if (msel) formChildren.push(buildMSelectElement(msel));
+      }
+    }
+    formChildren.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: '提交' },
+      type: 'primary',
+      width: 'default',
+      form_action_type: 'submit',
+      behaviors: [{
+        type: 'callback',
+        value: {
+          action: FORM_SUBMIT_ACTION,
+          label: '提交',
+          sessionKey: sessionKey || '',
+          chatId: chatId || '',
+          cardId: cardId || '',
+          messageId: messageId || '',
+        },
+      }],
+    });
+    elements.push({
+      tag: 'form',
+      name: INTERACTIVE_FORM_NAME,
+      elements: formChildren,
+    });
+  } else if (segments && segments.length > 0) {
+    let first = true;
+    for (const seg of segments) {
+      if (seg.kind === 'text') {
+        let content = first ? extractTitleFromText(seg.content, 30).body : seg.content;
+        first = false;
+        if (!content || content.trim().length === 0) continue;
+        elements.push(buildTextElement(
+          content,
+          elements.length === 0 || !elements.some((e: any) => e.element_id === STREAMING_ELEMENT_ID),
+        ));
+      } else if (seg.kind === 'image') {
+        const r = images?.[seg.index];
+        if (r) elements.push(buildImageElement(r));
+      }
+      // select/mselect without sessionKey can't render (no callback target) — skip silently
+    }
+    // Defensive: if every segment was empty (rare), ensure at least one markdown element exists
+    if (!elements.some((e: any) => e.tag === 'markdown' || e.tag === 'img')) {
+      elements.push({ tag: 'markdown', content: displayText, element_id: STREAMING_ELEMENT_ID });
+    }
+  } else {
+    elements.push({
+      tag: 'markdown',
+      content: displayText,
+      element_id: STREAMING_ELEMENT_ID,
+    });
+    if (images && images.length > 0) {
+      elements.push(...buildImageElements(images));
+    }
+  }
+
+  // Buttons (if any) — 2 per row. BUTTON is mutually exclusive with form fields,
+  // so this only fires when hasFormFields is false (mutex already enforced upstream).
   if (buttons && buttons.length > 0) {
     elements.push({ tag: 'hr' });
     elements.push(...buildButtonElements(buttons, { sessionKey, chatId, cardId, messageId }));

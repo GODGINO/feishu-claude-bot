@@ -602,6 +602,31 @@ export class WechatBridge {
       return '';
     });
 
+    // Convert <<SELECT:...>> and <<MSELECT:...>> tags to a bulleted dropdown summary.
+    // WeChat has no native dropdown — render placeholder + option labels as text.
+    // MSELECT first so its longer keyword doesn't get half-eaten by SELECT's regex.
+    const renderSelectTag = (suffix: string) => (_: string, body: string) => {
+      const parts = String(body).split(/[|｜]/).map((p: string) => p.trim()).filter((p: string) => p.length > 0);
+      if (parts.length < 3) return '';
+      const placeholder = parts[0];
+      const labels = parts.slice(2).map((opt: string) => {
+        const eq = opt.search(/[=＝]/);
+        return eq > 0 ? opt.slice(eq + 1).trim() : opt;
+      });
+      return `${placeholder}${suffix}：${labels.join(' / ')}\n`;
+    };
+    cleaned = cleaned.replace(/<{1,2}\s*MSELECT\s*[:：]\s*([^>]+?)\s*>{1,2}\s*/gi, renderSelectTag('（多选）'));
+    cleaned = cleaned.replace(/<{1,2}\s*SELECT\s*[:：]\s*([^>]+?)\s*>{1,2}\s*/gi, renderSelectTag(''));
+
+    // Convert <<IMG:url|alt?>> tags to a text placeholder — WeChat strips card-side images.
+    cleaned = cleaned.replace(/<{1,2}\s*IMG\s*[:：]\s*([^>]+?)\s*>{1,2}\s*/gi, (_, body) => {
+      const parts = String(body).split(/[|｜]/).map((p: string) => p.trim()).filter((p: string) => p.length > 0);
+      if (parts.length === 0) return '';
+      const url = parts[0];
+      const alt = parts[1];
+      return alt ? `[图片: ${alt} - ${url}]\n` : `[图片: ${url}]\n`;
+    });
+
     cleaned = cleaned
       .replace(/<{1,2}\s*TITLE\s*[:：]?[^<>\n]*?[<\/\s]*>{1,2}\s*\n?|<\/\s*TITLE\s*>{0,2}\s*\n?/gi, '')
       .replace(/<{1,2}\s*REACT\s*[:：]\s*\w+\s*>{1,2}/gi, '')

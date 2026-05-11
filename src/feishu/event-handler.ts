@@ -34,7 +34,7 @@ export type MessageHandler = (msg: IncomingMessage) => void | Promise<void>;
 const recentMessageIds = new Set<string>();
 const DEDUP_TTL_MS = 600_000; // 10 minutes
 
-export type CardActionHandler = (action: { sessionKey: string; chatId: string; actionId: string; label: string; operatorId: string; cardId?: string; messageId?: string }) => void | Promise<void>;
+export type CardActionHandler = (action: { sessionKey: string; chatId: string; actionId: string; label: string; operatorId: string; cardId?: string; messageId?: string; formValue?: Record<string, string | string[]> }) => void | Promise<void>;
 
 export type RecallHandler = (event: { messageId: string; chatId: string; recallTime: string; recallType: string }) => void | Promise<void>;
 
@@ -234,9 +234,12 @@ export function createEventHandler(
 
         const operatorId = event?.operator?.open_id || '';
         const messageId = event?.open_message_id || value?.messageId || '';
+        // form_value is only populated for form-submit triggers (SELECT/MSELECT form interactions).
+        // Plain button clicks have form_value = undefined. Multi-select fields arrive as string[].
+        const formValue: Record<string, string | string[]> | undefined = event?.action?.form_value || event?.form_value;
         logger.info(
-          { sessionKey: value.sessionKey, actionId: value.action, label: value.label, operatorId, cardId: value.cardId, messageId },
-          'Card button clicked',
+          { sessionKey: value.sessionKey, actionId: value.action, label: value.label, operatorId, cardId: value.cardId, messageId, hasFormValue: !!formValue },
+          'Card action triggered',
         );
 
         if (cardActionHandler) {
@@ -248,6 +251,7 @@ export function createEventHandler(
             operatorId,
             cardId: value.cardId || '',
             messageId,
+            formValue,
           })).catch((err: any) => {
             logger.error({ err }, 'Error in card action handler');
           });

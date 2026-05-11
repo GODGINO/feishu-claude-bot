@@ -209,14 +209,49 @@ feishuId:<飞书id>
 - **详细描述**：若有则添加，无则删除，单行不超过 50 字符
 - **feishuId**：对应飞书需求 ID
 
-## 交互按钮
+## 交互卡片
 
-回复中可以使用 \`<<BUTTON:显示文案|操作标识|样式?>>\` 添加可点击按钮（样式: primary/danger/默认灰色）。适用场景：
-- 完成任务后的后续操作确认（如"部署"、"推送"、"发送"）
-- 提供链接快捷入口（配合文字说明）
-- 需要用户做选择时（如"方案A" / "方案B"）
+回复末尾可加交互元素让用户操作。**两种范式互斥**：一个回复只能用一种。
 
-示例：\`修改完成，测试通过。<<BUTTON:推送代码|push|primary>> <<BUTTON:取消|cancel>>\`
+### 模式 A：单维度决策（互斥 N 选 1，立即执行）
+用按钮 \`<<BUTTON:文案|action_id|样式?>>\`（样式 primary/danger 可选，≤4 个）
+点击后所有按钮立即禁用，被点的按钮文字会加 \`@用户名\`。
+适用：部署/取消、方案 A/B、是/否、立即执行的单步操作。
+示例：\`修改完成。<<BUTTON:推送|push|primary>> <<BUTTON:取消|cancel>>\`
+
+### 模式 B：多维度决策（独立字段，全部选完再提交）
+- 单选下拉 \`<<SELECT:placeholder|name|key1=文案1|key2=文案2|...>>\` — 用户只能选一个
+- 多选下拉 \`<<MSELECT:placeholder|name|key1=文案1|key2=文案2|...>>\` — 用户可以勾选多个
+- SELECT 和 MSELECT 可在同一回复中共存（合并为一个表单），系统自动追加"提交"按钮
+- 用户全选完点提交后，所有字段被收敛为只读行，提交按钮文字加 \`@用户名\`
+- 回调收到 \`[<用户名> 选择了: name1=label1 / name2=label2,label3]\`，多选用逗号分隔
+
+适用：建 cron（周期+时间+脚本）、配置邮箱（provider+标签+用途）、订阅多个板块等多字段表单。
+示例：
+- 单选：\`<<SELECT:周期|cycle|daily=每天|weekly=每周>> <<SELECT:时间|time|am=早 8:00|pm=晚 8:00>>\`
+- 多选：\`<<MSELECT:订阅板块|sectors|tech=科技|finance=金融|energy=能源>>\`
+- 混合：\`<<SELECT:市场|market|a=A股|hk=港股>> <<MSELECT:板块|sectors|tech=科技|finance=金融>>\`
+
+### 严禁
+- 同一回复混用 BUTTON 和 SELECT/MSELECT（系统会强制丢弃 SELECT/MSELECT）
+- 无意义按钮（"OK""确认""继续"等）
+- SELECT/MSELECT 选项 >7 个（改用文字让用户输入）
+- 单维度单选强行用 SELECT（用 BUTTON）
+
+## 卡片嵌入图片
+
+回复正文里写 \`<<IMG:url|alt?>>\` 可以在卡片中嵌入图片：
+- **url**：https 链接（自动下载并上传到飞书）或本地绝对路径
+- **alt**（可选）：图片描述
+
+图片渲染在正文 markdown 之后、按钮/表单之前。上传失败会优雅退化为 \`_[图片: <url>]_\` 占位文本。
+
+示例：
+- \`<<IMG:https://picsum.photos/600/400|示例随机图>>\`
+- \`<<IMG:/tmp/chart.png|当日 K 线>>\`
+- 同 URL 在同一回复中复用会被去重缓存（只传一次）
+
+IMG 与 BUTTON / SELECT / MSELECT 互相独立，可在同一回复中任意组合。
 `;
     try {
       fs.writeFileSync(claudeMdPath, template);

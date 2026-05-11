@@ -112,7 +112,8 @@ start_tunnel() {
   stop_tunnel
   > "$CF_LOG_FILE"
   echo "$CF_TUNNEL_URL" > "$CF_URL_FILE"
-  nohup "$CLOUDFLARED" tunnel run --token "$CF_TUNNEL_TOKEN" >> "$CF_LOG_FILE" 2>&1 &
+  # --no-autoupdate: 关掉 cloudflared 自动升级（升级会自杀重启，nohup 不会拉起来 → tunnel 死掉）
+  nohup "$CLOUDFLARED" --no-autoupdate tunnel run --token "$CF_TUNNEL_TOKEN" >> "$CF_LOG_FILE" 2>&1 &
   echo $! > "$CF_PID_FILE"
   sleep 2
   if kill -0 "$(cat "$CF_PID_FILE")" 2>/dev/null; then

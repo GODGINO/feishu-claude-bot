@@ -8,7 +8,7 @@ import type { LiveUsage } from '../claude/stream-parser.js';
 import { SessionManager } from '../claude/session-manager.js';
 import type { Config } from '../config.js';
 import type { Logger } from '../utils/logger.js';
-import { isNoReply } from '../feishu/card-builder.js';
+import { isNoReply, FORM_SUBMIT_ACTION, type SelectInfo, type MultiSelectInfo } from '../feishu/card-builder.js';
 import { CommandHandler } from './command-handler.js';
 import { MessageQueue, type Job } from './message-queue.js';
 import { GroupContextBuffer } from './group-context.js';
@@ -45,8 +45,10 @@ function getFeishuMcpHint(sessionDir: string, userId: string): string {
 export class MessageBridge {
   private runningTasks = new Set<string>();
   private abortControllers = new Map<string, AbortController>();
-  // Cache finalized card state for button click updates (cardId → card data)
-  private buttonCardCache = new Map<string, { cardJson: object; sequence: number; expiresAt: number }>();
+  // Cache finalized card state for button/select-form click updates (cardId → card data).
+  // `selects` / `multiSelects` are populated when the original reply used SELECT/MSELECT tags,
+  // so the form-submit handler can map field names back to placeholder + option labels.
+  private buttonCardCache = new Map<string, { cardJson: object; sequence: number; expiresAt: number; selects?: SelectInfo[]; multiSelects?: MultiSelectInfo[] }>();
   private commandHandler: CommandHandler;
   private queue: MessageQueue;
   private groupContext: GroupContextBuffer;
@@ -908,18 +910,57 @@ export class MessageBridge {
   }
 
   /**
-   * Execute a card button action — sends the click as natural language to Claude.
+   * Execute a card action — either a plain button click or a SELECT-form submit.
+   * For form submits the click is sent as `[<user> 选择了: name=label / ...]`.
    * Respects the same runningTasks queue as normal messages.
    */
-  async executeButtonAction(sessionKey: string, chatId: string, actionId: string, label: string, userName: string, operatorId: string, cardId?: string, messageId?: string): Promise<void> {
-    // Update original card immediately (disable buttons + show who clicked) — don't wait for queue
+  async executeButtonAction(
+    sessionKey: string,
+    chatId: string,
+    actionId: string,
+    label: string,
+    userName: string,
+    operatorId: string,
+    cardId?: string,
+    messageId?: string,
+    formValue?: Record<string, string | string[]>,
+  ): Promise<void> {
+    // The submit button always carries FORM_SUBMIT_ACTION; Feishu, however, *omits* form_value
+    // entirely when the user clicks submit without filling anything — so we cannot rely on
+    // `!!formValue` to detect "this is a form submit". Identify by actionId only and treat
+    // missing form_value as the empty case.
+    const isFormSubmit = actionId === FORM_SUBMIT_ACTION;
+
+    // Empty-form guard: if the user clicks submit without picking *any* field, silently drop
+    // the action. Don't disable the form (so they can pick + retry), don't trigger Claude.
+    // Treat `'none'` value (synthetic "不选" option we prepend to every single-select) as
+    // equivalent to unselected.
+    if (isFormSubmit) {
+      const fv = formValue || {};
+      const anyFilled = Object.values(fv).some((v) => {
+        if (Array.isArray(v)) return v.length > 0;
+        if (typeof v !== 'string') return false;
+        return v.length > 0 && v !== 'none';
+      });
+      if (!anyFilled) {
+        this.logger.info({ sessionKey, cardId, userName, hasFormValue: !!formValue }, 'Empty form submit ignored');
+        return;
+      }
+    }
+
+    // Update original card immediately (disable buttons / collapse form) — don't wait for queue
     if (cardId) {
-      await this.updateCardButtonState(cardId, label, userName);
+      if (isFormSubmit) {
+        await this.updateCardSelectState(cardId, formValue!, userName);
+      } else {
+        await this.updateCardButtonState(cardId, label, userName);
+      }
     }
 
     // If actionId is a slash command, route it through the command handler
     // (same path as if the user had typed it). This lets buttons trigger /model, /effort, etc.
-    if (actionId?.startsWith('/')) {
+    // Form submits never go through the command handler.
+    if (!isFormSubmit && actionId?.startsWith('/')) {
       const handled = await this.commandHandler.handle(actionId, {
         chatId,
         messageId: messageId || '',
@@ -937,39 +978,94 @@ export class MessageBridge {
     const session = this.sessionMgr.getOrCreate(sessionKey);
     try {
       if (fs.existsSync(path.join(session.sessionDir, 'muted'))) {
-        this.logger.debug({ sessionKey }, 'Session muted, ignoring button action');
+        this.logger.debug({ sessionKey }, 'Session muted, ignoring card action');
         return;
       }
     } catch { /* ignore */ }
 
-    // If session is busy, queue the button action into the unified Job queue
+    // Compose the Claude-facing prompt up-front so both immediate and queued execution
+    // see the exact same text.
+    const prompt = isFormSubmit
+      ? this.buildFormSubmitPrompt(userName, formValue!, cardId)
+      : `[${userName} 点击了按钮: ${label}]`;
+
+    // If session is busy, queue the action into the unified Job queue
     if (this.runningTasks.has(sessionKey)) {
+      // Pre-rendered prompt is stashed via `label` for form submits (label is unused
+      // by runButtonAction beyond the prompt template). To stay backward-compatible
+      // with the existing queue Job shape we override `label` to the synthesized text.
       const queued = this.queue.enqueue(sessionKey, {
-        kind: 'claude-button', sessionKey, chatId, actionId, label, userName, operatorId, cardId, messageId,
+        kind: 'claude-button',
+        sessionKey,
+        chatId,
+        actionId,
+        label: isFormSubmit ? prompt : label,
+        userName,
+        operatorId,
+        cardId,
+        messageId,
       });
       if (queued) {
-        this.logger.info({ sessionKey, label, queueSize: this.queue.queueSize(sessionKey) }, 'Button action queued (session busy)');
+        this.logger.info({ sessionKey, isFormSubmit, queueSize: this.queue.queueSize(sessionKey) }, 'Card action queued (session busy)');
       } else {
-        this.logger.warn({ sessionKey, label }, 'Button action dropped — queue full');
+        this.logger.warn({ sessionKey, isFormSubmit }, 'Card action dropped — queue full');
       }
       return;
     }
 
-    await this.runButtonAction(sessionKey, chatId, label, userName, messageId);
+    await this.runButtonAction(sessionKey, chatId, isFormSubmit ? prompt : label, userName, messageId, isFormSubmit);
+  }
+
+  /**
+   * Render the form_value payload as `[<user> 选择了: name1=label1 / name2=labelA,labelB]`.
+   * Looks up each field's option label from the buttonCardCache so Claude sees human-readable
+   * text. Multi-select values arrive as string[] (one per chosen option) and get joined with commas.
+   */
+  private buildFormSubmitPrompt(userName: string, formValue: Record<string, string | string[]>, cardId?: string): string {
+    const cached = cardId ? this.buttonCardCache.get(cardId) : undefined;
+    const selects: SelectInfo[] = cached?.selects || [];
+    const multiSelects: MultiSelectInfo[] = cached?.multiSelects || [];
+    const parts: string[] = [];
+    for (const [name, value] of Object.entries(formValue)) {
+      // Skip noise from Feishu — the submit button gets reported as `undefined: null` when
+      // it has no `name` field, and any field with null/undefined/empty value is uninteresting.
+      // Also skip the synthetic `none` ("不选") sentinel we prepend to every single-select.
+      if (value == null) continue;
+      if (name === 'undefined' || name === '') continue;
+      if (Array.isArray(value)) {
+        if (value.length === 0) continue;
+        const msel = multiSelects.find((s) => s.name === name);
+        const labels = value.map((v) => msel?.options.find((o) => o.key === v)?.label || v);
+        parts.push(`${name}=${labels.join(',')}`);
+      } else {
+        if (typeof value === 'string' && value.length === 0) continue;
+        if (value === 'none') continue;
+        const sel = selects.find((s) => s.name === name);
+        const opt = sel?.options.find((o) => o.key === value);
+        const labelText = opt?.label || value;
+        parts.push(`${name}=${labelText}`);
+      }
+    }
+    if (parts.length === 0) return `[${userName} 提交了表单]`;
+    return `[${userName} 选择了: ${parts.join(' / ')}]`;
   }
 
   /**
    * Actually run a button action (called when session is free).
+   * If `labelIsPrompt` is true, `label` is treated as the fully-rendered prompt
+   * (used for form-submit actions whose prompt was built up-front from form_value).
    */
-  private async runButtonAction(sessionKey: string, chatId: string, label: string, userName: string, messageId?: string): Promise<void> {
+  private async runButtonAction(sessionKey: string, chatId: string, label: string, userName: string, messageId?: string, labelIsPrompt = false): Promise<void> {
     const session = this.sessionMgr.getOrCreate(sessionKey);
-    const prompt = `[${userName} 点击了按钮: ${label}]`;
+    const prompt = labelIsPrompt ? label : `[${userName} 点击了按钮: ${label}]`;
 
-    this.logger.info({ sessionKey, label, userName, messageId }, 'Executing button action via reply pipeline');
+    this.logger.info({ sessionKey, label, userName, messageId, labelIsPrompt }, 'Executing button action via reply pipeline');
 
     // Store button echo for WeChat dual-send
     if (this.wechatBridge?.isActive(sessionKey)) {
-      this.feishuPendingEcho.set(sessionKey, `${userName} 点击了按钮: ${label}`);
+      this.feishuPendingEcho.set(sessionKey, labelIsPrompt
+        ? prompt.replace(/^\[|\]$/g, '')
+        : `${userName} 点击了按钮: ${label}`);
     }
 
     this.runningTasks.add(sessionKey);
@@ -1060,6 +1156,98 @@ export class MessageBridge {
       this.logger.info({ cardId, clickedLabel, userName }, 'Updated card button state');
     } catch (err) {
       this.logger.warn({ err, cardId }, 'Failed to update card button state');
+    }
+  }
+
+  /**
+   * Collapse a SELECT-form card after submission:
+   *   - replace each `select_static` with a read-only `**<placeholder>**：<选中 label>` markdown line
+   *   - disable the form's submit button and rewrite its text to `✓ 已提交 @<userName>`.
+   *
+   * The form element is wrapped in a `column_set`-like or `form` tag — we walk the
+   * top-level `body.elements` and any nested `elements` array to find it.
+   */
+  private async updateCardSelectState(cardId: string, formValue: Record<string, string | string[]>, userName: string): Promise<void> {
+    const cached = this.buttonCardCache.get(cardId);
+    this.logger.info({ cardId, cacheHit: !!cached, cacheSize: this.buttonCardCache.size }, 'Select-form card cache lookup');
+    if (!cached) return;
+
+    const selects: SelectInfo[] = cached.selects || [];
+    const multiSelects: MultiSelectInfo[] = cached.multiSelects || [];
+
+    try {
+      const cardJson = JSON.parse(JSON.stringify(cached.cardJson)) as any; // deep clone
+      const elements = cardJson?.body?.elements;
+      if (!Array.isArray(elements)) return;
+
+      // Find the form element and rebuild its `elements` list in-place.
+      let replaced = false;
+      for (let i = 0; i < elements.length; i++) {
+        const el = elements[i];
+        if (el?.tag !== 'form' || !Array.isArray(el.elements)) continue;
+
+        const newFormElements: object[] = [];
+        for (const child of el.elements) {
+          if (child?.tag === 'select_static') {
+            const name: string = child.name;
+            const raw = formValue[name];
+            const chosenKey = Array.isArray(raw) ? raw[0] : raw;
+            const sel = selects.find((s) => s.name === name);
+            const placeholder = sel?.placeholder || name;
+            // `none` is our synthetic "不选" sentinel — render as 未选.
+            const isUnselected = !chosenKey || chosenKey === 'none';
+            const opt = sel?.options.find((o) => o.key === chosenKey);
+            const labelText = isUnselected ? '(未选)' : (opt?.label || chosenKey);
+            newFormElements.push({
+              tag: 'markdown',
+              content: `**${placeholder}**：${labelText}`,
+            });
+          } else if (child?.tag === 'multi_select_static') {
+            const name: string = child.name;
+            const raw = formValue[name];
+            const chosenKeys: string[] = Array.isArray(raw) ? raw : (raw ? [raw] : []);
+            const msel = multiSelects.find((s) => s.name === name);
+            const placeholder = msel?.placeholder || name;
+            const labels = chosenKeys.map((k) => msel?.options.find((o) => o.key === k)?.label || k);
+            const labelText = labels.length > 0 ? labels.join('、') : '(未选)';
+            newFormElements.push({
+              tag: 'markdown',
+              content: `**${placeholder}**：${labelText}`,
+            });
+          } else if (child?.tag === 'button') {
+            // Submit button — rewrite text + disable. @ the operator on this button only.
+            newFormElements.push({
+              ...child,
+              text: { tag: 'plain_text', content: `✓ 已提交 @${userName}` },
+              type: 'primary',
+              disabled: true,
+            });
+          } else {
+            newFormElements.push(child);
+          }
+        }
+        el.elements = newFormElements;
+        replaced = true;
+        break;
+      }
+
+      if (!replaced) {
+        this.logger.warn({ cardId }, 'updateCardSelectState: no form element found in cached card');
+        return;
+      }
+
+      const newSequence = cached.sequence + 1;
+      await (this.sender.larkClient.cardkit as any).v1.card.update({
+        path: { card_id: cardId },
+        data: {
+          card: { type: 'card_json', data: JSON.stringify(cardJson) },
+          sequence: newSequence,
+        },
+      });
+      cached.sequence = newSequence;
+      this.logger.info({ cardId, fields: Object.keys(formValue), userName }, 'Updated card select-form state');
+    } catch (err) {
+      this.logger.warn({ err, cardId }, 'Failed to update card select-form state');
     }
   }
 
@@ -1274,7 +1462,7 @@ export class MessageBridge {
             this.runner.onSubagentStream(sessionKey, undefined);
           }
         }, 30 * 60 * 1000);
-      } else if (!cardCreated && !cardCreating && !rawText.includes('<<BUTTON:')) {
+      } else if (!cardCreated && !cardCreating && !rawText.includes('<<BUTTON:') && !rawText.includes('<<SELECT:') && !rawText.includes('<<MSELECT:') && !rawText.includes('<<IMG:')) {
         // No card, no buttons — send as plain text
         this.logger.info({ sessionKey, textLen: cleanText.length }, 'No tools used, sending plain text reply');
         await fireWillReply();
@@ -1462,6 +1650,11 @@ export class MessageBridge {
     sessionKey?: string,
   ): Promise<void> {
     try {
+      // Strip <<IMG:path|alt?>> tags — any path referenced by IMG has already been
+      // embedded into the card by CardStreamer.complete(), so we must NOT also send
+      // it as a standalone image message (would be a duplicate).
+      const scanText = replyText.replace(/<{1,2}\s*IMG\s*[:：][^>]+>{1,2}\s*/gi, '');
+
       // Match absolute paths that look like files (with extensions)
       const escapedDir = sessionDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       const projectRoot = path.resolve(sessionDir, '..', '..');
@@ -1473,7 +1666,7 @@ export class MessageBridge {
       ];
       const allMatches: string[] = [];
       for (const p of patterns) {
-        const m = replyText.match(p);
+        const m = scanText.match(p);
         if (m) allMatches.push(...m);
       }
       if (allMatches.length === 0) return;
@@ -1534,9 +1727,13 @@ export class MessageBridge {
       case 'claude-user-msg':
         await this.runUserMsgJob(job);
         return;
-      case 'claude-button':
-        await this.runButtonAction(job.sessionKey, job.chatId, job.label, job.userName, job.messageId);
+      case 'claude-button': {
+        // For form submits the prompt was pre-rendered into `label` at enqueue time;
+        // detect that case by actionId so runButtonAction skips the prompt template.
+        const labelIsPrompt = job.actionId === FORM_SUBMIT_ACTION;
+        await this.runButtonAction(job.sessionKey, job.chatId, job.label, job.userName, job.messageId, labelIsPrompt);
         return;
+      }
       case 'claude-cron':
         await this.runCronJob(job);
         return;

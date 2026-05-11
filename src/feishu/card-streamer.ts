@@ -25,11 +25,17 @@ import {
   buildStreamingCard,
   buildCompleteCard,
   extractButtons,
+  parseInteractive,
   STREAMING_ELEMENT_ID,
   type ToolCallInfo,
   type ButtonInfo,
+  type SelectInfo,
+  type MultiSelectInfo,
+  type ImageInfo,
+  type ContentSegment,
   type UsageInfo,
 } from './card-builder.js';
+import { uploadImageToFeishu } from './image-uploader.js';
 
 const THROTTLE_MS = 1000; // Minimum interval between card updates — paired with
                           // print_frequency_ms below; faster than 1s buys nothing
@@ -64,8 +70,10 @@ export class CardStreamer {
   sessionKey?: string;
   sessionDir?: string;
   chatId?: string;
-  // Shared cache for button card state (set by caller)
-  buttonCardCache?: Map<string, { cardJson: object; sequence: number; expiresAt: number }>;
+  // Shared cache for button/select card state (set by caller).
+  // `selects` / `multiSelects` are populated when the LLM emitted SELECT/MSELECT tags so
+  // the form-submit handler can look up placeholder + option labels.
+  buttonCardCache?: Map<string, { cardJson: object; sequence: number; expiresAt: number; selects?: SelectInfo[]; multiSelects?: MultiSelectInfo[] }>;
   /** Fire-once callback invoked after the card IM message is delivered.
    *  Used by MessageBridge to upgrade the typing reaction (THINKING → MeMeMe)
    *  for non-@mention groups, signaling "I've decided to reply". */
@@ -380,9 +388,52 @@ export class CardStreamer {
       fullText = resolveAtMentions(fullText, this.sessionDir);
     }
 
-    // Extract <<BUTTON:...>> tags
+    // Extract <<BUTTON:...>> first (strips them from text), then parseInteractive scans the
+    // rest in one pass for IMG / SELECT / MSELECT — returning ordered segments that preserve
+    // each tag's position so the renderer can interleave them with markdown.
+    // BUTTON is mutually exclusive with form fields (SELECT/MSELECT); if both arrive, BUTTON wins
+    // and form fields are dropped with a warning. SELECT/MSELECT can coexist (one shared form).
+    // IMG is independent and always renders in-place.
     const { cleanText: textWithoutButtons, buttons } = extractButtons(fullText);
-    fullText = textWithoutButtons;
+    const parsed = parseInteractive(textWithoutButtons);
+    const rawImages: ImageInfo[] = parsed.images;
+    let segments: ContentSegment[] = parsed.segments;
+    fullText = parsed.cleanText;
+    let selects: SelectInfo[] = parsed.selects;
+    let multiSelects: MultiSelectInfo[] = parsed.multiSelects;
+    if (buttons.length > 0 && (selects.length > 0 || multiSelects.length > 0)) {
+      this.logger.warn({
+        cardId: this.cardId,
+        buttonCount: buttons.length,
+        selectCount: selects.length,
+        multiSelectCount: multiSelects.length,
+      }, 'BUTTON + form fields both present in reply — dropping form fields (mutex)');
+      selects = [];
+      multiSelects = [];
+      // Filter form-field segments out so they don't render orphaned.
+      segments = segments.filter((s) => s.kind !== 'select' && s.kind !== 'mselect');
+    }
+
+    // Resolve <<IMG:...>> tags to Feishu image_keys (upload pass). Done at complete() time,
+    // not on each flush, since uploading on every throttle would burn API calls.
+    // Same-URL dedup within this turn keeps repeated images cheap.
+    let resolvedImages: Array<{ imageKey: string | null; url: string; alt?: string }> = [];
+    if (rawImages.length > 0) {
+      const cache = new Map<string, string | null>();
+      for (const img of rawImages) {
+        let key = cache.get(img.url);
+        if (key === undefined) {
+          key = await uploadImageToFeishu(this.client, img.url, this.logger);
+          cache.set(img.url, key);
+        }
+        resolvedImages.push({ imageKey: key, url: img.url, alt: img.alt });
+      }
+      this.logger.info({
+        cardId: this.cardId,
+        imageCount: rawImages.length,
+        uploaded: resolvedImages.filter((r) => r.imageKey).length,
+      }, 'Resolved IMG tags');
+    }
 
     // Truncate to avoid Feishu card size limit
     if (fullText.length > CARD_TEXT_LIMIT) {
@@ -425,17 +476,27 @@ export class CardStreamer {
         usage,
         this.thinkingEntries.length > 0 ? this.thinkingEntries : undefined,
         this.aborted,
+        selects.length > 0 ? selects : undefined,
+        multiSelects.length > 0 ? multiSelects : undefined,
+        resolvedImages.length > 0 ? resolvedImages : undefined,
+        segments.length > 0 ? segments : undefined,
       );
 
-      // Cache card state for button click updates
-      if (buttons.length > 0 && this.cardId) {
+      // Cache card state for button/select click updates.
+      // Same cache is used for both — `selects`/`multiSelects` are non-empty iff the LLM rendered a form.
+      if ((buttons.length > 0 || selects.length > 0 || multiSelects.length > 0) && this.cardId) {
         if (this.buttonCardCache) {
           this.buttonCardCache.set(this.cardId, {
             cardJson: completeCard,
             sequence: this.sequence + 2, // account for the update + settings calls below
             expiresAt: Date.now() + 24 * 60 * 60 * 1000,
+            selects: selects.length > 0 ? selects : undefined,
+            multiSelects: multiSelects.length > 0 ? multiSelects : undefined,
           });
-          this.logger.info({ cardId: this.cardId, buttonCount: buttons.length, cacheSize: this.buttonCardCache.size }, 'Cached button card for click updates');
+          this.logger.info(
+            { cardId: this.cardId, buttonCount: buttons.length, selectCount: selects.length, multiSelectCount: multiSelects.length, cacheSize: this.buttonCardCache.size },
+            'Cached interactive card for click updates',
+          );
         } else {
           this.logger.warn({ cardId: this.cardId }, 'buttonCardCache not set on streamer, cannot cache');
         }
@@ -692,6 +753,9 @@ export class CardStreamer {
       .replace(/<{1,2}\s*THREAD\s*>{1,2}\s*/gi, '')
       .replace(/<{1,2}\s*REACT\s*[:：]\s*\w+\s*>{1,2}\s*/gi, '')
       .replace(/<{1,2}\s*BUTTON\s*:[^>]+>{1,2}\s*/gi, '')
+      .replace(/<{1,2}\s*MSELECT\s*[:：][^>]+>{1,2}\s*/gi, '')
+      .replace(/<{1,2}\s*SELECT\s*[:：][^>]+>{1,2}\s*/gi, '')
+      .replace(/<{1,2}\s*IMG\s*[:：][^>]+>{1,2}\s*/gi, '')
       .replace(/<[\/\s<]*\/[\/\s<]*TITLE[^>]*?>{0,2}\s*\n?/gi, '')
       .replace(/<{1,2}\s*TITLE\s*[:：]?[^<>\n]*?[<\/\s]*>{1,2}\s*\n?/gi, '');
 

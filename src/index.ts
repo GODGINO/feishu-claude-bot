@@ -144,10 +144,10 @@ async function main() {
 
   // Handle card button clicks — actionId prefixed with '/' routes to command handler,
   // otherwise the click is sent as natural language to Claude.
-  onCardAction(async ({ sessionKey, chatId, actionId, label, operatorId, cardId, messageId }) => {
+  onCardAction(async ({ sessionKey, chatId, actionId, label, operatorId, cardId, messageId, formValue }) => {
     const userName = await sender.resolveUserName(operatorId) || operatorId;
-    logger.info({ sessionKey, chatId, actionId, label, operatorId, userName, cardId, messageId }, 'Processing card button click');
-    await bridge.executeButtonAction(sessionKey, chatId, actionId, label, userName, operatorId, cardId, messageId);
+    logger.info({ sessionKey, chatId, actionId, label, operatorId, userName, cardId, messageId, hasFormValue: !!formValue }, 'Processing card action');
+    await bridge.executeButtonAction(sessionKey, chatId, actionId, label, userName, operatorId, cardId, messageId, formValue);
   });
 
   // Start cron scheduler for skills
