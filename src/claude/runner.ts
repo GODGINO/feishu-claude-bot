@@ -226,6 +226,21 @@ export class ClaudeRunner {
   }
 
   /**
+   * Get the saved Claude sessionId for a sessionKey (for /并行 transcript sharing).
+   */
+  getSavedSessionId(sessionKey: string): string | null {
+    return this.pool.getSavedSessionId(sessionKey);
+  }
+
+  /**
+   * Pre-register a Claude sessionId for a sessionKey before its first spawn.
+   * Used by /并行 so the fork shares the parent's transcript via `--resume`.
+   */
+  setSavedSessionId(sessionKey: string, sessionId: string): void {
+    this.pool.setSavedSessionId(sessionKey, sessionId);
+  }
+
+  /**
    * Register callback for unsolicited results (background agent completion).
    * Called when Claude emits output without a pending send() request.
    */

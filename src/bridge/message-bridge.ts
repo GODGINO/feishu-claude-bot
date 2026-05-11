@@ -89,10 +89,12 @@ export class MessageBridge {
       logger,
     );
     this.commandHandler.setEmailSetup(this.emailSetup);
-    // /并行 driver: spawns isolated Claude children for parallel work without
-    // blocking the main process pool. See src/claude/parallel-runner.ts.
-    this.parallelRunner = new ParallelRunner(config, logger);
+    // /并行 slot allocator (max 2 concurrent forks per parent session).
+    // The actual run goes through the standard executeAndReply pipeline via
+    // runParallelAgent() so fork agents look identical to normal messages.
+    this.parallelRunner = new ParallelRunner(2);
     this.commandHandler.setParallelRunner(this.parallelRunner);
+    this.commandHandler.setRunParallel((opts) => this.runParallelAgent(opts));
 
     // Periodically clean up expired button card cache entries
     setInterval(() => {
@@ -393,6 +395,7 @@ export class MessageBridge {
       sessionKey,
       userId: msg.userId,
       senderName: msg.senderName,
+      msg,
     });
     if (isCommand) return;
 
@@ -1258,6 +1261,179 @@ export class MessageBridge {
   }
 
   /**
+   * `/并行` driver. Spawns a parallel agent that reuses the *exact same* reply
+   * pipeline as normal messages — typing indicator, reply quote, streaming
+   * card, MCP tools — so users can't tell the difference from regular ops.
+   *
+   * Mechanism: synthesize a fork sessionKey (so ProcessPool gives us a fresh
+   * Claude child with its own transcript) while pointing it at the parent
+   * sessionDir (so CLAUDE.md, .claude/skills, members, git, mcp-servers.json,
+   * Chrome MCP — everything — is shared). The fork's process is killed and
+   * its slot freed on completion.
+   *
+   * Concurrency: ParallelRunner caps at 2 forks per parent session.
+   * Tradeoff: fork does NOT see parent's prior conversation history yet —
+   * future work will copy the parent transcript jsonl into a new sessionId
+   * and pre-seed savedSessionIds so the fork can `--resume` it.
+   */
+  async runParallelAgent(opts: {
+    parentSessionKey: string;
+    prompt: string;
+    msg: IncomingMessage;
+  }): Promise<void> {
+    const { msg } = opts;
+    if (!this.parallelRunner.canSpawn(opts.parentSessionKey)) {
+      await this.sender.sendText(
+        msg.chatId,
+        `⚠️ 已达并行上限 (${this.parallelRunner.getMax()})，请等当前并行任务完成`,
+        msg.messageId,
+      );
+      return;
+    }
+    const forkN = this.parallelRunner.allocate(opts.parentSessionKey);
+    const nonce = Math.random().toString(36).slice(2, 6);
+    const forkSessionKey = `${opts.parentSessionKey}__fork${forkN}_${nonce}`;
+    const parentSession = this.sessionMgr.getOrCreate(opts.parentSessionKey);
+    // Per user spec: /并行 always treats input as @mention even if user didn't
+    // tag the bot. Only "is-this-msg-for-me" detection is bypassed; everything
+    // else (group hints, missed messages, quote, attachments) is identical.
+    const isNonMentionGroup = false;
+
+    // CORE: clone the parent's Claude sessionId onto the fork sessionKey so the
+    // fork agent boots with `--resume <parentSessionId>` and sees the parent's
+    // full conversation history. Fork and parent then write to the same jsonl —
+    // from the agent's POV they're the same logical agent with one transcript.
+    const parentSessionId = this.runner.getSavedSessionId(opts.parentSessionKey);
+    if (parentSessionId) {
+      this.runner.setSavedSessionId(forkSessionKey, parentSessionId);
+    }
+
+    this.logger.info(
+      { parentSessionKey: opts.parentSessionKey, forkSessionKey, forkN, parentSessionId },
+      'Parallel agent spawning',
+    );
+
+    let prompt = opts.prompt;
+
+    // 1) User identity prefix + mcpHint (mirrors onMessage line 510-525)
+    let userName: string | null = null;
+    if (this.memberMgr) {
+      const m = this.memberMgr.get(msg.userId);
+      if (m?.name && m.name !== msg.userId) userName = m.name;
+    }
+    if (!userName) userName = msg.senderName || null;
+    if (userName) {
+      const mcpHint = getFeishuMcpHint(parentSession.sessionDir, msg.userId);
+      const safeUserName = userName.replace(/[\n\r\]]/g, ' ');
+      const safeUserId = msg.userId.replace(/[\n\r\]]/g, '');
+      prompt = `[发送者: ${safeUserName} | id: ${safeUserId}]${mcpHint ? ' ' + mcpHint : ''} ${prompt}`;
+    }
+
+    // 2) MEMBER.md per-user profile (mirrors onMessage line 527-537)
+    try {
+      const memberMdPath = path.join(parentSession.sessionDir, 'members', msg.userId, 'MEMBER.md');
+      if (fs.existsSync(memberMdPath)) {
+        const memberMd = fs.readFileSync(memberMdPath, 'utf-8').trim();
+        if (memberMd && memberMd.length > 50) {
+          const truncated = memberMd.length > 1000 ? memberMd.slice(0, 1000) + '\n...(truncated)' : memberMd;
+          prompt = `[用户档案]\n${truncated}\n[/用户档案]\n\n${prompt}`;
+        }
+      }
+    } catch { /* ignore */ }
+
+    // 3) Group context: missed messages + behavior hint + record into history
+    if (msg.chatType === 'group') {
+      if (!this.groupContext['buffers'].has(msg.chatId)) {
+        this.groupContext.load(parentSession.sessionDir, msg.chatId);
+      }
+      const missedStr = this.groupContext.formatMissed(msg.chatId);
+      if (missedStr) prompt = `${missedStr}\n\n${prompt}`;
+      // /并行 forces the @mention path — no "未@你" branch
+      prompt = `[你被@提及，必须回复]\n${prompt}`;
+      this.groupContext.add(msg.chatId, {
+        timestamp: Date.now(),
+        senderName: userName || this.resolveSenderName(msg.senderName, msg.userId),
+        senderId: msg.userId,
+        text: msg.text,
+      });
+      this.groupContext.markSent(msg.chatId);
+    } else if (msg.chatType === 'p2p') {
+      this.groupContext.add(msg.chatId, {
+        timestamp: Date.now(),
+        senderName: userName || this.resolveSenderName(msg.senderName, msg.userId),
+        senderId: msg.userId,
+        text: msg.text,
+      });
+    }
+
+    // 4) Quoted message
+    if (msg.parentId) {
+      let quotedText: string | null | undefined = this.groupContext.lookupBotReply(msg.chatId, msg.parentId);
+      if (!quotedText) quotedText = await this.sender.fetchMessageText(msg.parentId);
+      if (quotedText) prompt = `[用户引用了一条消息]\n引用内容: "${quotedText}"\n\n${prompt}`;
+    }
+
+    // 5) merge_forward
+    if (msg.messageType === 'merge_forward') {
+      const mergeContent = await this.sender.fetchMergeForwardContent(msg.messageId);
+      if (mergeContent) prompt = prompt.replace('[合并转发消息]', mergeContent);
+    }
+
+    // 6) Image attachments — download + inject paths so tools can pick them up
+    let images: ImageAttachment[] | undefined;
+    if (msg.images && msg.images.length > 0) {
+      images = [];
+      const savedPaths: string[] = [];
+      for (const imgInfo of msg.images) {
+        const downloaded = await this.sender.downloadImage(msg.messageId, imgInfo.imageKey);
+        if (downloaded) {
+          images.push({ base64: downloaded.base64, mediaType: downloaded.mediaType });
+          try {
+            const ext = downloaded.mediaType.split('/')[1]?.replace('jpeg', 'jpg') || 'png';
+            const imgPath = path.join(parentSession.sessionDir, `upload-${Date.now()}-${savedPaths.length}.${ext}`);
+            fs.writeFileSync(imgPath, Buffer.from(downloaded.base64, 'base64'));
+            savedPaths.push(imgPath);
+          } catch { /* ignore */ }
+        }
+      }
+      if (images.length === 0) images = undefined;
+      if (savedPaths.length > 0) prompt += `\n[用户发送的图片已保存: ${savedPaths.join(', ')}]`;
+    }
+
+    // 7) File attachments — same as onMessage
+    if (msg.files && msg.files.length > 0) {
+      const filePaths: string[] = [];
+      for (const fileInfo of msg.files) {
+        const filePath = await this.sender.downloadFile(msg.messageId, fileInfo.fileKey, fileInfo.fileName, parentSession.sessionDir);
+        if (filePath) filePaths.push(filePath);
+      }
+      if (filePaths.length > 0) prompt += `\n[用户发送的文件已保存: ${filePaths.join(', ')}]`;
+    }
+
+    // Typing reaction — MeMeMe to match @mention behaviour.
+    let reactionId: string | null = await this.typing.start(msg.messageId).catch(() => null);
+
+    try {
+      await this.executeAndReply({
+        sessionKey: forkSessionKey,
+        chatId: msg.chatId,
+        prompt,
+        sessionDir: parentSession.sessionDir,
+        replyToMessageId: msg.messageId,
+        existingRootId: msg.threadId ? msg.rootId : undefined,
+        isNonMentionGroup,
+        images,
+      });
+    } finally {
+      if (reactionId) {
+        this.typing.stop(msg.messageId, reactionId).catch(() => {});
+      }
+      this.parallelRunner.release(opts.parentSessionKey, forkN);
+      try { this.runner.reset(forkSessionKey); } catch { /* ignore */ }
+    }
+  }
+
+  /**
    * Shared reply pipeline: run Claude, stream results, send reply.
    * Used by both normal messages and cron jobs.
    */
@@ -1661,14 +1837,18 @@ export class MessageBridge {
       // it as a standalone image message (would be a duplicate).
       const scanText = replyText.replace(/<{1,2}\s*IMG\s*[:：][^>]+>{1,2}\s*/gi, '');
 
-      // Match absolute paths that look like files (with extensions)
+      // Match absolute paths that look like files (with extensions). The char
+      // class includes CJK ideographs so Chinese filenames like "报告.xlsx" are
+      // captured. Without this, the regex silently drops paths and the file
+      // never reaches the user.
       const escapedDir = sessionDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       const projectRoot = path.resolve(sessionDir, '..', '..');
       const escapedRoot = projectRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const pathChar = '[\\w./\\-一-鿿]+';
       const patterns = [
-        new RegExp(escapedDir + '/[\\w./-]+\\.\\w+', 'g'),
-        new RegExp(escapedRoot + '/[\\w./-]+\\.\\w+', 'g'),
-        /\/tmp\/[\w./-]+\.\w+/g,
+        new RegExp(escapedDir + '/' + pathChar + '\\.\\w+', 'g'),
+        new RegExp(escapedRoot + '/' + pathChar + '\\.\\w+', 'g'),
+        new RegExp('/tmp/' + pathChar + '\\.\\w+', 'g'),
       ];
       const allMatches: string[] = [];
       for (const p of patterns) {

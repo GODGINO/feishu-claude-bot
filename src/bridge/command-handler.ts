@@ -9,6 +9,7 @@ import type { EmailSetup } from './email-setup.js';
 import type { IdleMonitor } from '../email/idle-monitor.js';
 import type { WechatBridge } from '../wechat/wechat-bridge.js';
 import type { ParallelRunner } from '../claude/parallel-runner.js';
+import type { IncomingMessage } from '../feishu/event-handler.js';
 
 export interface CommandContext {
   chatId: string;
@@ -16,6 +17,10 @@ export interface CommandContext {
   sessionKey: string;
   userId: string;
   senderName?: string;
+  /** Original incoming message object — required for /并行 to reuse the full
+   * onMessage prompt-decoration pipeline (group hints, quoted msg, missed
+   * messages, attachments). Optional so other commands aren't forced to pass it. */
+  msg?: IncomingMessage;
 }
 
 /**
@@ -39,6 +44,9 @@ const CN_ALIASES: Record<string, string> = {
   '/微信': '/wechat',
   '/并行': '/parallel',
   '/parallel-agent': '/parallel',
+  '/btw': '/parallel',
+  '/顺便': '/parallel',
+  '/分身': '/parallel',
 };
 
 /**
@@ -50,6 +58,7 @@ export class CommandHandler {
   private idleMonitor: IdleMonitor | null = null;
   private wechatBridge: WechatBridge | null = null;
   private parallelRunner: ParallelRunner | null = null;
+  private runParallelCallback: ((opts: { parentSessionKey: string; prompt: string; msg: IncomingMessage }) => Promise<void>) | null = null;
 
   constructor(
     private sender: MessageSender,
@@ -74,6 +83,10 @@ export class CommandHandler {
 
   setParallelRunner(runner: ParallelRunner): void {
     this.parallelRunner = runner;
+  }
+
+  setRunParallel(cb: (opts: { parentSessionKey: string; prompt: string; msg: IncomingMessage }) => Promise<void>): void {
+    this.runParallelCallback = cb;
   }
 
   async handle(text: string, ctx: CommandContext): Promise<boolean> {
@@ -130,13 +143,14 @@ export class CommandHandler {
   }
 
   /**
-   * `/并行 <prompt>` — spawn an isolated Claude child process that shares the
-   * session directory but writes its own transcript. Returns immediately; the
-   * agent runs detached and posts its result back to the chat when it finishes.
-   * See src/claude/parallel-runner.ts.
+   * `/并行 <prompt>` — fork agent that shares the session directory but spawns
+   * with a fresh sessionKey so it runs in parallel without blocking the main
+   * conversation. UX is *identical* to a normal message (typing indicator,
+   * reply quote, streaming card) — no banner, no prefix. Delegates to
+   * MessageBridge.runParallelAgent via the runParallelCallback.
    */
   private async handleParallel(text: string, ctx: CommandContext): Promise<boolean> {
-    if (!this.parallelRunner) {
+    if (!this.runParallelCallback || !ctx.msg) {
       await this.sender.sendText(ctx.chatId, '⚠️ /并行 功能尚未启用', ctx.messageId);
       return true;
     }
@@ -150,15 +164,14 @@ export class CommandHandler {
       );
       return true;
     }
-    const session = this.sessionMgr.getOrCreate(ctx.sessionKey);
-    // Fire-and-forget — the runner posts back to chatId itself.
-    this.parallelRunner.run({
+    // Fire-and-forget; the parallel agent will reply on its own via the
+    // standard pipeline (the user sees streaming card + reply quote).
+    // Pass the original msg through so runParallelAgent can reuse the full
+    // onMessage prompt-decoration pipeline (identity, group hint, quote, etc).
+    this.runParallelCallback({
       parentSessionKey: ctx.sessionKey,
-      parentSessionDir: session.sessionDir,
-      chatId: ctx.chatId,
       prompt,
-      replyToMessageId: ctx.messageId,
-      sender: this.sender,
+      msg: ctx.msg,
     }).catch((err) => {
       this.logger.error({ err, sessionKey: ctx.sessionKey }, '/并行 runner crashed');
     });

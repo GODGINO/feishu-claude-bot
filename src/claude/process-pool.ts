@@ -270,6 +270,25 @@ export class ProcessPool {
   }
 
   /**
+   * Read the saved sessionId for a sessionKey, or null if not registered.
+   * Used by /并行 to clone the parent sessionId into the fork sessionKey so
+   * fork agents resume the same transcript stream.
+   */
+  getSavedSessionId(sessionKey: string): string | null {
+    return this.savedSessionIds.get(sessionKey) || null;
+  }
+
+  /**
+   * Pre-register a sessionId for a sessionKey before its first spawn. Next
+   * spawn for this key will use `--resume <id>` from the start. Used by /并行
+   * to make fork agents share the parent's transcript.
+   */
+  setSavedSessionId(sessionKey: string, sessionId: string): void {
+    this.savedSessionIds.set(sessionKey, sessionId);
+    this.saveState();
+  }
+
+  /**
    * Reset a session (/new command).
    * Kills the process and clears saved sessionId.
    * Next message will spawn a fresh process WITHOUT --resume = clean context.
