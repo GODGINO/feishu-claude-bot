@@ -20,6 +20,7 @@ import type { EmailAccount } from '../email/account-store.js';
 import { CardStreamer } from '../feishu/card-streamer.js';
 import type { MemberManager } from '../members/member-manager.js';
 import type { WechatBridge } from '../wechat/wechat-bridge.js';
+import { ParallelRunner } from '../claude/parallel-runner.js';
 
 const TITLE_INSTRUCTION = '\n\n[当你的回复包含 markdown 格式（表格、列表、代码块、加粗、链接、分隔线等）时，必须在第一行写 <<TITLE:简短标题|颜色>>，然后空一行写正文。颜色可选：blue（默认/信息/成功/完成）/ green（上涨/增长/积极行情）/ red（失败/紧急/下跌）/ orange（警告）/ yellow（提醒/亮点）/ wathet（次级信息/数据播报）/ turquoise（进展中）/ carmine（严重警告）/ violet/purple/indigo（特殊场景）/ grey（中立/不活跃）。不指定颜色时省略 |颜色 即可（默认 blue）。示例：<<TITLE:部署完成>>、<<TITLE:沪指 -1.5%|orange>>、<<TITLE:茅台涨停|green>>。标题10字以内，概括主题；标题里如果你想加 emoji（如 ✅ ❌ ⚠️ 💡 🔄 🚨 ✨ 📊 等）可以自己加，系统不会再自动追加任何 emoji。纯文字短回复（打招呼、一两句话确认）不要写标题。]';
 
@@ -53,6 +54,7 @@ export class MessageBridge {
   private queue: MessageQueue;
   private groupContext: GroupContextBuffer;
   private emailSetup: EmailSetup;
+  private parallelRunner: ParallelRunner;
   // Dedup: Feishu WebSocket can re-deliver events on reconnect, bypassing event-handler dedup
   private recentMessageIds = new Set<string>();
   private memberMgr?: MemberManager;
@@ -87,6 +89,10 @@ export class MessageBridge {
       logger,
     );
     this.commandHandler.setEmailSetup(this.emailSetup);
+    // /并行 driver: spawns isolated Claude children for parallel work without
+    // blocking the main process pool. See src/claude/parallel-runner.ts.
+    this.parallelRunner = new ParallelRunner(config, logger);
+    this.commandHandler.setParallelRunner(this.parallelRunner);
 
     // Periodically clean up expired button card cache entries
     setInterval(() => {

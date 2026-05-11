@@ -8,6 +8,7 @@ import { loadRules, saveRules } from '../email/email-processor.js';
 import type { EmailSetup } from './email-setup.js';
 import type { IdleMonitor } from '../email/idle-monitor.js';
 import type { WechatBridge } from '../wechat/wechat-bridge.js';
+import type { ParallelRunner } from '../claude/parallel-runner.js';
 
 export interface CommandContext {
   chatId: string;
@@ -36,6 +37,8 @@ const CN_ALIASES: Record<string, string> = {
   '/模型': '/model',
   '/思考': '/effort',
   '/微信': '/wechat',
+  '/并行': '/parallel',
+  '/parallel-agent': '/parallel',
 };
 
 /**
@@ -46,6 +49,7 @@ export class CommandHandler {
   private emailSetup: EmailSetup | null = null;
   private idleMonitor: IdleMonitor | null = null;
   private wechatBridge: WechatBridge | null = null;
+  private parallelRunner: ParallelRunner | null = null;
 
   constructor(
     private sender: MessageSender,
@@ -66,6 +70,10 @@ export class CommandHandler {
 
   setWechatBridge(bridge: WechatBridge): void {
     this.wechatBridge = bridge;
+  }
+
+  setParallelRunner(runner: ParallelRunner): void {
+    this.parallelRunner = runner;
   }
 
   async handle(text: string, ctx: CommandContext): Promise<boolean> {
@@ -114,8 +122,47 @@ export class CommandHandler {
     if (cmd === '/wechat' || cmd.startsWith('/wechat ')) {
       return this.handleWechat(text.trim(), ctx);
     }
+    if (cmd === '/parallel' || cmd.startsWith('/parallel ')) {
+      return this.handleParallel(text.trim(), ctx);
+    }
 
     return false;
+  }
+
+  /**
+   * `/并行 <prompt>` — spawn an isolated Claude child process that shares the
+   * session directory but writes its own transcript. Returns immediately; the
+   * agent runs detached and posts its result back to the chat when it finishes.
+   * See src/claude/parallel-runner.ts.
+   */
+  private async handleParallel(text: string, ctx: CommandContext): Promise<boolean> {
+    if (!this.parallelRunner) {
+      await this.sender.sendText(ctx.chatId, '⚠️ /并行 功能尚未启用', ctx.messageId);
+      return true;
+    }
+    // Strip the command head; preserve everything after it as the prompt.
+    const prompt = text.replace(/^\S+\s*/, '').trim();
+    if (!prompt) {
+      await this.sender.sendText(
+        ctx.chatId,
+        '用法：`/并行 <提示词>`  开启一个分身处理这个任务，主对话不被打断。最多 2 个并行。',
+        ctx.messageId,
+      );
+      return true;
+    }
+    const session = this.sessionMgr.getOrCreate(ctx.sessionKey);
+    // Fire-and-forget — the runner posts back to chatId itself.
+    this.parallelRunner.run({
+      parentSessionKey: ctx.sessionKey,
+      parentSessionDir: session.sessionDir,
+      chatId: ctx.chatId,
+      prompt,
+      replyToMessageId: ctx.messageId,
+      sender: this.sender,
+    }).catch((err) => {
+      this.logger.error({ err, sessionKey: ctx.sessionKey }, '/并行 runner crashed');
+    });
+    return true;
   }
 
   private async handleNew(ctx: CommandContext): Promise<boolean> {
