@@ -229,24 +229,48 @@ export class CronRunner {
 
   /**
    * Schedule a single user job with setTimeout, auto-reschedule after execution
+   *
+   * Robustness: We check the job's existence on disk TWICE:
+   *   1. **Right before execution** — guards against orphan timers from a previous
+   *      schedule cycle still firing after the job was removed from cron-jobs.json
+   *      (e.g. user deletes the job + the hot-reload signal got lost / racey).
+   *   2. **After execution, before reschedule** — same check, but cheaper because
+   *      we already know the in-memory entry was current at exec time.
+   *
+   * Either check failing → drop the timer + delete the in-memory entry, so the
+   * job stops cleanly without one more rogue execution.
    */
   private scheduleUserJob(sessionKey: string, job: CronJob, delayMs: number): void {
+    const isStillScheduled = (): boolean => {
+      if (!this.userJobs.has(job.id)) return false;
+      const session = this.sessionMgr.getOrCreate(sessionKey);
+      const jobsFile = path.join(session.sessionDir, JOBS_FILENAME);
+      try {
+        const jobs: CronJob[] = JSON.parse(fs.readFileSync(jobsFile, 'utf-8'));
+        return jobs.some((j) => j.id === job.id && j.enabled);
+      } catch {
+        return false;
+      }
+    };
+
     const timer = setTimeout(() => {
+      // (1) Pre-execution disk check — drops zombie timers whose job was removed
+      // from cron-jobs.json after they were originally scheduled.
+      if (!isStillScheduled()) {
+        this.logger.info(
+          { jobId: job.id, name: job.name, sessionKey },
+          'Job no longer on disk at fire time, dropping zombie timer',
+        );
+        this.userJobs.delete(job.id);
+        return;
+      }
       this.executeUserJob(sessionKey, job).catch((err) => {
         this.logger.error({ err, jobId: job.id }, 'User cron job execution failed');
       }).finally(() => {
-        // Verify job still exists on disk before rescheduling (prevents zombie timers)
-        if (!this.userJobs.has(job.id)) return;
-        const session = this.sessionMgr.getOrCreate(sessionKey);
-        const jobsFile = path.join(session.sessionDir, JOBS_FILENAME);
-        try {
-          const jobs: CronJob[] = JSON.parse(fs.readFileSync(jobsFile, 'utf-8'));
-          if (!jobs.some((j) => j.id === job.id && j.enabled)) {
-            this.logger.info({ jobId: job.id, name: job.name }, 'Job removed from disk, stopping timer');
-            this.userJobs.delete(job.id);
-            return;
-          }
-        } catch { /* file missing or corrupt — stop to be safe */
+        // (2) Post-execution disk check — covers the case where the job was
+        // removed during execution. Without this, finally() would reschedule it.
+        if (!isStillScheduled()) {
+          this.logger.info({ jobId: job.id, name: job.name }, 'Job removed from disk, stopping timer');
           this.userJobs.delete(job.id);
           return;
         }

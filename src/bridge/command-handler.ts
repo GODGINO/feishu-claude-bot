@@ -42,11 +42,12 @@ const CN_ALIASES: Record<string, string> = {
   '/模型': '/model',
   '/思考': '/effort',
   '/微信': '/wechat',
+  // `/并行` is the toggle command (on/off/status) for the auto-fork feature.
+  // Manual single-shot fork uses the `// <prompt>` prefix (handled in message-bridge,
+  // not here). The old aliases `/parallel-agent` `/btw` `/顺便` `/分身` are deliberately
+  // removed — if a user sends them, they fall through to normal text + we emit a hint
+  // via the `parallel_legacy_prefix_hint` path in message-bridge.
   '/并行': '/parallel',
-  '/parallel-agent': '/parallel',
-  '/btw': '/parallel',
-  '/顺便': '/parallel',
-  '/分身': '/parallel',
 };
 
 /**
@@ -143,38 +144,95 @@ export class CommandHandler {
   }
 
   /**
-   * `/并行 <prompt>` — fork agent that shares the session directory but spawns
-   * with a fresh sessionKey so it runs in parallel without blocking the main
-   * conversation. UX is *identical* to a normal message (typing indicator,
-   * reply quote, streaming card) — no banner, no prefix. Delegates to
-   * MessageBridge.runParallelAgent via the runParallelCallback.
+   * `/并行` — manage per-session auto-fork mode. Mirrors the `/auto` reply-mode UX:
+   * no-arg shows status + toggle buttons (current state highlighted), explicit
+   * subcommands flip the state silently.
+   *
+   *   /并行                → show status card with on/off BUTTON (current highlighted)
+   *   /并行 on / auto      → enable
+   *   /并行 off            → disable
+   *
+   * When auto-fork is on: any user message arriving while the main agent is busy
+   * is dispatched as a fork (same as `// <prompt>`) instead of being queued. The
+   * flag is stored as the file `<sessionDir>/parallel-auto` (exists = on).
+   *
+   * Manual single-shot fork uses `// <prompt>` prefix (handled in onMessage).
    */
   private async handleParallel(text: string, ctx: CommandContext): Promise<boolean> {
-    if (!this.runParallelCallback || !ctx.msg) {
-      await this.sender.sendText(ctx.chatId, '⚠️ /并行 功能尚未启用', ctx.messageId);
-      return true;
-    }
-    // Strip the command head; preserve everything after it as the prompt.
-    const prompt = text.replace(/^\S+\s*/, '').trim();
-    if (!prompt) {
+    const session = this.sessionMgr.get(ctx.sessionKey) || this.sessionMgr.getOrCreate(ctx.sessionKey);
+    const flagFile = `${session.sessionDir}/parallel-auto`;
+    const isOn = () => fs.existsSync(flagFile);
+    const setOn = () => { try { fs.writeFileSync(flagFile, 'on'); } catch {} };
+    const setOff = () => { try { fs.unlinkSync(flagFile); } catch {} };
+
+    const parts = text.trim().split(/\s+/);
+    const sub = parts[1]?.toLowerCase();
+    const maxParallel = this.parallelRunner?.getMax() ?? 4;
+    const activeFork = this.parallelRunner?.activeCount(ctx.sessionKey) ?? 0;
+
+    if (sub === 'on' || sub === 'auto') {
+      setOn();
       await this.sender.sendText(
         ctx.chatId,
-        '用法：`/并行 <提示词>`  开启一个分身处理这个任务，主对话不被打断。最多 2 个并行。',
+        `✅ 自动并行已开启\n主 agent 忙碌时，新消息会自动 fork（无需 \`// \` 前缀）。\n当前 fork: ${activeFork}/${maxParallel}（含主进程并发上限 ${maxParallel + 1}）`,
         ctx.messageId,
+      );
+      this.logger.info({ sessionKey: ctx.sessionKey }, '/并行 auto: on');
+      return true;
+    }
+    if (sub === 'off') {
+      setOff();
+      await this.sender.sendText(
+        ctx.chatId,
+        `⭕ 自动并行已关闭\n主 agent 忙碌时新消息排队等待。仍可用 \`// <prompt>\` 手动 fork。\n当前 fork: ${activeFork}/${maxParallel}`,
+        ctx.messageId,
+      );
+      this.logger.info({ sessionKey: ctx.sessionKey }, '/并行 auto: off');
+      return true;
+    }
+    if (!sub) {
+      // No arg → status card with on/off toggle buttons (current state highlighted).
+      // Mirrors the `/auto` MENU pattern for visual consistency.
+      const current: 'on' | 'off' = isOn() ? 'on' : 'off';
+      const descMap: Record<string, string> = {
+        on: '当前：主 agent 忙碌时新消息**自动 fork**（无需 \`// \` 前缀）',
+        off: '当前：主 agent 忙碌时新消息**排队**等待。仍可用 \`// <prompt>\` 手动 fork',
+      };
+      const MENU: Array<{ alias: 'on' | 'off'; label: string }> = [
+        { alias: 'on',  label: '开启 (自动 fork)' },
+        { alias: 'off', label: '关闭 (排队等待)' },
+      ];
+      const lines: string[] = [
+        `<<TITLE:自动并行: ${current.toUpperCase()}>>`,
+        '',
+        descMap[current],
+        '',
+        `**当前 fork**: ${activeFork}/${maxParallel}  ·  含主并发上限 ${maxParallel + 1}`,
+        '',
+        '点按下方按钮切换（当前高亮）：',
+        '',
+      ];
+      for (const item of MENU) {
+        const style = item.alias === current ? 'primary' : 'default';
+        lines.push(`<<BUTTON:${item.label}|/并行 ${item.alias}|${style}>>`);
+      }
+      await this.sender.sendReply(
+        ctx.chatId,
+        lines.join('\n'),
+        ctx.messageId,
+        undefined,
+        undefined,
+        { sessionKey: ctx.sessionKey, chatId: ctx.chatId },
       );
       return true;
     }
-    // Fire-and-forget; the parallel agent will reply on its own via the
-    // standard pipeline (the user sees streaming card + reply quote).
-    // Pass the original msg through so runParallelAgent can reuse the full
-    // onMessage prompt-decoration pipeline (identity, group hint, quote, etc).
-    this.runParallelCallback({
-      parentSessionKey: ctx.sessionKey,
-      prompt,
-      msg: ctx.msg,
-    }).catch((err) => {
-      this.logger.error({ err, sessionKey: ctx.sessionKey }, '/并行 runner crashed');
-    });
+    // Unknown subcommand — likely a legacy invocation like `/并行 帮我查 X`
+    // that used to mean "fork this prompt". Redirect to the new `// ` prefix.
+    await this.sender.sendText(
+      ctx.chatId,
+      `ℹ️ \`/并行\` 现在是**开关命令**，不再带 prompt。\n\n• 手动 fork：在消息开头加 \`// \` —— 例如 \`// ${text.replace(/^\S+\s*/, '').slice(0, 30)}\`\n• 开关自动 fork：\`/并行\`（无参显示状态卡片）或 \`/并行 on\` / \`/并行 off\``,
+      ctx.messageId,
+    );
     return true;
   }
 

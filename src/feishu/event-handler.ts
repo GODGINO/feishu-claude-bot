@@ -34,7 +34,18 @@ export type MessageHandler = (msg: IncomingMessage) => void | Promise<void>;
 const recentMessageIds = new Set<string>();
 const DEDUP_TTL_MS = 600_000; // 10 minutes
 
-export type CardActionHandler = (action: { sessionKey: string; chatId: string; actionId: string; label: string; operatorId: string; cardId?: string; messageId?: string; formValue?: Record<string, string | string[]> }) => void | Promise<void>;
+/**
+ * Card action handler. May return a toast descriptor that the SDK passes back to
+ * Feishu as the callback HTTP response (`{ toast: { type, content } }`), which
+ * pops a floating notification on the operator's client. Returning nothing (or
+ * undefined toast) leaves it to Feishu's default UI feedback (button visual).
+ *
+ * The handler MUST be quick (only synthesizes the toast); actual business work
+ * should be dispatched async so the callback response isn't blocked.
+ */
+export type CardActionToast = { type: 'info' | 'success' | 'warning' | 'error'; content: string };
+export type CardActionResponse = { toast?: CardActionToast };
+export type CardActionHandler = (action: { sessionKey: string; chatId: string; actionId: string; label: string; operatorId: string; cardId?: string; messageId?: string; formValue?: Record<string, string | string[]> }) => CardActionResponse | void | Promise<CardActionResponse | void>;
 
 export type RecallHandler = (event: { messageId: string; chatId: string; recallTime: string; recallType: string }) => void | Promise<void>;
 
@@ -243,18 +254,27 @@ export function createEventHandler(
         );
 
         if (cardActionHandler) {
-          Promise.resolve(cardActionHandler({
-            sessionKey: value.sessionKey,
-            chatId: value.chatId,
-            actionId: value.action,
-            label: value.label,
-            operatorId,
-            cardId: value.cardId || '',
-            messageId,
-            formValue,
-          })).catch((err: any) => {
+          // Handler is expected to synthesize the toast quickly and dispatch
+          // the actual business work asynchronously — we await briefly so the
+          // returned toast can be relayed back to Feishu as the callback's
+          // HTTP response body.
+          try {
+            const result = await cardActionHandler({
+              sessionKey: value.sessionKey,
+              chatId: value.chatId,
+              actionId: value.action,
+              label: value.label,
+              operatorId,
+              cardId: value.cardId || '',
+              messageId,
+              formValue,
+            });
+            if (result?.toast) {
+              return { toast: result.toast };
+            }
+          } catch (err: any) {
             logger.error({ err }, 'Error in card action handler');
-          });
+          }
         }
       } catch (err) {
         logger.error({ err }, 'Error handling card action event');

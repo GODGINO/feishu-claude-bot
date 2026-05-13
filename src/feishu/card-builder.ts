@@ -320,7 +320,11 @@ export function extractTitleFromText(text: string, maxLen = 40): { title: string
  */
 export function extractButtons(text: string): { cleanText: string; buttons: ButtonInfo[] } {
   const buttons: ButtonInfo[] = [];
-  const cleanText = text.replace(/<{1,2}\s*BUTTON\s*:\s*([^|>]+?)\s*\|\s*([^|>]+?)\s*(?:\|\s*([^>]+?)\s*)?>{1,2}[\s]*/gi, (_, label, actionId, type) => {
+  // Half/full-width tolerance: `:` or `：`, `|` or `｜`. Mirrors SELECT/MSELECT/CHECK/TOAST/IMG.
+  // **label** allows `>` inside text (e.g. "白酒跌幅>2%通知") — relies on the lazy
+  // quantifier `+?` to stop at the first `|` separator. **actionId** still rejects
+  // `>` because it must end before the closing `>>` and shouldn't contain inequality.
+  const cleanText = text.replace(/<{1,2}\s*BUTTON\s*[:：]\s*([^|｜]+?)\s*[|｜]\s*([^|｜>]+?)\s*(?:[|｜]\s*([^>]+?)\s*)?>{1,2}[\s]*/gi, (_, label, actionId, type) => {
     const trimmedAction = actionId.trim();
     const isLink = /^https?:\/\//.test(trimmedAction);
     buttons.push({
@@ -390,6 +394,39 @@ export function extractSelects(text: string): { cleanText: string; selects: Sele
 /** Single MSELECT (multi-select) field — same shape as SelectInfo, rendered as `multi_select_static`. */
 export interface MultiSelectInfo extends SelectInfo {}
 
+/**
+ * Single CHECK field — parsed from `<<CHECK:name|✓?|text|style?>>`. Rendered as a
+ * Feishu `checker` element inside the shared form container, so its boolean
+ * value is collected with all other fields when the user clicks Submit.
+ *
+ * `defaultChecked` toggles the initial check state (parsed from `✓`/`1`/`true`).
+ * `style` toggles `checked_style` on the rendered element:
+ *   - undefined → no visual change when checked (default; best for most pick-options scenarios)
+ *   - 'strike'  → strikethrough only ("cancelled / removed")
+ *   - 'dim'     → opacity fade only ("read / acknowledged")
+ *   - 'done'    → strikethrough + fade ("completed todo / checked-off task")
+ */
+export interface CheckerInfo {
+  name: string;
+  text: string;
+  defaultChecked: boolean;
+  style?: 'strike' | 'dim' | 'done';
+}
+
+/**
+ * Toast pop-up to show after the user clicks form submit / a button.
+ * Returned in the card-callback HTTP response as `{ toast: { type, content } }`.
+ * Feishu allowed types: info | success | warning | error.
+ *
+ * Parsed from `<<TOAST:type|content>>` tags. Not rendered as a visual element
+ * (the toast is a floating overlay, not card content) — just stashed on the
+ * cached card so the callback handler can return it.
+ */
+export interface ToastInfo {
+  type: 'info' | 'success' | 'warning' | 'error';
+  content: string;
+}
+
 /** Parsed <<IMG:url|alt?>> tag — `url` is either https or a local absolute path. */
 export interface ImageInfo {
   url: string;
@@ -401,7 +438,8 @@ export type ContentSegment =
   | { kind: 'text'; content: string }
   | { kind: 'image'; index: number }
   | { kind: 'select'; index: number }
-  | { kind: 'mselect'; index: number };
+  | { kind: 'mselect'; index: number }
+  | { kind: 'check'; index: number };
 
 /**
  * Parse <<IMG:url|alt?>> tags in body text. Returns three views of the same content:
@@ -463,23 +501,31 @@ export function extractImages(text: string): { cleanText: string; images: ImageI
  * Names are deduplicated across SELECT and MSELECT (they share the same form_value
  * keyspace, so a clash would silently overwrite). First wins, later dupes are dropped.
  */
-export function parseInteractive(text: string): {
+export function parseInteractive(
+  text: string,
+  opts?: { sessionDir?: string; projectRoot?: string },
+): {
   segments: ContentSegment[];
   images: ImageInfo[];
   selects: SelectInfo[];
   multiSelects: MultiSelectInfo[];
+  checkers: CheckerInfo[];
+  toast: ToastInfo | undefined;
   cleanText: string;
+  consumedBarePaths: string[];
 } {
   const segments: ContentSegment[] = [];
   const images: ImageInfo[] = [];
   const selects: SelectInfo[] = [];
   const multiSelects: MultiSelectInfo[] = [];
+  const checkers: CheckerInfo[] = [];
+  let toast: ToastInfo | undefined;
   let cleanText = '';
   let lastEnd = 0;
   // MSELECT first in alternation — guards against any edge case where the engine
-  // could short-circuit on SELECT inside MSELECT. Tag spelling itself disambiguates,
-  // but order is cheap insurance.
-  const re = /<{1,2}\s*(IMG|MSELECT|SELECT)\s*[:：]\s*([^>]+?)\s*>{1,2}\s*/gi;
+  // could short-circuit on SELECT inside MSELECT. CHECK / TOAST are independent
+  // (no substring confusion). Tag spelling disambiguates the rest.
+  const re = /<{1,2}\s*(IMG|MSELECT|SELECT|CHECK|TOAST)\s*[:：]\s*([^>]+?)\s*>{1,2}\s*/gi;
   const seenFieldNames = new Set<string>();
   let m: RegExpExecArray | null;
   while ((m = re.exec(text)) !== null) {
@@ -496,6 +542,55 @@ export function parseInteractive(text: string): {
         const idx = images.length;
         images.push({ url: parts[0], alt: parts[1] });
         segments.push({ kind: 'image', index: idx });
+      }
+    } else if (tag === 'TOAST') {
+      // Format: <<TOAST:type|content>>. type defaults to 'success' if absent.
+      // Not rendered into segments — purely a side-channel for the callback response.
+      if (parts.length >= 1) {
+        const allowedTypes = ['info', 'success', 'warning', 'error'];
+        let type: ToastInfo['type'] = 'success';
+        let content: string;
+        if (parts.length >= 2 && allowedTypes.includes(parts[0].toLowerCase())) {
+          type = parts[0].toLowerCase() as ToastInfo['type'];
+          content = parts.slice(1).join(' | ');
+        } else {
+          content = parts.join(' | ');
+        }
+        if (content) toast = { type, content };
+      }
+    } else if (tag === 'CHECK') {
+      // Format:
+      //   <<CHECK:name|text>>                       — 2 parts, default unchecked, no style
+      //   <<CHECK:name|✓|text>>                     — 3 parts (✓ as checked flag)
+      //   <<CHECK:name|✓?|text|style>>              — 4 parts, style ∈ strike|dim|done
+      // The last part is treated as `style` only if it matches a known style keyword,
+      // otherwise it's appended back into the text (so `<<CHECK:n||a|b>>` keeps `a | b` as text).
+      if (parts.length >= 2) {
+        const STYLE_RE = /^(strike|dim|done)$/i;
+        const name = parts[0];
+        let defaultChecked = false;
+        let textBody: string;
+        let style: CheckerInfo['style'];
+        // Empty `✓?` slot (`<<CHECK:n||text|done>>`) gets dropped by the `.filter(p=>p.length>0)`
+        // upstream, so 4 raw segments collapse to 3 in `parts[]`. Detect style by the keyword
+        // match on the last token instead of by length — works for both 3-part and 4-part shapes.
+        const last = parts[parts.length - 1];
+        const lastIsStyle = parts.length >= 3 && STYLE_RE.test(last);
+        if (lastIsStyle) style = last.toLowerCase() as CheckerInfo['style'];
+        const textParts = lastIsStyle ? parts.slice(0, -1) : parts;
+        if (textParts.length >= 3) {
+          const flag = textParts[1];
+          defaultChecked = /^(✓|✔|☑|1|true|y|yes|checked|on)$/i.test(flag);
+          textBody = textParts.slice(2).join(' | ');
+        } else {
+          textBody = textParts[1];
+        }
+        if (!seenFieldNames.has(name) && textBody) {
+          seenFieldNames.add(name);
+          const idx = checkers.length;
+          checkers.push({ name, text: textBody, defaultChecked, style });
+          segments.push({ kind: 'check', index: idx });
+        }
       }
     } else {
       // SELECT or MSELECT — same parsing logic
@@ -534,8 +629,159 @@ export function parseInteractive(text: string): {
     segments.push({ kind: 'text', content: tail });
     cleanText += tail;
   }
+  // Second pass: if a sessionDir/projectRoot whitelist was supplied, scan remaining
+  // text segments for bare absolute image paths (no <<IMG:>> wrapper) and lift them
+  // into inline image segments at their original position. Lets the model write
+  // natural-language paths like "/Users/.../shared/screenshot_1.png" without
+  // remembering the <<IMG:>> macro — server-side parsing makes it inline anyway.
+  const consumedBarePaths: string[] = [];
+  if (opts && (opts.sessionDir || opts.projectRoot)) {
+    const lifted = liftBareImagePaths(segments, images, opts);
+    segments.length = 0; segments.push(...lifted.segments);
+    images.length = 0; images.push(...lifted.images);
+    consumedBarePaths.push(...lifted.consumedBarePaths);
+  }
   cleanText = cleanText.trim();
-  return { segments, images, selects, multiSelects, cleanText };
+  return { segments, images, selects, multiSelects, checkers, toast, cleanText, consumedBarePaths };
+}
+
+/**
+ * Whitelist regex builder for "looks like a local image path we own".
+ * Matches absolute paths under sessionDir / projectRoot / /tmp/ with image extensions.
+ * Char class allows CJK ideographs (一-鿿) so Chinese filenames work; rejects
+ * shell metachars, quotes, brackets, and CJK punctuation that would never
+ * appear inside a real filename so we don't over-eat the surrounding text.
+ */
+function buildBareImagePathRegex(opts: { sessionDir?: string; projectRoot?: string }): RegExp | null {
+  const prefixes: string[] = [];
+  const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  if (opts.sessionDir) prefixes.push(esc(opts.sessionDir));
+  if (opts.projectRoot) prefixes.push(esc(opts.projectRoot));
+  prefixes.push('/tmp');
+  if (prefixes.length === 0) return null;
+  const pathChar = '[\\w./\\-一-鿿]';
+  const ext = '(?:png|jpg|jpeg|gif|webp|bmp)';
+  // Boundary: rejection list is intentionally narrow — only word chars, hyphens,
+  // and CJK ideographs. We DO allow `.` and `/` after the extension so that
+  // "...a.png." (sentence-ending period) and "...a.png/sub" don't sabotage the
+  // match. `a.pngx` is still rejected because `x` is a word char.
+  const body = `(?:${prefixes.join('|')})/${pathChar}+\\.${ext}(?![\\w\\-一-鿿])`;
+  return new RegExp(body, 'gi');
+}
+
+/**
+ * Detect bare absolute image paths in `text` matching the sessionDir/projectRoot/tmp
+ * whitelist. Pure helper — used by message-bridge to compute "paths the card will
+ * embed inline, so sendMentionedFiles must NOT also send them as standalone files".
+ * Skips paths inside ``` fenced code blocks.
+ */
+export function detectBareImagePaths(
+  text: string,
+  opts: { sessionDir?: string; projectRoot?: string },
+): string[] {
+  const re = buildBareImagePathRegex(opts);
+  if (!re) return [];
+  const found: string[] = [];
+  const seen = new Set<string>();
+  for (const chunk of splitOutFencedCode(text)) {
+    if (chunk.kind !== 'text') continue;
+    let m: RegExpExecArray | null;
+    re.lastIndex = 0;
+    while ((m = re.exec(chunk.content)) !== null) {
+      const p = m[0];
+      if (!seen.has(p)) { seen.add(p); found.push(p); }
+    }
+  }
+  return found;
+}
+
+/**
+ * Split text into alternating { kind: 'text' | 'code' } chunks based on triple-backtick
+ * fenced blocks. Anything inside a code fence is opaque to bare-path lifting so
+ * we don't accidentally rewrite `cp /Users/.../a.png /dst` shell snippets into images.
+ * Inline single-backtick code is left alone (negligible false-positive risk vs.
+ * complexity of state machine).
+ */
+function splitOutFencedCode(text: string): Array<{ kind: 'text' | 'code'; content: string }> {
+  const out: Array<{ kind: 'text' | 'code'; content: string }> = [];
+  const re = /```[\s\S]*?```/g;
+  let lastEnd = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > lastEnd) out.push({ kind: 'text', content: text.slice(lastEnd, m.index) });
+    out.push({ kind: 'code', content: m[0] });
+    lastEnd = m.index + m[0].length;
+  }
+  if (lastEnd < text.length) out.push({ kind: 'text', content: text.slice(lastEnd) });
+  return out;
+}
+
+/**
+ * Take existing `segments` + `images` from parseInteractive and rewrite each
+ * `text` segment, expanding bare image paths in-place into image segments.
+ * Returns the new arrays plus the list of paths that were consumed (so callers
+ * can deduplicate against sendMentionedFiles).
+ */
+function liftBareImagePaths(
+  segments: ContentSegment[],
+  images: ImageInfo[],
+  opts: { sessionDir?: string; projectRoot?: string },
+): { segments: ContentSegment[]; images: ImageInfo[]; consumedBarePaths: string[] } {
+  const re = buildBareImagePathRegex(opts);
+  if (!re) return { segments, images, consumedBarePaths: [] };
+  const newSegments: ContentSegment[] = [];
+  const newImages: ImageInfo[] = [...images];
+  const consumedBarePaths: string[] = [];
+  const consumedSeen = new Set<string>();
+  // Pre-pass: strip Markdown image syntax `![alt](path)` down to just `path` before
+  // the bare-path regex runs — but ONLY for local paths in our whitelist (sessionDir
+  // / projectRoot / /tmp/). Otherwise external URL markdown like
+  // `![pic](https://example.com/x.png)` would also get flattened to a naked URL,
+  // which is worse than leaving the syntax intact (rendered as markdown link).
+  const mdImageRe = /!\[([^\]]*)\]\(([^)\s]+)\)/g;
+  const pathOnlyRe = buildBareImagePathRegex(opts);
+  const isLocalImagePath = (p: string): boolean => {
+    if (!pathOnlyRe) return false;
+    pathOnlyRe.lastIndex = 0;
+    const m = pathOnlyRe.exec(p);
+    return m !== null && m[0] === p;
+  };
+  const altMap = new Map<string, string>(); // path → alt (best-effort, first wins)
+  const stripMdImageSyntax = (s: string): string =>
+    s.replace(mdImageRe, (full, alt: string, p: string) => {
+      if (!isLocalImagePath(p)) return full; // leave external/non-image MD intact
+      if (alt && !altMap.has(p)) altMap.set(p, alt);
+      return p;
+    });
+  for (const seg of segments) {
+    if (seg.kind !== 'text') { newSegments.push(seg); continue; }
+    // Walk fenced code-safe sub-chunks; lift only in text portions.
+    const subChunks = splitOutFencedCode(seg.content);
+    for (const sub of subChunks) {
+      if (sub.kind === 'code') {
+        newSegments.push({ kind: 'text', content: sub.content });
+        continue;
+      }
+      const stripped = stripMdImageSyntax(sub.content);
+      let lastEnd = 0;
+      re.lastIndex = 0;
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(stripped)) !== null) {
+        const before = stripped.slice(lastEnd, m.index);
+        if (before.length > 0) newSegments.push({ kind: 'text', content: before });
+        const url = m[0];
+        const idx = newImages.length;
+        const alt = altMap.get(url);
+        newImages.push(alt ? { url, alt } : { url });
+        newSegments.push({ kind: 'image', index: idx });
+        if (!consumedSeen.has(url)) { consumedSeen.add(url); consumedBarePaths.push(url); }
+        lastEnd = m.index + m[0].length;
+      }
+      const tail = stripped.slice(lastEnd);
+      if (tail.length > 0) newSegments.push({ kind: 'text', content: tail });
+    }
+  }
+  return { segments: newSegments, images: newImages, consumedBarePaths };
 }
 
 /**
@@ -619,8 +865,9 @@ export function buildSelectFormElement(
   ctx: ButtonContext = {},
   submitLabel = '提交',
   multiSelects: MultiSelectInfo[] = [],
+  checkers: CheckerInfo[] = [],
 ): object | null {
-  if (!selects.length && !multiSelects.length) return null;
+  if (!selects.length && !multiSelects.length && !checkers.length) return null;
   if (!ctx.sessionKey) return null; // callback buttons need a session to route to
 
   const formElements: object[] = [];
@@ -647,6 +894,21 @@ export function buildSelectFormElement(
         text: { tag: 'plain_text', content: opt.label },
       })),
     });
+  }
+
+  for (const chk of checkers) {
+    // checker has no `behaviors` → state stays local until form submit,
+    // at which point form_value[name] will be `true`/`false`.
+    const el: any = {
+      tag: 'checker',
+      name: chk.name,
+      checked: chk.defaultChecked,
+      text: { tag: 'lark_md', content: chk.text },
+    };
+    if (chk.style === 'strike') el.checked_style = { show_strikethrough: true };
+    else if (chk.style === 'dim') el.checked_style = { opacity: 0.6 };
+    else if (chk.style === 'done') el.checked_style = { show_strikethrough: true, opacity: 0.6 };
+    formElements.push(el);
   }
 
   formElements.push({
@@ -752,6 +1014,7 @@ export function buildCompleteCard(
   multiSelects?: MultiSelectInfo[],
   images?: Array<{ imageKey: string | null; url: string; alt?: string }>,
   segments?: ContentSegment[],
+  checkers?: CheckerInfo[],
 ): object {
   // Extract TITLE tag via shared tolerant parser (handles <<TITLE:xxx>>, <<TITLE:xxx|color>>, HTML-mixed, etc.)
   const { title: extracted, body, color: headerColor } = extractTitleFromText(text || '(空回复)', 30);
@@ -831,8 +1094,29 @@ export function buildCompleteCard(
     display_lines: 0,
     options: msel.options.map((opt) => ({ value: opt.key, text: { tag: 'plain_text', content: opt.label } })),
   });
+  const buildCheckerElement = (chk: CheckerInfo): object => {
+    const el: any = {
+      tag: 'checker',
+      name: chk.name,
+      checked: chk.defaultChecked,
+      text: { tag: 'lark_md', content: chk.text },
+    };
+    // Only set `checked_style` when the model explicitly opts in. Default (no style)
+    // = no visual change when checked, which fits picker / preference / subscription
+    // scenarios. The model picks `strike` / `dim` / `done` when "completed" semantics apply.
+    if (chk.style === 'strike') {
+      el.checked_style = { show_strikethrough: true };
+    } else if (chk.style === 'dim') {
+      el.checked_style = { opacity: 0.6 };
+    } else if (chk.style === 'done') {
+      el.checked_style = { show_strikethrough: true, opacity: 0.6 };
+    }
+    return el;
+  };
 
-  const hasFormFields = (selects && selects.length > 0) || (multiSelects && multiSelects.length > 0);
+  const hasFormFields = (selects && selects.length > 0)
+    || (multiSelects && multiSelects.length > 0)
+    || (checkers && checkers.length > 0);
 
   // BIG-FORM-CONTAINER MODE: when there are SELECT/MSELECT fields, wrap the entire body
   // (text + img + select + mselect) into a single `form` element. Submit button is the last
@@ -858,6 +1142,9 @@ export function buildCompleteCard(
       } else if (seg.kind === 'mselect') {
         const msel = multiSelects?.[seg.index];
         if (msel) formChildren.push(buildMSelectElement(msel));
+      } else if (seg.kind === 'check') {
+        const chk = checkers?.[seg.index];
+        if (chk) formChildren.push(buildCheckerElement(chk));
       }
     }
     formChildren.push({

@@ -17,7 +17,10 @@ export class ParallelRunner {
   private slots = new Map<string, Set<number>>();
   private readonly maxConcurrent: number;
 
-  constructor(maxConcurrent = 2) {
+  // Default 4 forks → with the main agent, a session can have up to 5 concurrent
+  // Claude processes. Bumped from 2 once we verified memory + Anthropic rate limit
+  // headroom: each process ~250 MB RSS, 5 × 250 MB = 1.25 GB peak (Mac mini handles).
+  constructor(maxConcurrent = 4) {
     this.maxConcurrent = maxConcurrent;
   }
 

@@ -8,6 +8,7 @@ import { TypingIndicator } from './feishu/typing.js';
 import { ClaudeRunner } from './claude/runner.js';
 import { SessionManager } from './claude/session-manager.js';
 import { MessageBridge } from './bridge/message-bridge.js';
+import { FORM_SUBMIT_ACTION } from './feishu/card-builder.js';
 import { CronRunner } from './scheduler/cron-runner.js';
 import { AlertRunner } from './scheduler/alert-runner.js';
 import { ChromeIdleChecker } from './local-only/chrome/idle-checker.js';
@@ -144,10 +145,24 @@ async function main() {
 
   // Handle card button clicks — actionId prefixed with '/' routes to command handler,
   // otherwise the click is sent as natural language to Claude.
+  //
+  // Toast: form submits get a floating success popup ("✓ 已提交" by default, or
+  // whatever the model declared via <<TOAST:type|content>>). We compute the toast
+  // BEFORE dispatching the actual business work — otherwise Claude's processing
+  // would block Feishu's callback HTTP response and the user wouldn't see the
+  // toast for many seconds. The work is dispatched as a fire-and-forget promise.
   onCardAction(async ({ sessionKey, chatId, actionId, label, operatorId, cardId, messageId, formValue }) => {
     const userName = await sender.resolveUserName(operatorId) || operatorId;
     logger.info({ sessionKey, chatId, actionId, label, operatorId, userName, cardId, messageId, hasFormValue: !!formValue }, 'Processing card action');
-    await bridge.executeButtonAction(sessionKey, chatId, actionId, label, userName, operatorId, cardId, messageId, formValue);
+
+    const isFormSubmit = actionId === FORM_SUBMIT_ACTION;
+    const toast = isFormSubmit ? bridge.getFormSubmitToast(cardId) : undefined;
+
+    // Fire-and-forget: don't block toast response on Claude work
+    bridge.executeButtonAction(sessionKey, chatId, actionId, label, userName, operatorId, cardId, messageId, formValue)
+      .catch((err) => logger.error({ err, sessionKey, actionId }, 'executeButtonAction failed'));
+
+    return toast ? { toast } : undefined;
   });
 
   // Start cron scheduler for skills

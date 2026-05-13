@@ -31,6 +31,8 @@ import {
   type ButtonInfo,
   type SelectInfo,
   type MultiSelectInfo,
+  type CheckerInfo,
+  type ToastInfo,
   type ImageInfo,
   type ContentSegment,
   type UsageInfo,
@@ -73,7 +75,7 @@ export class CardStreamer {
   // Shared cache for button/select card state (set by caller).
   // `selects` / `multiSelects` are populated when the LLM emitted SELECT/MSELECT tags so
   // the form-submit handler can look up placeholder + option labels.
-  buttonCardCache?: Map<string, { cardJson: object; sequence: number; expiresAt: number; selects?: SelectInfo[]; multiSelects?: MultiSelectInfo[] }>;
+  buttonCardCache?: Map<string, { cardJson: object; sequence: number; expiresAt: number; selects?: SelectInfo[]; multiSelects?: MultiSelectInfo[]; checkers?: CheckerInfo[]; toast?: ToastInfo }>;
   /** Fire-once callback invoked after the card IM message is delivered.
    *  Used by MessageBridge to upgrade the typing reaction (THINKING → MeMeMe)
    *  for non-@mention groups, signaling "I've decided to reply". */
@@ -395,23 +397,35 @@ export class CardStreamer {
     // and form fields are dropped with a warning. SELECT/MSELECT can coexist (one shared form).
     // IMG is independent and always renders in-place.
     const { cleanText: textWithoutButtons, buttons } = extractButtons(fullText);
-    const parsed = parseInteractive(textWithoutButtons);
+    // Pass sessionDir/projectRoot so parseInteractive can lift bare absolute image
+    // paths (no <<IMG:>> wrapper) into inline image segments. Lets the model write
+    // "/Users/.../screenshot.png" naturally; server-side parsing makes it inline.
+    const projectRoot = this.sessionDir
+      ? this.sessionDir.replace(/\/sessions\/[^/]+\/?$/, '')
+      : undefined;
+    const parsed = parseInteractive(textWithoutButtons, {
+      sessionDir: this.sessionDir,
+      projectRoot,
+    });
     const rawImages: ImageInfo[] = parsed.images;
     let segments: ContentSegment[] = parsed.segments;
     fullText = parsed.cleanText;
     let selects: SelectInfo[] = parsed.selects;
     let multiSelects: MultiSelectInfo[] = parsed.multiSelects;
-    if (buttons.length > 0 && (selects.length > 0 || multiSelects.length > 0)) {
+    let checkers: CheckerInfo[] = parsed.checkers;
+    if (buttons.length > 0 && (selects.length > 0 || multiSelects.length > 0 || checkers.length > 0)) {
       this.logger.warn({
         cardId: this.cardId,
         buttonCount: buttons.length,
         selectCount: selects.length,
         multiSelectCount: multiSelects.length,
+        checkerCount: checkers.length,
       }, 'BUTTON + form fields both present in reply — dropping form fields (mutex)');
       selects = [];
       multiSelects = [];
+      checkers = [];
       // Filter form-field segments out so they don't render orphaned.
-      segments = segments.filter((s) => s.kind !== 'select' && s.kind !== 'mselect');
+      segments = segments.filter((s) => s.kind !== 'select' && s.kind !== 'mselect' && s.kind !== 'check');
     }
 
     // Resolve <<IMG:...>> tags to Feishu image_keys (upload pass). Done at complete() time,
@@ -480,11 +494,11 @@ export class CardStreamer {
         multiSelects.length > 0 ? multiSelects : undefined,
         resolvedImages.length > 0 ? resolvedImages : undefined,
         segments.length > 0 ? segments : undefined,
+        checkers.length > 0 ? checkers : undefined,
       );
 
-      // Cache card state for button/select click updates.
-      // Same cache is used for both — `selects`/`multiSelects` are non-empty iff the LLM rendered a form.
-      if ((buttons.length > 0 || selects.length > 0 || multiSelects.length > 0) && this.cardId) {
+      // Cache card state for button/select/checker click updates.
+      if ((buttons.length > 0 || selects.length > 0 || multiSelects.length > 0 || checkers.length > 0) && this.cardId) {
         if (this.buttonCardCache) {
           this.buttonCardCache.set(this.cardId, {
             cardJson: completeCard,
@@ -492,9 +506,11 @@ export class CardStreamer {
             expiresAt: Date.now() + 24 * 60 * 60 * 1000,
             selects: selects.length > 0 ? selects : undefined,
             multiSelects: multiSelects.length > 0 ? multiSelects : undefined,
+            checkers: checkers.length > 0 ? checkers : undefined,
+            toast: parsed.toast,
           });
           this.logger.info(
-            { cardId: this.cardId, buttonCount: buttons.length, selectCount: selects.length, multiSelectCount: multiSelects.length, cacheSize: this.buttonCardCache.size },
+            { cardId: this.cardId, buttonCount: buttons.length, selectCount: selects.length, multiSelectCount: multiSelects.length, checkerCount: checkers.length, cacheSize: this.buttonCardCache.size },
             'Cached interactive card for click updates',
           );
         } else {

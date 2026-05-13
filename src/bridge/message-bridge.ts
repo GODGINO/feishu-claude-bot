@@ -8,7 +8,7 @@ import type { LiveUsage } from '../claude/stream-parser.js';
 import { SessionManager } from '../claude/session-manager.js';
 import type { Config } from '../config.js';
 import type { Logger } from '../utils/logger.js';
-import { isNoReply, FORM_SUBMIT_ACTION, type SelectInfo, type MultiSelectInfo } from '../feishu/card-builder.js';
+import { isNoReply, FORM_SUBMIT_ACTION, detectBareImagePaths, type SelectInfo, type MultiSelectInfo, type CheckerInfo, type ToastInfo } from '../feishu/card-builder.js';
 import { CommandHandler } from './command-handler.js';
 import { MessageQueue, type Job } from './message-queue.js';
 import { GroupContextBuffer } from './group-context.js';
@@ -49,7 +49,7 @@ export class MessageBridge {
   // Cache finalized card state for button/select-form click updates (cardId → card data).
   // `selects` / `multiSelects` are populated when the original reply used SELECT/MSELECT tags,
   // so the form-submit handler can map field names back to placeholder + option labels.
-  private buttonCardCache = new Map<string, { cardJson: object; sequence: number; expiresAt: number; selects?: SelectInfo[]; multiSelects?: MultiSelectInfo[] }>();
+  private buttonCardCache = new Map<string, { cardJson: object; sequence: number; expiresAt: number; selects?: SelectInfo[]; multiSelects?: MultiSelectInfo[]; checkers?: CheckerInfo[]; toast?: ToastInfo }>();
   private commandHandler: CommandHandler;
   private queue: MessageQueue;
   private groupContext: GroupContextBuffer;
@@ -92,7 +92,7 @@ export class MessageBridge {
     // /并行 slot allocator (max 2 concurrent forks per parent session).
     // The actual run goes through the standard executeAndReply pipeline via
     // runParallelAgent() so fork agents look identical to normal messages.
-    this.parallelRunner = new ParallelRunner(2);
+    this.parallelRunner = new ParallelRunner(4);
     this.commandHandler.setParallelRunner(this.parallelRunner);
     this.commandHandler.setRunParallel((opts) => this.runParallelAgent(opts));
 
@@ -406,6 +406,61 @@ export class MessageBridge {
       );
       if (handled) return;
     }
+
+    // ─── Parallel-agent dispatch ─────────────────────────────────────────
+    // Three entry points to fork, in priority order:
+    //   1. Explicit `// <prompt>` prefix → always fork (whether main is busy or not)
+    //   2. Legacy `/btw` `/parallel` etc. prefix → hint user about new syntax, drop
+    //   3. auto-fork mode on + main is busy → silent fork
+    //
+    // Fork dispatch capacity check: if `parallelRunner.canSpawn()` returns false
+    // (slot saturated), fall through to normal queue path.
+
+    // (1) Manual fork via `// <prompt>` — requires space separator to avoid `//comment`
+    const manualForkMatch = msg.text.match(/^\/\/\s+(.+)/s);
+    if (manualForkMatch) {
+      const forkPrompt = manualForkMatch[1].trim();
+      if (this.parallelRunner.canSpawn(sessionKey)) {
+        // Build a synthetic msg with the prompt-only text so runParallelAgent
+        // sees the user's intent cleanly. Original msg.text is replaced in-place
+        // (msg is a per-event object, no other consumer reads it after this).
+        msg.text = forkPrompt;
+        // Explicit `// ` = user clearly wants a reply → forceMention defaults to true
+        this.runParallelAgent({ parentSessionKey: sessionKey, prompt: forkPrompt, msg, forceMention: true })
+          .catch((err) => this.logger.error({ err, sessionKey }, 'manual `//` fork crashed'));
+        return;
+      }
+      // Saturated — fall through to normal queue (with prompt stripped of `// `)
+      msg.text = forkPrompt;
+      this.logger.info({ sessionKey, active: this.parallelRunner.activeCount(sessionKey), max: this.parallelRunner.getMax() }, '`//` fork requested but slots full, queueing as normal message');
+    }
+
+    // (2) Legacy prefix hint — softly redirect users with muscle memory for old syntax
+    const legacyPrefix = msg.text.match(/^(\/btw|\/parallel|\/parallel-agent|\/顺便|\/分身)\s+(.+)/s);
+    if (legacyPrefix) {
+      const oldCmd = legacyPrefix[1];
+      const restPrompt = legacyPrefix[2].trim().slice(0, 40);
+      await this.sender.sendText(
+        msg.chatId,
+        `ℹ️ \`${oldCmd}\` 触发词已废弃。\n\n• 手动 fork：\`// ${restPrompt}${restPrompt.length === 40 ? '…' : ''}\`\n• 开关自动 fork：\`/并行 on\` / \`/并行 off\``,
+        msg.messageId,
+      );
+      return;
+    }
+
+    // (3) Auto-fork — only kicks in when main is busy AND flag file exists
+    const autoForkOn = (() => {
+      try { return fs.existsSync(path.join(session.sessionDir, 'parallel-auto')); } catch { return false; }
+    })();
+    if (this.runningTasks.has(sessionKey) && autoForkOn && this.parallelRunner.canSpawn(sessionKey)) {
+      this.logger.info({ sessionKey, active: this.parallelRunner.activeCount(sessionKey), max: this.parallelRunner.getMax() }, 'auto-fork: main busy, dispatching as fork');
+      // Auto-fork = silent fork, NOT user-explicit. Honor /auto reply mode so
+      // background group chatter doesn't force a reply (THINKING typing + NO_REPLY allowed).
+      this.runParallelAgent({ parentSessionKey: sessionKey, prompt: msg.text, msg, forceMention: false })
+        .catch((err) => this.logger.error({ err, sessionKey }, 'auto-fork crashed'));
+      return;
+    }
+    // ────────────────────────────────────────────────────────────────────
 
     // Check if session is busy — silently queue message (FIFO, processed when current task ends)
     if (this.runningTasks.has(sessionKey)) {
@@ -919,6 +974,22 @@ export class MessageBridge {
   }
 
   /**
+   * Look up the cached `<<TOAST:>>` for a form-submit on this card. Used by
+   * the event-handler to relay a floating toast back to Feishu in the callback
+   * response, before we await any of the actual business work.
+   *
+   * Returns the model-declared toast if present, otherwise a default success
+   * acknowledgement so the user always gets visual confirmation that the submit
+   * was received (even if Claude is still busy processing).
+   */
+  getFormSubmitToast(cardId: string | undefined): { type: 'info' | 'success' | 'warning' | 'error'; content: string } {
+    if (!cardId) return { type: 'success', content: '✓ 已提交' };
+    const cached = this.buttonCardCache.get(cardId);
+    if (cached?.toast) return cached.toast;
+    return { type: 'success', content: '✓ 已提交' };
+  }
+
+  /**
    * Execute a card action — either a plain button click or a SELECT-form submit.
    * For form submits the click is sent as `[<user> 选择了: name=label / ...]`.
    * Respects the same runningTasks queue as normal messages.
@@ -1030,33 +1101,46 @@ export class MessageBridge {
    * Looks up each field's option label from the buttonCardCache so Claude sees human-readable
    * text. Multi-select values arrive as string[] (one per chosen option) and get joined with commas.
    */
-  private buildFormSubmitPrompt(userName: string, formValue: Record<string, string | string[]>, cardId?: string): string {
+  private buildFormSubmitPrompt(userName: string, formValue: Record<string, string | string[] | boolean>, cardId?: string): string {
     const cached = cardId ? this.buttonCardCache.get(cardId) : undefined;
     const selects: SelectInfo[] = cached?.selects || [];
     const multiSelects: MultiSelectInfo[] = cached?.multiSelects || [];
-    const parts: string[] = [];
+    const checkers: CheckerInfo[] = cached?.checkers || [];
+    const checkerNames = new Set(checkers.map(c => c.name));
+    const selectParts: string[] = [];
+    const checkLines: string[] = [];
     for (const [name, value] of Object.entries(formValue)) {
       // Skip noise from Feishu — the submit button gets reported as `undefined: null` when
-      // it has no `name` field, and any field with null/undefined/empty value is uninteresting.
-      // Also skip the synthetic `none` ("不选") sentinel we prepend to every single-select.
-      if (value == null) continue;
+      // it has no `name` field. CHECK values are booleans (false is meaningful: explicitly
+      // unchecked), so don't drop them like we drop null/empty SELECT values.
       if (name === 'undefined' || name === '') continue;
+      if (checkerNames.has(name)) {
+        const chk = checkers.find(c => c.name === name);
+        const checked = value === true || value === 'true';
+        checkLines.push(`  ${checked ? '☑' : '☐'} ${chk?.text || name}`);
+        continue;
+      }
+      if (value == null) continue;
       if (Array.isArray(value)) {
         if (value.length === 0) continue;
         const msel = multiSelects.find((s) => s.name === name);
         const labels = value.map((v) => msel?.options.find((o) => o.key === v)?.label || v);
-        parts.push(`${name}=${labels.join(',')}`);
+        selectParts.push(`${name}=${labels.join(',')}`);
       } else {
         if (typeof value === 'string' && value.length === 0) continue;
         if (value === 'none') continue;
         const sel = selects.find((s) => s.name === name);
         const opt = sel?.options.find((o) => o.key === value);
         const labelText = opt?.label || value;
-        parts.push(`${name}=${labelText}`);
+        selectParts.push(`${name}=${labelText}`);
       }
     }
-    if (parts.length === 0) return `[${userName} 提交了表单]`;
-    return `[${userName} 选择了: ${parts.join(' / ')}]`;
+    if (selectParts.length === 0 && checkLines.length === 0) return `[${userName} 提交了表单]`;
+    const header = `[${userName} 选择了:`;
+    const body: string[] = [];
+    if (checkLines.length > 0) body.push(...checkLines);
+    if (selectParts.length > 0) body.push(`  ${selectParts.join(' / ')}`);
+    return `${header}\n${body.join('\n')}\n]`;
   }
 
   /**
@@ -1176,13 +1260,14 @@ export class MessageBridge {
    * The form element is wrapped in a `column_set`-like or `form` tag — we walk the
    * top-level `body.elements` and any nested `elements` array to find it.
    */
-  private async updateCardSelectState(cardId: string, formValue: Record<string, string | string[]>, userName: string): Promise<void> {
+  private async updateCardSelectState(cardId: string, formValue: Record<string, string | string[] | boolean>, userName: string): Promise<void> {
     const cached = this.buttonCardCache.get(cardId);
     this.logger.info({ cardId, cacheHit: !!cached, cacheSize: this.buttonCardCache.size }, 'Select-form card cache lookup');
     if (!cached) return;
 
     const selects: SelectInfo[] = cached.selects || [];
     const multiSelects: MultiSelectInfo[] = cached.multiSelects || [];
+    const checkers: CheckerInfo[] = cached.checkers || [];
 
     try {
       const cardJson = JSON.parse(JSON.stringify(cached.cardJson)) as any; // deep clone
@@ -1205,23 +1290,48 @@ export class MessageBridge {
             const placeholder = sel?.placeholder || name;
             // `none` is our synthetic "不选" sentinel — render as 未选.
             const isUnselected = !chosenKey || chosenKey === 'none';
-            const opt = sel?.options.find((o) => o.key === chosenKey);
-            const labelText = isUnselected ? '(未选)' : (opt?.label || chosenKey);
+            // Render every option for auditability: ✓ marks the selected one,
+            // unselected options stay as plain text joined by `·`. Unselected
+            // state shows `(未选)` followed by the alternatives.
+            const visibleOptions = (sel?.options || []).filter(o => o.key !== 'none');
+            const chosenLabel = !isUnselected
+              ? (visibleOptions.find(o => o.key === chosenKey)?.label || chosenKey || '')
+              : '';
+            const recapParts = isUnselected
+              ? ['(未选)', ...visibleOptions.map(o => o.label)]
+              : visibleOptions.map(o => o.label === chosenLabel ? `✓ ${o.label}` : o.label);
             newFormElements.push({
               tag: 'markdown',
-              content: `**${placeholder}**：${labelText}`,
+              content: `**${placeholder}**：${recapParts.join(' · ')}`,
             });
           } else if (child?.tag === 'multi_select_static') {
             const name: string = child.name;
             const raw = formValue[name];
-            const chosenKeys: string[] = Array.isArray(raw) ? raw : (raw ? [raw] : []);
+            const chosenKeys: string[] = Array.isArray(raw) ? raw : (typeof raw === 'string' && raw ? [raw] : []);
             const msel = multiSelects.find((s) => s.name === name);
             const placeholder = msel?.placeholder || name;
-            const labels = chosenKeys.map((k) => msel?.options.find((o) => o.key === k)?.label || k);
-            const labelText = labels.length > 0 ? labels.join('、') : '(未选)';
+            const chosenSet = new Set(chosenKeys);
+            const recapParts = (msel?.options || []).map(o =>
+              chosenSet.has(o.key) ? `✓ ${o.label}` : o.label
+            );
+            const content = chosenKeys.length === 0
+              ? `**${placeholder}**：(未选) · ${recapParts.join(' · ')}`
+              : `**${placeholder}**：${recapParts.join(' · ')}`;
             newFormElements.push({
               tag: 'markdown',
-              content: `**${placeholder}**：${labelText}`,
+              content,
+            });
+          } else if (child?.tag === 'checker') {
+            const name: string = child.name;
+            const raw = formValue[name];
+            const checked = raw === true || raw === 'true';
+            const chk = checkers.find((c) => c.name === name);
+            const text = chk?.text || child.text?.content || name;
+            // ☑/☐ unicode squared chars render reliably across Feishu desktop/mobile;
+            // matches the form-submit-prompt format Claude sees for consistency.
+            newFormElements.push({
+              tag: 'markdown',
+              content: `${checked ? '☑' : '☐'} ${text}`,
             });
           } else if (child?.tag === 'button') {
             // Submit button — rewrite text + disable. @ the operator on this button only.
@@ -1280,8 +1390,19 @@ export class MessageBridge {
     parentSessionKey: string;
     prompt: string;
     msg: IncomingMessage;
+    /**
+     * `true` (default) → fork bypasses the "is-this-msg-for-me" check: always
+     * treated as @mentioned, must reply, MeMeMe typing. Used for explicit `// `
+     * prefix where the user is clearly asking the bot to do something.
+     *
+     * `false` → fork behaves like a regular group message: honors `/auto` mode,
+     * uses THINKING typing for non-@-mention groups, lets Claude decide via
+     * NO_REPLY. Used for auto-fork mode (main busy → silent fork) so background
+     * chatter doesn't generate spam replies.
+     */
+    forceMention?: boolean;
   }): Promise<void> {
-    const { msg } = opts;
+    const { msg, forceMention = true } = opts;
     if (!this.parallelRunner.canSpawn(opts.parentSessionKey)) {
       await this.sender.sendText(
         msg.chatId,
@@ -1294,10 +1415,17 @@ export class MessageBridge {
     const nonce = Math.random().toString(36).slice(2, 6);
     const forkSessionKey = `${opts.parentSessionKey}__fork${forkN}_${nonce}`;
     const parentSession = this.sessionMgr.getOrCreate(opts.parentSessionKey);
-    // Per user spec: /并行 always treats input as @mention even if user didn't
-    // tag the bot. Only "is-this-msg-for-me" detection is bypassed; everything
-    // else (group hints, missed messages, quote, attachments) is identical.
-    const isNonMentionGroup = false;
+    // forceMention=true → always treated as @mention. forceMention=false → defer
+    // to normal auto-reply judgement: non-@ in a group with auto-reply!=always
+    // becomes "isNonMentionGroup" (lets the model emit NO_REPLY for chatter).
+    let autoReplyMode = 'on';
+    if (msg.chatType === 'group') {
+      try { autoReplyMode = fs.readFileSync(path.join(parentSession.sessionDir, 'auto-reply'), 'utf-8').trim(); } catch {}
+    }
+    const isNonMentionGroup = !forceMention
+      && msg.chatType === 'group'
+      && !msg.isMentioned
+      && autoReplyMode !== 'always';
 
     // CORE: clone the parent's Claude sessionId onto the fork sessionKey so the
     // fork agent boots with `--resume <parentSessionId>` and sees the parent's
@@ -1348,8 +1476,13 @@ export class MessageBridge {
       }
       const missedStr = this.groupContext.formatMissed(msg.chatId);
       if (missedStr) prompt = `${missedStr}\n\n${prompt}`;
-      // /并行 forces the @mention path — no "未@你" branch
-      prompt = `[你被@提及，必须回复]\n${prompt}`;
+      // Behavior hint depends on isNonMentionGroup (computed up-top from forceMention).
+      // Mirrors handleMessage normal-path branch at line ~603.
+      if (isNonMentionGroup) {
+        prompt = `[群聊消息，未@你。请从第一个 token 开始判断：不需要回复（闲聊、表情、"好的/收到"等无关消息）→ 只输出 NO_REPLY；以下情况正常回复：有人提问、下达指令或任务、用户的消息与你上一条回复高度相关（追问/补充/确认）、讨论你擅长的话题、提到 Sigma。]\n${prompt}`;
+      } else {
+        prompt = `[你被@提及，必须回复]\n${prompt}`;
+      }
       this.groupContext.add(msg.chatId, {
         timestamp: Date.now(),
         senderName: userName || this.resolveSenderName(msg.senderName, msg.userId),
@@ -1410,8 +1543,13 @@ export class MessageBridge {
       if (filePaths.length > 0) prompt += `\n[用户发送的文件已保存: ${filePaths.join(', ')}]`;
     }
 
-    // Typing reaction — MeMeMe to match @mention behaviour.
-    let reactionId: string | null = await this.typing.start(msg.messageId).catch(() => null);
+    // Typing reaction — THINKING for non-@ groups (matches main path), MeMeMe otherwise.
+    // For non-@ we also pass onWillReply so when the model actually emits a reply
+    // (not NO_REPLY), the reaction swaps THINKING → MeMeMe to signal "I'm in".
+    let reactionId: string | null = await this.typing.start(
+      msg.messageId,
+      isNonMentionGroup ? 'THINKING' : undefined,
+    ).catch(() => null);
 
     try {
       await this.executeAndReply({
@@ -1423,6 +1561,9 @@ export class MessageBridge {
         existingRootId: msg.threadId ? msg.rootId : undefined,
         isNonMentionGroup,
         images,
+        onWillReply: isNonMentionGroup
+          ? async () => { reactionId = await this.typing.swap(msg.messageId, reactionId, 'MeMeMe'); }
+          : undefined,
       });
     } finally {
       if (reactionId) {
@@ -1596,6 +1737,18 @@ export class MessageBridge {
       const cleanText = replyText;
       let plainTextSentMsgId: string | null = null;
 
+      // Detect bare absolute image paths the model wrote without <<IMG:>> wrapper.
+      // Used for two things below: (a) force card route so they render inline,
+      // (b) feed to sendMentionedFiles as excludePaths so we don't dup-send them
+      // as standalone image messages.
+      const projectRootForBare = path.resolve(sessionDir, '..', '..');
+      const bareImagePaths = detectBareImagePaths(rawText, {
+        sessionDir,
+        projectRoot: projectRootForBare,
+      });
+      const bareImageExcludeSet = bareImagePaths.length > 0 ? new Set(bareImagePaths) : undefined;
+      const hasBareImagePaths = bareImagePaths.length > 0;
+
       if (isNoReply(replyText) || (!cardCreated && !cardCreating && isNonMentionGroup && !replyText) || (!cardCreated && !cardCreating && !replyText)) {
         // NO_REPLY or empty text without card — finalize card if it was already created
         if (cardCreated || cardCreating) {
@@ -1618,7 +1771,7 @@ export class MessageBridge {
           model: result.model,
           costUsd: result.costUsd,
         });
-        await this.sendMentionedFiles(chatId, cleanText, sessionDir, undefined, undefined, sessionKey);
+        await this.sendMentionedFiles(chatId, cleanText, sessionDir, undefined, undefined, sessionKey, bareImageExcludeSet);
         this.wechatPendingEcho.delete(sessionKey); // consumed by card, skip dual-send Feishu
         this.runner.onSubagentStream(sessionKey, undefined);
       } else if (isFromWechat) {
@@ -1635,7 +1788,7 @@ export class MessageBridge {
         if (!cardCreated) ensureCard();
         if (streamer.startPromise) await streamer.startPromise;
         streamer.completeTextOnly(rawText || '(空回复)');
-        await this.sendMentionedFiles(chatId, cleanText, sessionDir, undefined, streamRootId, sessionKey);
+        await this.sendMentionedFiles(chatId, cleanText, sessionDir, undefined, streamRootId, sessionKey, bareImageExcludeSet);
         this.logger.info({ sessionKey, runningAgents: runningAgents.size }, 'Turn done but agents still running');
         setTimeout(() => {
           if (streamer.isWaitingForAgents()) {
@@ -1644,8 +1797,8 @@ export class MessageBridge {
             this.runner.onSubagentStream(sessionKey, undefined);
           }
         }, 30 * 60 * 1000);
-      } else if (!cardCreated && !cardCreating && !rawText.includes('<<BUTTON:') && !rawText.includes('<<SELECT:') && !rawText.includes('<<MSELECT:') && !rawText.includes('<<IMG:')) {
-        // No card, no buttons — send as plain text
+      } else if (!cardCreated && !cardCreating && !rawText.includes('<<BUTTON:') && !rawText.includes('<<SELECT:') && !rawText.includes('<<MSELECT:') && !rawText.includes('<<IMG:') && !hasBareImagePaths) {
+        // No card, no buttons, no inline images — send as plain text
         this.logger.info({ sessionKey, textLen: cleanText.length }, 'No tools used, sending plain text reply');
         await fireWillReply();
         plainTextSentMsgId = await this.sender.sendReply(chatId, cleanText || '(空回复)', replyToMessageId, sessionDir, streamRootId);
@@ -1669,7 +1822,7 @@ export class MessageBridge {
           model: result.model,
           costUsd: result.costUsd,
         });
-        await this.sendMentionedFiles(chatId, cleanText, sessionDir, undefined, streamRootId, sessionKey);
+        await this.sendMentionedFiles(chatId, cleanText, sessionDir, undefined, streamRootId, sessionKey, bareImageExcludeSet);
         this.runner.onSubagentStream(sessionKey, undefined);
       }
 
@@ -1830,6 +1983,7 @@ export class MessageBridge {
     replyToMessageId?: string,
     rootId?: string,
     sessionKey?: string,
+    excludePaths?: Set<string>,
   ): Promise<void> {
     try {
       // Strip <<IMG:path|alt?>> tags — any path referenced by IMG has already been
@@ -1856,7 +2010,10 @@ export class MessageBridge {
         if (m) allMatches.push(...m);
       }
       if (allMatches.length === 0) return;
-      const matches = allMatches;
+      const matches = excludePaths && excludePaths.size > 0
+        ? allMatches.filter(p => !excludePaths.has(p))
+        : allMatches;
+      if (matches.length === 0) return;
 
       // Deduplicate
       const uniquePaths = [...new Set(matches)];
