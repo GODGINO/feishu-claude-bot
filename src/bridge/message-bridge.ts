@@ -1,4 +1,5 @@
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import type { IncomingMessage } from '../feishu/event-handler.js';
 import type { MessageSender } from '../feishu/message-sender.js';
@@ -55,6 +56,14 @@ export class MessageBridge {
   private groupContext: GroupContextBuffer;
   private emailSetup: EmailSetup;
   private parallelRunner: ParallelRunner;
+  /**
+   * Set of parent sessionKeys whose main-path process should be respawned
+   * before the next message — populated when a fork finishes (signals to main
+   * "you missed some jsonl writes, refresh on your next turn"). If main is
+   * currently idle when a fork finishes, we respawn immediately. If main is
+   * busy mid-turn, we defer until its finally block.
+   */
+  private pendingRespawn = new Set<string>();
   // Dedup: Feishu WebSocket can re-deliver events on reconnect, bypassing event-handler dedup
   private recentMessageIds = new Set<string>();
   private memberMgr?: MemberManager;
@@ -92,7 +101,7 @@ export class MessageBridge {
     // /并行 slot allocator (max 2 concurrent forks per parent session).
     // The actual run goes through the standard executeAndReply pipeline via
     // runParallelAgent() so fork agents look identical to normal messages.
-    this.parallelRunner = new ParallelRunner(4);
+    this.parallelRunner = new ParallelRunner(2);
     this.commandHandler.setParallelRunner(this.parallelRunner);
     this.commandHandler.setRunParallel((opts) => this.runParallelAgent(opts));
 
@@ -717,6 +726,14 @@ export class MessageBridge {
       await this.typing.stop(msg.messageId, reactionId);
       this.runningTasks.delete(sessionKey);
       this.abortControllers.delete(sessionKey);
+
+      // If a fork finished while main was busy, the fork bumped pendingRespawn
+      // for this sessionKey — respawn now so the next main turn picks up the
+      // new jsonl writes (the fork's outputs).
+      if (this.pendingRespawn.has(sessionKey)) {
+        this.pendingRespawn.delete(sessionKey);
+        try { this.runner.respawn(sessionKey); } catch { /* ignore */ }
+      }
 
       // Process next queued message
       await this.processQueue(sessionKey);
@@ -1386,6 +1403,25 @@ export class MessageBridge {
    * future work will copy the parent transcript jsonl into a new sessionId
    * and pre-seed savedSessionIds so the fork can `--resume` it.
    */
+
+  /**
+   * Helper: compute Claude Code's jsonl path for a sessionDir + sessionId.
+   * Claude Code encodes `<projectDir>` by replacing `/` and `_` with `-`,
+   * then stores the transcript at `~/.claude/projects/<encoded>/<sessionId>.jsonl`.
+   * Returns null if either input is missing.
+   */
+  private jsonlPathFor(sessionDir: string | undefined, sessionId: string | null | undefined): string | null {
+    if (!sessionDir || !sessionId) return null;
+    const encoded = sessionDir.replace(/[/_.]/g, '-');
+    return path.join(os.homedir(), '.claude', 'projects', encoded, `${sessionId}.jsonl`);
+  }
+
+  /** Helper: fs.statSync mtime in ms, or 0 if path missing. */
+  private jsonlMtimeMs(jsonlPath: string | null): number {
+    if (!jsonlPath) return 0;
+    try { return fs.statSync(jsonlPath).mtimeMs; } catch { return 0; }
+  }
+
   async runParallelAgent(opts: {
     parentSessionKey: string;
     prompt: string;
@@ -1403,18 +1439,42 @@ export class MessageBridge {
     forceMention?: boolean;
   }): Promise<void> {
     const { msg, forceMention = true } = opts;
-    if (!this.parallelRunner.canSpawn(opts.parentSessionKey)) {
-      await this.sender.sendText(
-        msg.chatId,
-        `⚠️ 已达并行上限 (${this.parallelRunner.getMax()})，请等当前并行任务完成`,
-        msg.messageId,
-      );
-      return;
-    }
-    const forkN = this.parallelRunner.allocate(opts.parentSessionKey);
-    const nonce = Math.random().toString(36).slice(2, 6);
-    const forkSessionKey = `${opts.parentSessionKey}__fork${forkN}_${nonce}`;
+
     const parentSession = this.sessionMgr.getOrCreate(opts.parentSessionKey);
+    const parentSessionId = this.runner.getSavedSessionId(opts.parentSessionKey);
+    const jsonlPath = this.jsonlPathFor(parentSession.sessionDir, parentSessionId);
+    const currentMtime = this.jsonlMtimeMs(jsonlPath);
+
+    // Try to reuse a warm agent first. Warm = an agent that finished last in
+    // this pool and was kept alive specifically to absorb the next message.
+    // `takeWarmIfFresh` returns it only when its captured jsonl mtime matches
+    // current — if drifted, fall through to spawn fresh.
+    let warm = this.parallelRunner.takeWarmIfFresh(opts.parentSessionKey, currentMtime);
+    let forkSessionKey: string;
+    if (warm) {
+      forkSessionKey = warm.syntheticKey;
+      this.logger.info({ parentSessionKey: opts.parentSessionKey, forkSessionKey, currentMtime },
+        'Reusing warm agent (jsonl mtime match)');
+    } else {
+      // No reusable warm. Evict any stale warm first (mtime drifted) — kill it
+      // since we'd need to respawn anyway, and we may need its slot.
+      const staleKey = this.parallelRunner.evictWarm(opts.parentSessionKey);
+      if (staleKey) {
+        try { this.runner.reset(staleKey); } catch { /* ignore */ }
+        this.logger.info({ parentSessionKey: opts.parentSessionKey, staleKey },
+          'Evicted stale warm agent (jsonl drifted)');
+      }
+      if (!this.parallelRunner.canSpawn(opts.parentSessionKey)) {
+        await this.sender.sendText(
+          msg.chatId,
+          `⚠️ 已达并行上限 (${this.parallelRunner.getMax()})，请等当前并行任务完成`,
+          msg.messageId,
+        );
+        return;
+      }
+      const entry = this.parallelRunner.spawn(opts.parentSessionKey);
+      forkSessionKey = entry.syntheticKey;
+    }
     // forceMention=true → always treated as @mention. forceMention=false → defer
     // to normal auto-reply judgement: non-@ in a group with auto-reply!=always
     // becomes "isNonMentionGroup" (lets the model emit NO_REPLY for chatter).
@@ -1431,14 +1491,14 @@ export class MessageBridge {
     // fork agent boots with `--resume <parentSessionId>` and sees the parent's
     // full conversation history. Fork and parent then write to the same jsonl —
     // from the agent's POV they're the same logical agent with one transcript.
-    const parentSessionId = this.runner.getSavedSessionId(opts.parentSessionKey);
-    if (parentSessionId) {
+    // (parentSessionId captured at top of function for jsonl mtime check.)
+    if (parentSessionId && !warm) {
       this.runner.setSavedSessionId(forkSessionKey, parentSessionId);
     }
 
     this.logger.info(
-      { parentSessionKey: opts.parentSessionKey, forkSessionKey, forkN, parentSessionId },
-      'Parallel agent spawning',
+      { parentSessionKey: opts.parentSessionKey, forkSessionKey, parentSessionId, reused: !!warm },
+      'Parallel agent dispatching',
     );
 
     let prompt = opts.prompt;
@@ -1569,8 +1629,33 @@ export class MessageBridge {
       if (reactionId) {
         this.typing.stop(msg.messageId, reactionId).catch(() => {});
       }
-      this.parallelRunner.release(opts.parentSessionKey, forkN);
-      try { this.runner.reset(forkSessionKey); } catch { /* ignore */ }
+      // Decide: am I the latest-spawned agent? If yes → stay alive as warm
+      // standby (next dispatch may reuse me cheaply). Else → suicide.
+      const postMtime = this.jsonlMtimeMs(jsonlPath);
+      const decision = this.parallelRunner.complete(opts.parentSessionKey, forkSessionKey, postMtime);
+      if (decision === 'suicide') {
+        try { this.runner.reset(forkSessionKey); } catch { /* ignore */ }
+      } else {
+        // 'warm' — keep child process alive; ProcessPool's own 30-min idle
+        // checker will eventually reclaim it if no one reuses it.
+        this.logger.info(
+          { parentSessionKey: opts.parentSessionKey, forkSessionKey, jsonlMtimeMs: postMtime },
+          'Agent kept as warm standby (latest-spawned)',
+        );
+      }
+
+      // Preemptive main respawn: a fork just wrote to jsonl, so the long-lived
+      // main process at parentSessionKey now has a stale in-memory history.
+      // If main is idle, kill it now (next user msg will fresh-spawn). If main
+      // is busy mid-turn, defer via pendingRespawn — its finally block will
+      // pick this up. The runner.respawn keeps savedSessionId, so spawn-time
+      // --resume reads the latest jsonl. Skip if main is the same key as this
+      // fork (impossible with synthetic keys, but defensive).
+      if (this.runningTasks.has(opts.parentSessionKey)) {
+        this.pendingRespawn.add(opts.parentSessionKey);
+      } else {
+        try { this.runner.respawn(opts.parentSessionKey); } catch { /* ignore */ }
+      }
     }
   }
 

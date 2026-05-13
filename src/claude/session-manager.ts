@@ -427,9 +427,9 @@ feishuId:<飞书id>
 
 ## 并行 agent
 
-<!-- sigma-template:parallel-agent-v1 -->
+<!-- sigma-template:parallel-agent-v3 -->
 
-每个 session 最多 **5 个并发 Claude 进程**（主 agent 1 + fork agent 4）。fork 共享主对话的完整历史（同一个 sessionId 的 transcript），但跑在独立进程里，**主 agent 不阻塞**——你可以一边等长任务，一边发新消息让 fork 处理。
+每个 session 最多 **3 个并发 Claude 进程**（含主 agent 和 fork agent）。fork 共享主对话的完整历史（同一个 sessionId 的 transcript），但跑在独立进程里，**主 agent 不阻塞**——你可以一边等长任务，一边发新消息让 fork 处理。
 
 ### 触发方式
 
@@ -456,7 +456,7 @@ feishuId:<飞书id>
 
 ### 容量耗尽时
 
-如果 4 个 fork slot 都满了：
+如果 3 个 slot 都满了：
 - \`// <prompt>\` 显式触发 → 降级为普通排队（不丢消息）
 - 自动 fork 触发 → 同上，排队
 
